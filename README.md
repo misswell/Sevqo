@@ -119,7 +119,7 @@ bash tools/release_macos.sh      # 构建 → Developer ID 签名 → 公证 →
 bash tools/publish_release.sh    # gh 发布 Release，并回读 releases/latest/download/latest.json 确认生效
 ```
 
-本轮 v0.1.1 由本机脚本完成构建、Developer ID 签名、公证、装订、打包与 GitHub 发布。仓库变量 `RELEASE_PROVIDER=local` 让新版标签的 GitHub Actions 只跑前端和 Rust 验证；云端构建与发布任务会跳过。未设置该变量时保留原来的云端签名、公证和发布路径。`publish_release.sh` 会检查产物、更新清单与远端 Release；发现同名 Release 时退出，不覆盖附件或说明。`SKIP_BUILD=1` 复用已构建的 `.app`，`SIGN_ONLY=1` 只签名不公证（自检用，不能用于正式发布）。
+本轮 v0.1.1 已于 2026-10-14 08:51（北京时间）在 [GitHub Release](https://github.com/misswell/Sevqo/releases/tag/v0.1.1) 发布；本机脚本完成构建、Developer ID 签名、公证、装订与打包。仓库变量 `RELEASE_PROVIDER=local` 让新版标签的 GitHub Actions 只跑前端和 Rust 验证；云端构建与发布任务会跳过。未设置该变量时保留原来的云端签名、公证和发布路径。`publish_release.sh` 会检查产物、更新清单与远端 Release；发现同名 Release 时退出，不覆盖附件或说明。`SKIP_BUILD=1` 复用已构建的 `.app`，`SIGN_ONLY=1` 只签名不公证（自检用，不能用于正式发布）。
 
 更新包用 minisign 签名，`cargo tauri signer sign --app-version` 会把版本号写进签名的 trusted comment：
 

@@ -69,5 +69,5 @@ log "回读更新源"
 url="https://github.com/$repo/releases/latest/download/latest.json"
 got="$(curl -fsSL "$url" | jq -r '.version')"
 [[ "$got" == "$version" ]] || fail "$url 返回版本 $got，期望 $version"
-log "更新源可用：$url（$got）"
+log "更新源可用：${url}（${got}）"
 gh release view "$tag" --repo "$repo" --json tagName,url,assets --jq '{tag:.tagName,url:.url,assets:[.assets[].name]}'

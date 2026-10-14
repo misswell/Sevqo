@@ -46,4 +46,4 @@
 - 打包版仍依赖用户自行配置装有 torch 等依赖的 Python；内嵌 sidecar 源码并不等于独立运行时。
 - 移动端尚未实现。CPython sidecar 无法直接作为 iOS 的交付方案。
 - 本轮没有完成 Windows/Linux 真机验证、十万级素材压力测试或打包后 GUI 全流程验收。
-- 本轮执行本地修复与验证，没有执行 GitHub 推送、发布或生产部署。共享工作区中其他 Agent 的发布脚本、更新代码和 README 改动均保留。
+- Sevqo v0.1.1 已于 2026-10-14 08:51（北京时间）发布到 [GitHub Release](https://github.com/misswell/Sevqo/releases/tag/v0.1.1)。tag 指向发布提交；GitHub Actions 前端和 Rust 验证成功，本机负责签名、公证、打包与发布。
