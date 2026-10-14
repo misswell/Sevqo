@@ -43,7 +43,9 @@ impl AppState {
         let need_vision = settings.index_images || settings.index_video;
         let client = Client::new(&paths, &settings);
         let status = sevqo_engine::model::status(&paths.model_dir);
-        let ready = status.complete && has_python;
+        // 按字段注释的含义来：model_ready 只说「权重齐了」，能不能推理由 can_infer 加上 Python 判断。
+        // 之前在这里混入 has_python，会和 reseed() 的口径不一致，导致没配 Python 时误判成「权重还缺」。
+        let ready = status.complete;
         let vector_path = paths.vector_path.clone();
         AppState {
             client: Mutex::new(Arc::new(client)),

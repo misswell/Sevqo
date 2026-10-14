@@ -33,7 +33,22 @@ FILES = [
     ("tokenizer.json", 32170510),
     ("model.safetensors", 1488915288),
 ]
-OUT = sys.argv[1] if len(sys.argv) > 1 else "/Users/guofeng/Code/solo/Sevqo/models/google/embeddinggemma-2"
+def default_out() -> str:
+    """权重必须落在 App 真正读取的目录，否则下完 1.49 GB 应用还是说「未就绪」。
+
+    和 Rust 侧 Paths::resolve 同一套规则：SEVQO_MODEL_HOME 优先，否则系统缓存目录下的 Sevqo。
+    """
+    home = os.environ.get("SEVQO_MODEL_HOME")
+    if home:
+        return home
+    if sys.platform == "darwin":
+        cache = os.path.expanduser("~/Library/Caches")
+    else:
+        cache = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(cache, "Sevqo", "models", "google", "embeddinggemma-2")
+
+
+OUT = sys.argv[1] if len(sys.argv) > 1 else default_out()
 UA = "Sevqo/0.1 (local search; +https://localhost)"
 DEADLINE = float(os.environ.get("FETCH_DEADLINE_S", "0")) or None
 

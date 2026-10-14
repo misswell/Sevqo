@@ -5,6 +5,7 @@ import { type Hit, type Kind, type Moment, type Root, type SearchRequest, type S
 import { dateThresholdNs, firstMediaPath, formatMillis, mediaKindOf, sizeRange } from '../format';
 import { kindOrder, labels } from '../i18n';
 import { useDebounced, useFileDrop } from '../hooks';
+import { ModelPrompt } from './ModelPrompt';
 import { hasMeta, isMac } from '../scope';
 import { CloseIcon, SearchIcon } from './Icons';
 import { Btn, Chip, EmptyState, Note, Select } from './ui';
@@ -429,6 +430,8 @@ export function SearchArea({
 
       {note ? <Note>{note}</Note> : null}
       {modelHint ? <Note>{modelHint}</Note> : null}
+      {/* 提示说完「仅按文件名与正文匹配」，下面就得能一步解决，而不是让人去找侧栏。 */}
+      {modelHint ? <ModelPrompt compact /> : null}
       {error ? <Note tone="error">{error}</Note> : null}
 
       <div className="results-head">

@@ -4,6 +4,7 @@ import type { Settings } from '../types';
 import { labels } from '../i18n';
 import { CloseIcon } from './Icons';
 import { Btn, Note, SectionTitle, TextInput, Toggle } from './ui';
+import { ModelPrompt } from './ModelPrompt';
 
 const MB = 1024 * 1024;
 
@@ -266,6 +267,8 @@ export function SettingsSheet({ settings, busy, onClose, onSave }: SettingsSheet
 
           <div className="sheet-group">
             <h3>{labels.settings.groupModel}</h3>
+            {/* 报错文案里说的「在设置中下载模型」，直到这里才真的成立。 */}
+            <ModelPrompt />
             <label className="field">
               <span className="field-label">{labels.settings.modelRepo}</span>
               <input className="input" value={draft.modelRepo} readOnly />

@@ -10,6 +10,7 @@ import { useDebounced, useFileDrop, useFocusOnMount } from '../hooks';
 import { hasMeta } from '../scope';
 import { setWindowSize } from '../window';
 import { CloseIcon, KindIcon, SearchIcon, WindowIcon } from './Icons';
+import { ModelPrompt } from './ModelPrompt';
 import { Note } from './ui';
 
 const MAX_ROWS = 8;
@@ -27,6 +28,8 @@ export function Spotlight(): ReactElement {
   const [active, setActive] = useState(0);
   /** Set when a picture or clip was dropped: the list below is similar media, not a text match. */
   const [mediaOf, setMediaOf] = useState<MediaQuery | null>(null);
+  /** 模型提示条自己会换高度（下载中多两行进度），靠它提醒外层重算窗口高度。 */
+  const [modelTick, setModelTick] = useState(0);
 
   const seq = useRef(0);
   const textIntent = useRef(true);
@@ -127,7 +130,10 @@ export function Spotlight(): ReactElement {
   useEffect(() => {
     const id = window.setTimeout(measure, 40);
     return () => window.clearTimeout(id);
-  }, [measure, hits, note, error, query, loading, mediaOf]);
+  }, [measure, hits, note, error, query, loading, mediaOf, modelTick]);
+
+  // 必须稳定：ModelPrompt 的内容变化回调进依赖数组，每次渲染换函数身份就会自激重排。
+  const bumpModel = useCallback(() => setModelTick((t) => t + 1), []);
 
   useEffect(() => {
     const onVisible = () => {
@@ -266,6 +272,9 @@ export function Spotlight(): ReactElement {
             </button>
           </div>
         ) : null}
+
+        {/* 缺权重时这里就是最短路径：不用去完整窗口翻侧栏。 */}
+        <ModelPrompt compact onChange={bumpModel} />
 
         {note ? <Note>{note}</Note> : null}
         {error ? <Note tone="error">{error}</Note> : null}

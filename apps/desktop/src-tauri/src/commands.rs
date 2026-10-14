@@ -564,7 +564,7 @@ pub async fn search_media(app: AppHandle, path: String, limit: Option<usize>, ki
     let st = app_state(&app);
     block(move || {
         if !st.can_infer() {
-            return Err("媒体检索需要模型就绪，请先在设置中下载模型".to_string());
+            return Err("媒体检索需要先下载模型权重（约 1.49 GB），点「下载模型」即可开始".to_string());
         }
         let s = st.settings();
         if !(s.index_images || s.index_video) {
@@ -787,16 +787,27 @@ fn platform_opener(p: &Path, reveal: bool) -> std::process::Command {
 #[tauri::command]
 pub fn model_download_start(app: AppHandle) -> Res<()> {
     let st = app_state(&app);
-    spawn_model_download(st, app)
+    spawn_model_download(st, app, true)
 }
 
 /// Fetch whatever the model directory is missing, reporting through `model://progress`.
-/// Shared by the command and by launch-time auto-resume.
-pub fn spawn_model_download(st: Arc<AppState>, app: AppHandle) -> Res<()> {
-    if !st.has_python() {
-        return Err("未找到 Python 运行环境，无法加载模型。请在设置里指定解释器路径。".to_string());
-    }
-    if st.can_infer() {
+/// Shared by the command and by launch-time auto-resume; `announce` keeps a manual click from
+/// dead-ending silently, while the launch path stays quiet.
+pub fn spawn_model_download(st: Arc<AppState>, app: AppHandle, announce: bool) -> Res<()> {
+    // 拉权重只是按镜像端点下文件，跟 Python 没关系；只有推理才需要解释器。
+    if model::status(&st.paths.model_dir).complete {
+        st.set_model_ready(true);
+        if announce {
+            let note = if st.has_python() {
+                "模型已就绪，可以开始语义检索"
+            } else {
+                "权重已经完整，在设置里指定 Python 后即可语义检索"
+            };
+            let _ = app.emit(
+                EV_MODEL_STATE,
+                serde_json::json!({ "ready": st.can_infer(), "note": note, "cancelled": false }),
+            );
+        }
         return Ok(());
     }
     if !st.try_begin_download() {

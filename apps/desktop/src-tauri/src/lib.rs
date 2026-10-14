@@ -106,8 +106,9 @@ pub fn run() {
             }
 
             // 首启按需下载：weights arrive in the background and stream their progress.
-            if wants_media && !state.can_infer() {
-                if let Err(e) = commands::spawn_model_download(state.clone(), handle.clone()) {
+            // 判据是「权重齐没齐」而不是「能不能推理」——没配 Python 时也该先把这 1.49 GB 取回来。
+            if wants_media && !state.model_ready() {
+                if let Err(e) = commands::spawn_model_download(state.clone(), handle.clone(), false) {
                     tracing::warn!("模型自动下载未启动：{e}");
                 }
             }

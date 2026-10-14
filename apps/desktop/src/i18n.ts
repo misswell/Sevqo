@@ -158,6 +158,12 @@ export const labels = {
     missingPython: '未找到 Python',
     missingPythonHint: '语义搜索需要本机 Python 环境，可在设置里指定路径。',
     download: '下载模型',
+    downloadPrompt: '语义检索需要本机模型权重',
+    oneClick: '一键下载',
+    resumeDownload: '继续下载',
+    size: (files: number, bytes: string) => `${files} 个文件 · ${bytes} · 全程本地`,
+    remaining: (files: number, bytes: string) =>
+      files > 0 ? `还缺 ${files} 个 · 已下 ${bytes}，可续传` : `已下 ${bytes}`,
     cancelDownload: '取消下载',
     verify: '校验完整性',
     runtime: '运行时',

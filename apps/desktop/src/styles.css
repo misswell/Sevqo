@@ -787,6 +787,42 @@ textarea {
   white-space: nowrap;
   max-width: 130px;
 }
+.model-prompt {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 9px;
+  border: 1px solid var(--accent-soft);
+  border-radius: var(--radius-input);
+  background: var(--bg-raised);
+}
+.model-prompt-compact {
+  padding: 7px;
+  gap: 5px;
+}
+.model-prompt-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.model-prompt-text {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 12px;
+}
+.model-prompt-text svg {
+  color: var(--accent);
+  flex: none;
+}
+.model-prompt-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
 .runtime {
   display: flex;
   flex-direction: column;
