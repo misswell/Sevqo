@@ -32,6 +32,8 @@ env:
 jobs:
   verify:
     runs-on: macos-14
+    outputs:
+      signing_ready: ${{ steps.credentials.outputs.ready }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -48,18 +50,30 @@ jobs:
       - name: Rust 测试
         run: cargo test -q --workspace
       - name: 发布凭据是否齐备
+        id: credentials
         env:
+          RELEASE_PROVIDER: ${{ vars.RELEASE_PROVIDER }}
           APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: |
+          if [ "${RELEASE_PROVIDER:-}" = local ]; then
+            echo "ready=false" >>"$GITHUB_OUTPUT"
+            {
+              echo "### 发布来源"
+              echo "本次由本机完成构建、签名、公证和发布；GitHub Actions 只执行验证。"
+            } >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           missing=()
           [ -n "${APPLE_DEVELOPER_ID_P12_BASE64:-}" ] || missing+=("APPLE_DEVELOPER_ID_P12_BASE64(+_PASSWORD)")
           [ -n "${APPLE_ID:-}" ] || missing+=("APPLE_ID(+APPLE_TEAM_ID/APPLE_APP_SPECIFIC_PASSWORD)")
           [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ] || missing+=("TAURI_SIGNING_PRIVATE_KEY(+_PASSWORD)")
           if [ ${#missing[@]} -eq 0 ]; then
+            echo "ready=true" >>"$GITHUB_OUTPUT"
             echo "签名与公证凭据齐备，构建任务会运行。"
           else
+            echo "ready=false" >>"$GITHUB_OUTPUT"
             {
               echo "### 缺少的 secrets"
               for m in "${missing[@]}"; do echo "- \`$m\`"; done
@@ -69,11 +83,10 @@ jobs:
           fi
 
   build-macos:
-    if: vars.RELEASE_PROVIDER != 'local'
     needs: verify
     # 没签名证书就没必要跑 20 分钟构建，也别在 release 上留一条红色的必需步骤；
     # 缺 secrets 时这里直接跳过，release 任务随 needs 一起跳过。
-    if: ${{ needs.verify.result == 'success' && secrets.APPLE_DEVELOPER_ID_P12_BASE64 != '' && secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+    if: ${{ vars.RELEASE_PROVIDER != 'local' && needs.verify.outputs.signing_ready == 'true' }}
     strategy:
       fail-fast: false
       matrix:
