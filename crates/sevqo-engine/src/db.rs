@@ -398,6 +398,19 @@ impl Db {
         Ok(rows.filter_map(|x| x.ok()).collect())
     }
 
+    /// Same queue as [`Self::pending`], counted instead of materialised: the progress
+    /// readout needs the denominator on every batch, not the rows.
+    pub fn pending_count(&self, kinds: &[Kind]) -> Result<u64> {
+        let g = self.write.lock().unwrap();
+        let mut sql = "SELECT count(*) FROM file WHERE state IN ('pending','stale') AND root_id IN (SELECT id FROM root WHERE enabled=1)".to_string();
+        if !kinds.is_empty() {
+            let list = kinds.iter().map(|k| format!("'{}'", kind_str(*k))).collect::<Vec<_>>().join(",");
+            sql.push_str(&format!(" AND kind IN ({list})"));
+        }
+        let n: i64 = g.query_row(&sql, [], |r| r.get(0))?;
+        Ok(n.max(0) as u64)
+    }
+
     pub fn counts(&self) -> Result<HashMap<String, i64>> {
         let g = self.write.lock().unwrap();
         let mut st = g.prepare("SELECT state, count(*) FROM file GROUP BY state")?;

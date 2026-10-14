@@ -99,6 +99,7 @@ export const api = {
       maxFiles: opts.maxFiles && opts.maxFiles > 0 ? opts.maxFiles : null,
       scan: opts.scan ?? null,
     }),
+  indexProgress: () => call<Progress>('index_progress'),
   indexPause: () => call<null>('index_pause'),
   indexResume: () => call<null>('index_resume'),
   indexCancel: () => call<null>('index_cancel'),

@@ -125,6 +125,8 @@ export interface WatchChange {
   path: string;
   type: string;
   applied: Applied;
+  /** 行已被删除或还没建出来时为 null；用于丢掉该文件缓存的缩略图。 */
+  fileId: number | null;
 }
 
 export interface Runtime {

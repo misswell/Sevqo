@@ -102,6 +102,8 @@ export function SearchArea({
           if (id !== seq.current) return;
           setError(errorText(e));
           setHits([]);
+          // 结果清空了就不能再留着上一轮的「N 个结果」，否则页脚和列表各说一套。
+          setResp(null);
         } finally {
           if (id === seq.current) setLoading(false);
         }

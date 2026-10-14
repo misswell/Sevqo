@@ -50,8 +50,9 @@ export function IndexCard({
 
   const running = progress.phase === 'indexing' || progress.phase === 'scanning';
   const paused = progress.phase === 'paused';
-  const total = progress.totalEstimate > 0 ? progress.totalEstimate : progress.done + progress.queued;
-  const pct = total > 0 ? Math.round(((progress.done + progress.failed + progress.skipped) / total) * 100) : 0;
+  const processed = progress.done + progress.failed + progress.skipped;
+  const total = progress.totalEstimate > 0 ? progress.totalEstimate : processed + progress.queued;
+  const pct = total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 0;
 
   return (
     <section className="card">
@@ -60,10 +61,10 @@ export function IndexCard({
       </SectionTitle>
 
       <div className="prog">
-        <Bar done={progress.done + progress.failed + progress.skipped} total={total} indeterminate={running && total === 0} />
+        <Bar done={processed} total={total} indeterminate={running && total === 0} />
         <div className="prog-line">
           <span className="mono">
-            {formatNumber(progress.done)} / {formatNumber(total)}
+            {formatNumber(processed)} / {formatNumber(total)}
           </span>
           <span className="muted mono">{total > 0 ? `${pct}%` : labels.index.queueEmpty}</span>
         </div>

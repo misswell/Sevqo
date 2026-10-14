@@ -64,7 +64,7 @@ export function ModelPrompt({ compact = false, onChange }: ModelPromptProps): Re
               {download.fileIndex}/{download.fileCount} · {formatPercent(download.doneBytes, download.totalBytes)}
             </span>
           </div>
-          <Bar done={download.doneBytes} total={download.totalBytes} />
+          <Bar done={download.doneBytes} total={download.totalBytes} indeterminate={download.totalBytes <= 0} />
           <div className="download-line">
             <span className="muted mono">
               {formatBytes(download.overallBytes)} / {formatBytes(download.overallTotal)} ·{' '}

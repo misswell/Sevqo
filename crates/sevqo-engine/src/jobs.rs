@@ -271,12 +271,21 @@ impl Indexer {
         }
         let file_batch = (self.settings.infer_batch * 2).max(8);
         let mut consecutive_errors = 0usize;
+        // 每条中间事件都带累计值。以前只发 phase+current，界面上的计数会被 `..Default::default()`
+        // 冲回 0，跑一整轮都显示「0 / 0 队列为空」。
+        let mut live = Progress {
+            phase: Phase::Indexing,
+            discovered: self.db.counts().map(|c| c.values().sum::<i64>().max(0) as u64).unwrap_or(0),
+            queued: self.db.pending_count(&kinds).unwrap_or(0),
+            ..Default::default()
+        };
+        let _ = self.emit.try_send(live.clone());
         loop {
             if self.control.is_cancelled() {
                 break;
             }
             while self.control.is_paused() {
-                let _ = self.emit.try_send(Progress { phase: Phase::Paused, ..Default::default() });
+                let _ = self.emit.try_send(Progress { phase: Phase::Paused, ..live.clone() });
                 std::thread::sleep(Duration::from_millis(300));
                 if self.control.is_cancelled() {
                     sum.ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -292,7 +301,7 @@ impl Indexer {
             if batch.is_empty() {
                 break;
             }
-            let result = self.process_batch(&mut batch, mode);
+            let result = self.process_batch(&mut batch, mode, &live);
             match result {
                 Ok(out) => {
                     consecutive_errors = 0;
@@ -305,6 +314,13 @@ impl Indexer {
                             store.flush()?;
                         }
                     }
+                    let ms = started.elapsed().as_secs_f64();
+                    live.done = sum.done;
+                    live.failed = sum.failed;
+                    live.skipped = sum.skipped;
+                    live.queued = self.db.pending_count(&kinds).unwrap_or(live.queued);
+                    live.elapsed_s = ms;
+                    live.images_per_min = if ms > 1.0 { sum.done as f64 / (ms / 60.0) } else { 0.0 };
                 }
                 Err(e) => {
                     if matches!(e, Error::Cancelled) {
@@ -315,7 +331,7 @@ impl Indexer {
                     let _ = self.emit.try_send(Progress {
                         phase: Phase::Failed,
                         message: Some(e.to_string()),
-                        ..Default::default()
+                        ..live.clone()
                     });
                     // Without a model there is no point retrying the same batch forever.
                     if self.client.is_none() && mode == Mode::Full {
@@ -331,6 +347,8 @@ impl Indexer {
         let per_min = if sum.ms > 1.0 { sum.done as f64 / (sum.ms / 60_000.0) } else { 0.0 };
         let _ = self.emit.try_send(Progress {
             phase: Phase::Idle,
+            discovered: live.discovered,
+            queued: live.queued,
             done: sum.done,
             failed: sum.failed,
             skipped: sum.skipped,
@@ -342,7 +360,7 @@ impl Indexer {
         Ok(sum)
     }
 
-    fn process_batch(&self, files: &mut [FileRecord], mode: Mode) -> Result<Out> {
+    fn process_batch(&self, files: &mut [FileRecord], mode: Mode, live: &Progress) -> Result<Out> {
         // A cancelled or failed embed must be retryable without restarting the app.
         let _recovery = BatchRecovery { db: &self.db, ids: files.iter().map(|f| f.id).collect() };
         let mut out = Out::default();
@@ -358,7 +376,7 @@ impl Indexer {
             let _ = self.emit.try_send(Progress {
                 phase: Phase::Indexing,
                 current: Some(f.name.clone()),
-                ..Default::default()
+                ..live.clone()
             });
             let prepared = match f.kind {
                 Kind::Image => self.prepare_image(f, want_vectors),
@@ -687,6 +705,36 @@ mod tests {
             "cap is bytes of UTF-8 cut on a char boundary, got {}",
             stored.len()
         );
+    }
+
+    /// 界面照着这些数字画读数。中间帧只带 phase 时会被 `..Default::default()` 冲成零，
+    /// 于是跑一整轮都显示「0 / 0 队列为空」——这条钉住「每一帧都带累计值」的约定。
+    #[test]
+    fn progress_frames_keep_the_running_totals() {
+        let h = harness();
+        h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
+        for i in 0..3 {
+            add_doc(&h, &format!("n{i}.md"), &format!("第 {i} 篇海边日记"));
+        }
+        add_doc(&h, "skip.pdf", "not a pdf");
+        let (idx, rx) = indexer(&h, text_settings());
+        let kinds = idx.kinds_for(Mode::TextOnly);
+        let sum = idx.run(Mode::TextOnly, None).unwrap();
+        drop(idx);
+        let frames: Vec<Progress> = rx.iter().collect();
+        for f in &frames {
+            assert_eq!(f.discovered, 4, "每一帧都要带总数: {f:?}");
+        }
+        let running: Vec<&Progress> = frames.iter().filter(|f| f.phase == Phase::Indexing).collect();
+        assert!(!running.is_empty(), "索引过程中必须发帧: {frames:?}");
+        for f in running {
+            assert!(f.queued > 0, "还在跑就不能把队列报成空: {f:?}");
+        }
+        let last = frames.last().expect("一轮索引至少以收尾帧结束");
+        assert_eq!(last.phase, Phase::Idle);
+        assert_eq!((last.done, last.skipped, last.queued), (sum.done, sum.skipped, 0));
+        assert_eq!(h.db.pending_count(&kinds).unwrap(), h.db.pending(usize::MAX, &kinds).unwrap().len() as u64);
+        assert_eq!(h.db.pending_count(&[]).unwrap(), h.db.pending(usize::MAX, &[]).unwrap().len() as u64);
     }
 
     #[test]

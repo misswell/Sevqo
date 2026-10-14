@@ -219,7 +219,7 @@ export function Toggle({
   );
 }
 
-/** Thin progress bar: `total <= 0` renders an indeterminate rail. */
+/** Thin progress bar. `indeterminate` is the caller's call: it alone decides whether the rail moves. */
 export function Bar({
   done,
   total,
@@ -234,8 +234,9 @@ export function Bar({
   const pct = total > 0 ? Math.min(100, Math.max(0, (done / total) * 100)) : 0;
   return (
     <div className={`bar bar-${tone}`}>
+      {/* 动画只由调用方决定：空闲时 total 同样是 0，照 total 判断会让静止的进度条一直转。 */}
       <div
-        className={`bar-fill${indeterminate || total <= 0 ? ' bar-fill-indeterminate' : ''}`}
+        className={`bar-fill${indeterminate ? ' bar-fill-indeterminate' : ''}`}
         style={total > 0 ? { width: `${pct}%` } : undefined}
       />
     </div>

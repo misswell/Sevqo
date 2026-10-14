@@ -5,7 +5,7 @@ mod update;
 
 use std::sync::Arc;
 
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 use tauri_plugin_global_shortcut::{Builder as ShortcutBuilder, GlobalShortcutExt};
 
 use crate::state::AppState;
@@ -59,6 +59,7 @@ pub fn run() {
             commands::set_root_enabled,
             commands::rescan,
             commands::index_start,
+            commands::index_progress,
             commands::index_pause,
             commands::index_resume,
             commands::index_cancel,
@@ -115,12 +116,17 @@ pub fn run() {
 
             // Files queued from a previous run: tell the UI it can resume.
             if resume {
-                let queued = state.db.counts().map(|c| c.get("pending").copied().unwrap_or(0)).unwrap_or(0);
+                let counts = state.db.counts().unwrap_or_default();
+                let queued = counts.get("pending").copied().unwrap_or(0);
                 if queued > 0 {
-                    let _ = handle.emit(
-                        commands::EV_INDEX,
+                    // 走 emit_progress 而不是直接 emit：这一帧多半赶在界面挂上监听器之前，
+                    // 只有存进快照，挂载后的首次询问才能把它问回来。
+                    commands::emit_progress(
+                        &state,
+                        &handle,
                         sevqo_engine::Progress {
                             phase: sevqo_engine::Phase::Idle,
+                            discovered: counts.values().sum::<i64>().max(0) as u64,
                             queued: queued as u64,
                             message: Some(format!("有 {queued} 个文件等待索引")),
                             ..Default::default()

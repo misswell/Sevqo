@@ -27,7 +27,10 @@ export function Sidebar({ backend, onOpenSettings }: SidebarProps): ReactElement
             <span className="mono">{formatNumber(overview.files)}</span>
             <span className="brand-stat-label">{labels.index.statsFiles}</span>
             <span className="mono">{formatBytes(overview.bytes)}</span>
-            <span className={`dot ${overview.semanticReady ? 'dot-ok' : 'dot-idle'}`} title={labels.model.ready} />
+            <span
+              className={`dot ${overview.semanticReady ? 'dot-ok' : 'dot-idle'}`}
+              title={overview.semanticReady ? labels.model.ready : labels.model.notReady}
+            />
           </span>
         ) : null}
       </header>

@@ -88,15 +88,17 @@ function loadClipThumb(fileId: number, clipId: number): Promise<string | null> {
   return p;
 }
 
-/** Drop cached thumbnails for a file (after a rebuild / re-index). */
-export function invalidateThumbs(fileId?: number): void {
+/** Files are re-rendered on disk after a rebuild or a watcher-driven re-index; drop what we cached for them. */
+export function invalidateFileCache(fileId?: number): void {
   if (fileId == null) {
     thumbCache.clear();
+    momentCache.clear();
     return;
   }
   for (const key of [...thumbCache.keys()]) {
     if (key === `f:${fileId}` || key.startsWith(`c:${fileId}:`)) thumbCache.delete(key);
   }
+  momentCache.delete(fileId);
 }
 
 /** Lazy data-URL thumbnail; only fetched once `enabled` (row in view). */
@@ -217,6 +219,21 @@ export function useFocusOnMount(): RefObject<HTMLInputElement> {
     return () => window.clearTimeout(id);
   }, []);
   return ref;
+}
+
+/**
+ * Hidden webviews miss events and get their timers throttled, so coming back on screen
+ * is exactly when stale state shows up. Re-ask for the truth at that moment.
+ */
+export function useOnVisible(action: () => void): void {
+  const ref = useEventCallback(action);
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') ref();
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => document.removeEventListener('visibilitychange', onVisible);
+  }, [ref]);
 }
 
 /**

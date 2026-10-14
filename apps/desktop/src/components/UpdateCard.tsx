@@ -75,7 +75,7 @@ export function UpdateCard({
                 : formatBytes(update?.downloaded ?? 0)}
             </span>
           </div>
-          <Bar done={update?.downloaded ?? 0} total={total} />
+          <Bar done={update?.downloaded ?? 0} total={total} indeterminate={total <= 0} />
         </div>
       ) : null}
 

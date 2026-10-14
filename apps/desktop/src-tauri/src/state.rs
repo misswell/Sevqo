@@ -7,7 +7,7 @@ use sevqo_engine::db::Db;
 use sevqo_engine::infer::Client;
 use sevqo_engine::jobs::Control;
 use sevqo_engine::watch::WatcherHandle;
-use sevqo_engine::{Paths, Settings};
+use sevqo_engine::{Phase, Progress, Paths, Settings};
 
 /// Everything the commands share. Kept behind `Arc`/`Mutex` because Tauri hands state
 /// to a worker thread on every command call.
@@ -22,6 +22,9 @@ pub struct AppState {
     pub vision_ready: AtomicBool,
     pub control: Control,
     pub indexing: AtomicBool,
+    /// 索引事件的最后一帧。事件只在被收到的那一刻有用：窗口藏着、监听器还没挂上，整条就没了，
+    /// 界面会永远停在「索引中」。所以存一份，前端随时能问回来。
+    last_progress: Mutex<Progress>,
     pub download_cancel: Arc<AtomicBool>,
     pub downloading: AtomicBool,
     pub watcher: Mutex<Option<WatcherHandle>>,
@@ -57,6 +60,7 @@ impl AppState {
             db,
             control: Control::default(),
             indexing: AtomicBool::new(false),
+            last_progress: Mutex::new(Progress::default()),
             download_cancel: Arc::new(AtomicBool::new(false)),
             downloading: AtomicBool::new(false),
             watcher: Mutex::new(None),
@@ -96,6 +100,24 @@ impl AppState {
 
     pub fn indexing(&self) -> bool {
         self.indexing.load(Ordering::Relaxed)
+    }
+
+    pub fn publish_progress(&self, p: Progress) {
+        if let Ok(mut g) = self.last_progress.lock() {
+            *g = p;
+        }
+    }
+
+    /// 没在跑却停在运行中的相位，说明那是上一轮的残留事件：降级成空闲再交给界面。
+    pub fn progress_snapshot(&self) -> Progress {
+        let p = self.last_progress.lock().map(|g| g.clone()).unwrap_or_default();
+        if self.indexing() {
+            return p;
+        }
+        match p.phase {
+            Phase::Scanning | Phase::Indexing | Phase::Paused => Progress { phase: Phase::Idle, current: None, ..p },
+            _ => p,
+        }
     }
 
     /// False when a pass is already running, so two triggers cannot race.
@@ -202,6 +224,25 @@ mod tests {
         drop(permit);
         assert!(!state.indexing());
         assert!(state.try_begin_index().is_some());
+    }
+
+    /// 事件整条漏掉时，界面只能信这一帧：没在跑却报「索引中」就是把上一轮的残留当成现状。
+    #[test]
+    fn stale_progress_frames_are_downgraded_to_idle() {
+        let (_dir, state) = test_state();
+        state.publish_progress(Progress {
+            phase: Phase::Indexing,
+            done: 3,
+            queued: 7,
+            current: Some("a.md".into()),
+            ..Default::default()
+        });
+        let snap = state.progress_snapshot();
+        assert_eq!(snap.phase, Phase::Idle, "空闲时不能把运行中的残留帧交出去");
+        assert_eq!((snap.done, snap.queued), (3, 7), "降级相位不该抹掉已经发生的事实");
+        assert!(snap.current.is_none(), "没有正在处理的文件却报着文件名");
+        let _permit = state.try_begin_index().unwrap();
+        assert_eq!(state.progress_snapshot().phase, Phase::Indexing, "真的在跑就原样报出来");
     }
 
     #[test]

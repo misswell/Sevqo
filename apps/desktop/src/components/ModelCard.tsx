@@ -24,9 +24,10 @@ function statusOf(model: ModelInfo | null, download: DownloadProgress | null): {
   if (!model) return { text: labels.common.loading, tone: 'neutral' };
   if (model.downloading || download) return { text: labels.model.downloading, tone: 'accent' };
   if (model.ready) return { text: labels.model.ready, tone: 'ok' };
+  // 权重没齐时先说权重：下载不需要 Python，报「缺 Python」会把人支到错误的那一步。
+  if (!model.status.complete) return { text: labels.model.incomplete, tone: 'neutral' };
   if (!model.hasPython) return { text: labels.model.missingPython, tone: 'warn' };
-  if (model.status.complete) return { text: labels.model.notReady, tone: 'warn' };
-  return { text: labels.model.incomplete, tone: 'neutral' };
+  return { text: labels.model.notReady, tone: 'warn' };
 }
 
 export function ModelCard({
@@ -98,7 +99,7 @@ export function ModelCard({
               {download.fileIndex}/{download.fileCount}
             </span>
           </div>
-          <Bar done={download.doneBytes} total={download.totalBytes} />
+          <Bar done={download.doneBytes} total={download.totalBytes} indeterminate={download.totalBytes <= 0} />
           {showOverall ? (
             <>
               <div className="download-line">
@@ -138,7 +139,8 @@ export function ModelCard({
         </Btn>
       </div>
 
-      {!model?.hasPython ? <Note>{labels.model.missingPythonHint}</Note> : null}
+      {/* 权重还没齐时先谈权重：下载不需要 Python，这时候喊缺 Python 会把人支到错误的那一步。 */}
+      {model && !model.hasPython && model.status.complete ? <Note>{labels.model.missingPythonHint}</Note> : null}
       {modelState?.note && !model?.downloading ? <Note>{modelState.note}</Note> : null}
       {error ? <Note tone="error">{error}</Note> : null}
 

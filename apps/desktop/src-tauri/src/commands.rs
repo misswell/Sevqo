@@ -402,30 +402,45 @@ pub fn index_start(app: AppHandle, mode: Option<String>, max_files: Option<usize
         .spawn(move || {
             let _permit = permit;
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_index(&app2, &st, m, max_files, scan_first)));
-            match outcome {
+            let failure: Option<String> = match outcome {
                 Err(_) => {
                     tracing::error!("索引线程异常终止");
-                    emit_progress(&app2, Progress { phase: Phase::Failed, message: Some("索引线程异常终止".into()), ..Default::default() });
+                    Some("索引线程异常终止".into())
                 }
-                Ok(Err(msg)) => emit_progress(&app2, Progress { phase: Phase::Failed, message: Some(msg), ..Default::default() }),
-                Ok(Ok(())) => {}
+                Ok(Err(msg)) => Some(msg),
+                Ok(Ok(())) => None,
+            };
+            if let Some(message) = failure {
+                // 带上累计值：清零会让界面上的数字在这一帧凭空消失。
+                let last = st.progress_snapshot();
+                emit_progress(&st, &app2, Progress { phase: Phase::Failed, message: Some(message), ..last });
             }
         })
         .map_err(es)?;
     Ok(())
 }
 
-fn emit_progress(app: &AppHandle, p: Progress) {
+/// Every index frame goes through here: the webview is the second consumer, and the
+/// snapshot is what the UI reads when it mounted (or woke up) after the event flew past.
+pub(crate) fn emit_progress(st: &Arc<AppState>, app: &AppHandle, p: Progress) {
+    st.publish_progress(p.clone());
     let _ = app.emit(EV_INDEX, &p);
+}
+
+/// 界面打开、窗口从隐藏里回来、事件整条漏掉时靠这个问一次当前状态。
+#[tauri::command]
+pub fn index_progress(app: AppHandle) -> Progress {
+    app_state(&app).progress_snapshot()
 }
 
 fn run_index(app: &AppHandle, st: &Arc<AppState>, mode: Mode, max_files: Option<usize>, scan_first: bool) -> Res<()> {
     let (tx, rx) = crossbeam_channel::unbounded::<Progress>();
     let fwd = {
         let app = app.clone();
+        let st = st.clone();
         std::thread::spawn(move || {
             while let Ok(p) = rx.recv() {
-                let _ = app.emit(EV_INDEX, &p);
+                emit_progress(&st, &app, p);
             }
         })
     };
@@ -442,11 +457,12 @@ fn run_index(app: &AppHandle, st: &Arc<AppState>, mode: Mode, max_files: Option<
             st.db.mark_missing_vectors().map_err(es)?;
         }
         if scan_first {
-            emit_progress(app, Progress { phase: Phase::Scanning, message: Some("正在扫描目录".into()), ..Default::default() });
+            // 新一轮开始：计数从零起，别把上一轮的残留带进来。
+            emit_progress(st, app, Progress { phase: Phase::Scanning, message: Some("正在扫描目录".into()), ..Default::default() });
             let rep = scan_all(st, None)?;
             tracing::info!("扫描完成：{} 个候选，排队 {} 个", rep.candidates, rep.queued);
         }
-        emit_progress(app, Progress { phase: Phase::Indexing, ..Default::default() });
+        emit_progress(st, app, Progress { phase: Phase::Indexing, ..Default::default() });
         let sum = idx.run(mode, max_files).map_err(es)?;
         Ok(IndexReport {
             done: sum.done,
@@ -459,22 +475,12 @@ fn run_index(app: &AppHandle, st: &Arc<AppState>, mode: Mode, max_files: Option<
     })();
     close_progress(idx, tx, fwd);
     match &result {
-        Ok(rep) => {
-            tracing::info!("索引一轮完成：{} 成功 / {} 失败 / {} 跳过", rep.done, rep.failed, rep.skipped);
-            emit_progress(
-                app,
-                Progress {
-                    phase: Phase::Idle,
-                    done: rep.done,
-                    failed: rep.failed,
-                    skipped: rep.skipped,
-                    elapsed_s: rep.ms / 1000.0,
-                    message: Some(format!("本轮处理 {} 个文件", rep.done)),
-                    ..Default::default()
-                },
-            );
+        // 收尾那一帧由 Indexer 自己发（它手上才有累计值），这里再发一帧只会把计数冲掉。
+        Ok(rep) => tracing::info!("索引一轮完成：{} 成功 / {} 失败 / {} 跳过", rep.done, rep.failed, rep.skipped),
+        Err(msg) => {
+            let last = st.progress_snapshot();
+            emit_progress(st, app, Progress { phase: Phase::Failed, message: Some(msg.clone()), ..last });
         }
-        Err(msg) => emit_progress(app, Progress { phase: Phase::Failed, message: Some(msg.clone()), ..Default::default() }),
     }
     result.map(|_| ())
 }
@@ -1005,11 +1011,15 @@ fn watch_loop(st: &Arc<AppState>, app: &AppHandle, rx: crossbeam_channel::Receiv
                 let mut needs_rescan = false;
                 for (_, c) in pending_changes.drain() {
                     let path = c.path().to_string_lossy().to_string();
+                    // Removed 之后行就查不到了，先记住 id；新建则相反，应用完才有行。
+                    let before = st.db.file_by_path(&path).map(|f| f.id);
                     match apply_change_with_options(&st.db, &c, &opts) {
                         Ok(applied) => {
                             needs_rescan |= matches!(applied, Applied::NeedsRescan);
+                            // 缩略图按路径覆盖写盘，前端却把它缓存成 data URL：带上 id 界面才知道该丢哪一张。
+                            let file_id = st.db.file_by_path(&path).map(|f| f.id).or(before);
                             let _ = app.emit(EV_WATCH, serde_json::json!({
-                                "path": path, "type": c.kind_name(), "applied": applied_name(applied)
+                                "path": path, "type": c.kind_name(), "applied": applied_name(applied), "fileId": file_id
                             }));
                         }
                         Err(err) => {
@@ -1071,9 +1081,10 @@ fn incremental_pass(st: &Arc<AppState>, app: &AppHandle) -> Res<bool> {
     let (tx, rx) = crossbeam_channel::unbounded::<Progress>();
     let fwd = {
         let app = app.clone();
+        let st = st.clone();
         std::thread::spawn(move || {
             while let Ok(p) = rx.recv() {
-                let _ = app.emit(EV_INDEX, &p);
+                emit_progress(&st, &app, p);
             }
         })
     };
