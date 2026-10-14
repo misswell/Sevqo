@@ -3,9 +3,12 @@ name: Release
 # macOS 双架构构建 → Developer ID 签名 → 公证 → 装订 → minisign 更新包 → latest.json → GitHub Release。
 # 需要仓库 secrets（缺一不可，脚本会显式报错而不是悄悄跳过）：
 #   APPLE_DEVELOPER_ID_P12_BASE64 / APPLE_DEVELOPER_ID_P12_PASSWORD   签名证书
-#   APPLE_ID / APPLE_TEAM_ID / APPLE_APP_SPECIFIC_PASSWORD            公证凭据
+#   公证二选一：APPLE_API_KEY_BASE64(+APPLE_API_KEY_ID/APPLE_API_ISSUER)
+#              或 APPLE_ID / APPLE_TEAM_ID / APPLE_APP_SPECIFIC_PASSWORD
 #   TAURI_SIGNING_PRIVATE_KEY / TAURI_SIGNING_PRIVATE_KEY_PASSWORD    更新包 minisign 私钥
 #   （公钥已经写进 apps/desktop/src-tauri/tauri.conf.json，换了密钥要同步）
+# 只想知道 secrets 配没配对：手动跑一次并勾 probeCredentials，它只装证书、试签、查公证，
+# 不做 20 分钟的完整构建，也不会发布任何东西。
 # Windows / Linux 暂不在发版链路里：推理侧的 Python 依赖在那些平台上还没验证过，
 # 与其发一个装不上的安装包，不如只发验证过的平台。
 
@@ -22,6 +25,11 @@ on:
       publish:
         description: 校验通过后是否发布 GitHub Release
         required: true
+        default: false
+        type: boolean
+      probeCredentials:
+        description: 只验证签名与公证凭据能否在 Runner 上用通，不做构建
+        required: false
         default: false
         type: boolean
 
@@ -88,6 +96,68 @@ jobs:
               echo "构建与发布任务会被跳过（未签名的安装包没有发布意义）。本机发版走 \`bash tools/release_macos.sh && bash tools/publish_release.sh\`。"
             } >>"$GITHUB_STEP_SUMMARY"
             echo "缺凭据，后续构建任务将跳过：${missing[*]}"
+          fi
+
+  probe-credentials:
+    # Secret 名字存在不等于值能用：这里在 Runner 上真装一次证书、真试签一次、真问一次公证。
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.probeCredentials }}
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_REF }}
+
+      - name: 导入 Developer ID 证书并试签
+        env:
+          DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+        run: bash .github/scripts/import_signing_identity.sh
+
+      - name: 验证公证凭据
+        env:
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -n "${APPLE_API_KEY_BASE64:-}" ]; then
+            key="$(mktemp)"; chmod 600 "$key"
+            printf '%s' "$APPLE_API_KEY_BASE64" | base64 -D >"$key"
+            xcrun notarytool history --key "$key" --key-id "$APPLE_API_KEY_ID" \
+              --issuer "$APPLE_API_ISSUER" --output-format json | jq '.history | length'
+            rm -f "$key"
+            echo "==> 公证可用：App Store Connect API key"
+          elif [ -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]; then
+            xcrun notarytool history --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+              --password "$APPLE_APP_SPECIFIC_PASSWORD" --output-format json | jq '.history | length'
+            echo "==> 公证可用：Apple ID + app-specific password"
+          else
+            echo "两条公证路线都没有凭据：需要 APPLE_API_KEY_BASE64(+ID/ISSUER) 或 APPLE_APP_SPECIFIC_PASSWORD" >&2
+            exit 1
+          fi
+
+      - name: 验证更新包签名私钥能解出
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          decoded="$(printf '%s' "$TAURI_SIGNING_PRIVATE_KEY" | base64 -D | head -c 200)"
+          case "$decoded" in
+            untrusted*) echo "==> 私钥格式正确（minisign untrusted，$(printf '%s' "$decoded" | wc -c | tr -d ' ') 字节起头可读）" ;;
+            *) echo "TAURI_SIGNING_PRIVATE_KEY 解出来不是 minisign 私钥，内容配错了" >&2; exit 1 ;;
+          esac
+          # 口令错误只在真正签名时暴露，这里至少确认它非空
+          [ -n "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" ] || echo "注意：私钥口令为空，只有未加密的密钥才该这样"
+
+      - name: 清理临时钥匙串
+        if: always()
+        run: |
+          if [ -n "${SIGNING_KEYCHAIN:-}" ] && [ -e "${SIGNING_KEYCHAIN}" ]; then
+            security delete-keychain "${SIGNING_KEYCHAIN}"
           fi
 
   build-macos:
