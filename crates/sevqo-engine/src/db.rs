@@ -176,6 +176,16 @@ impl Db {
         }
         // A crash mid-item must not leave rows stuck in `indexing` forever.
         c.execute("UPDATE file SET state='pending' WHERE state='indexing'", [])?;
+        // Older builds only inserted FTS rows when a document had body text,
+        // leaving images, videos and empty documents unsearchable by filename.
+        let missing: Vec<(i64, String, String)> = {
+            let mut stmt = c.prepare("SELECT id,name,path FROM file WHERE state='done' AND id NOT IN (SELECT rowid FROM fts)")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        for (id, name, path) in missing {
+            ensure_filename_row(&c, id, &name, &path)?;
+        }
         Ok(Db { path: path.to_path_buf(), write: Mutex::new(c) })
     }
 
@@ -330,7 +340,19 @@ impl Db {
 
     pub fn set_file_state(&self, id: i64, state: FileState, error: Option<&str>) -> Result<()> {
         let g = self.write.lock().unwrap();
+        if state == FileState::Done {
+            let (name, path): (String, String) = g.query_row("SELECT name,path FROM file WHERE id=?", params![id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            ensure_filename_row(&g, id, &name, &path)?;
+        }
         g.execute("UPDATE file SET state=?,error=?,indexed_ns=? WHERE id=?", params![state.as_str(), error, now_ns(), id])?;
+        Ok(())
+    }
+
+    pub fn recover_indexing_files(&self, ids: &[i64]) -> Result<()> {
+        let g = self.write.lock().unwrap();
+        for id in ids {
+            g.execute("UPDATE file SET state='pending' WHERE id=? AND state='indexing'", params![id])?;
+        }
         Ok(())
     }
 
@@ -363,7 +385,7 @@ impl Db {
     /// then documents/code.
     pub fn pending(&self, limit: usize, kinds: &[Kind]) -> Result<Vec<FileRecord>> {
         let g = self.write.lock().unwrap();
-        let mut sql = format!("SELECT {FILE_COLS} FROM file WHERE state IN ('pending','stale')");
+        let mut sql = format!("SELECT {FILE_COLS} FROM file WHERE state IN ('pending','stale') AND root_id IN (SELECT id FROM root WHERE enabled=1)");
         if !kinds.is_empty() {
             let list = kinds.iter().map(|k| format!("'{}'", kind_str(*k))).collect::<Vec<_>>().join(",");
             sql.push_str(&format!(" AND kind IN ({list})"));
@@ -456,7 +478,7 @@ impl Db {
     pub fn insert_clips(&self, file_id: i64, clips: &[(f64, f64)]) -> Result<Vec<(i64, usize)>> {
         let g = self.write.lock().unwrap();
         g.execute("DELETE FROM clip WHERE file_id=?", params![file_id])?;
-        g.execute("DELETE FROM vec_map WHERE file_id=? AND target_kind='clip'", params![file_id])?;
+        g.execute("UPDATE vec_map SET alive=0 WHERE file_id=? AND target_kind='clip'", params![file_id])?;
         let mut out = Vec::with_capacity(clips.len());
         for (ord, (start, end)) in clips.iter().enumerate() {
             g.execute(
@@ -487,6 +509,7 @@ impl Db {
     /// Allocate the next physical row in the vector file for an embeddable unit.
     pub fn reserve_vec_row(&self, target: EmbedRowKind, ref_id: i64, file_id: i64) -> Result<i64> {
         let g = self.write.lock().unwrap();
+        g.execute("UPDATE vec_map SET alive=0 WHERE target_kind=? AND ref_id=?", params![target.as_str(), ref_id])?;
         let next: i64 = g.query_row("SELECT COALESCE(MAX(row_id),-1)+1 FROM vec_map", [], |r| r.get(0))?;
         g.execute(
             "INSERT INTO vec_map(row_id,target_kind,ref_id,file_id,alive) VALUES(?,?,?,?,1)",
@@ -541,16 +564,20 @@ impl Db {
     /// After compaction, rewrite row ids and every `vec_row` pointer. `mapping` must be
     /// ascending by old row id, as `live_rows_for_compaction` returns.
     pub fn apply_compaction(&self, mapping: &[(i64, i64)]) -> Result<usize> {
-        let g = self.write.lock().unwrap();
-        let dropped = g.execute("DELETE FROM vec_map WHERE alive=0", [])?;
+        let mut g = self.write.lock().unwrap();
+        let tx = g.transaction()?;
+        tx.execute("UPDATE chunk SET vec_row=NULL WHERE vec_row IN (SELECT row_id FROM vec_map WHERE alive=0)", [])?;
+        tx.execute("UPDATE clip SET vec_row=NULL WHERE vec_row IN (SELECT row_id FROM vec_map WHERE alive=0)", [])?;
+        let dropped = tx.execute("DELETE FROM vec_map WHERE alive=0", [])?;
         for (old, new) in mapping {
             if old == new {
                 continue;
             }
-            g.execute("UPDATE vec_map SET row_id=? WHERE row_id=?", params![new, old])?;
-            g.execute("UPDATE chunk SET vec_row=? WHERE vec_row=?", params![new, old])?;
-            g.execute("UPDATE clip SET vec_row=? WHERE vec_row=?", params![new, old])?;
+            tx.execute("UPDATE vec_map SET row_id=? WHERE row_id=?", params![new, old])?;
+            tx.execute("UPDATE chunk SET vec_row=? WHERE vec_row=?", params![new, old])?;
+            tx.execute("UPDATE clip SET vec_row=? WHERE vec_row=?", params![new, old])?;
         }
+        tx.commit()?;
         Ok(dropped)
     }
 
@@ -561,10 +588,17 @@ impl Db {
 
     /// Searchable vector rows, pre-filtered by modality so the scan can skip whole blocks.
     pub fn vec_candidates(&self, kinds: &[Kind]) -> Result<Vec<crate::VecRow>> {
+        let mut req = SearchRequest::default();
+        req.filters.kinds = kinds.to_vec();
+        self.vec_candidates_for(&req)
+    }
+
+    pub fn vec_candidates_for(&self, req: &SearchRequest) -> Result<Vec<crate::VecRow>> {
         let g = self.write.lock().unwrap();
         let mut sql = String::from(
             "SELECT m.row_id,m.target_kind,m.ref_id,m.file_id,f.kind FROM vec_map m JOIN file f ON f.id=m.file_id WHERE m.alive=1 AND f.state='done'",
         );
+        let kinds = &req.filters.kinds;
         if !kinds.is_empty() {
             let mut list: Vec<String> = Vec::new();
             for k in kinds {
@@ -583,8 +617,10 @@ impl Db {
             }
             sql.push_str(&format!(" AND m.target_kind IN ({})", list.join(",")));
         }
+        let mut bind: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        push_filters(&mut sql, &mut bind, req);
         let mut st = g.prepare(&sql)?;
-        let rows = st.query_map([], |r| -> rusqlite::Result<crate::VecRow> {
+        let rows = st.query_map(rusqlite::params_from_iter(bind.iter()), |r| -> rusqlite::Result<crate::VecRow> {
             Ok(crate::VecRow {
                 row: r.get(0)?,
                 target: EmbedRowKind::parse(&r.get::<_, String>(1)?),
@@ -624,7 +660,7 @@ impl Db {
 
     pub fn reindex_all(&self) -> Result<usize> {
         let g = self.write.lock().unwrap();
-        let n = g.execute("UPDATE file SET state='pending',error=NULL WHERE state!='skipped'", [])?;
+        let n = g.execute("UPDATE file SET state='pending',error=NULL", [])?;
         g.execute("DELETE FROM vec_map", [])?;
         g.execute("UPDATE chunk SET vec_row=NULL", [])?;
         g.execute("UPDATE clip SET vec_row=NULL", [])?;
@@ -696,6 +732,7 @@ impl Db {
 }
 
 fn push_filters(sql: &mut String, bind: &mut Vec<Box<dyn rusqlite::types::ToSql>>, req: &SearchRequest) {
+    sql.push_str(" AND f.root_id IN (SELECT id FROM root WHERE enabled=1)");
     if !req.filters.kinds.is_empty() {
         let list = req.filters.kinds.iter().map(|k| format!("'{}'", kind_str(*k))).collect::<Vec<_>>().join(",");
         sql.push_str(&format!(" AND f.kind IN ({list})"));
@@ -721,6 +758,14 @@ fn push_filters(sql: &mut String, bind: &mut Vec<Box<dyn rusqlite::types::ToSql>
         bind.push(Box::new(v));
     }
     sql.push_str(" AND f.state='done'");
+}
+
+fn ensure_filename_row(g: &Connection, id: i64, name: &str, path: &str) -> Result<()> {
+    g.execute(
+        "INSERT INTO fts(rowid,name_seg,path_seg,title_seg,body_seg) SELECT ?,?,?,'','' WHERE NOT EXISTS (SELECT 1 FROM fts WHERE rowid=?)",
+        params![id, segment::segment(name), segment::segment(path), id],
+    )?;
+    Ok(())
 }
 
 /// Remove every derived artefact of these files, including the rows themselves.

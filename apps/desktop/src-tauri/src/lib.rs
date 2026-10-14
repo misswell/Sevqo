@@ -143,7 +143,7 @@ pub fn run() {
         .run(move |_app, event| {
             if matches!(event, tauri::RunEvent::Exit) {
                 // torch holds gigabytes; kill the child rather than orphan it.
-                state.client.shutdown();
+                state.client().shutdown();
             }
         });
 }

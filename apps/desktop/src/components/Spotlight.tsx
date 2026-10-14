@@ -29,6 +29,7 @@ export function Spotlight(): ReactElement {
   const [mediaOf, setMediaOf] = useState<MediaQuery | null>(null);
 
   const seq = useRef(0);
+  const textIntent = useRef(true);
   const cardRef = useRef<HTMLDivElement | null>(null);
   const listRef = useRef<HTMLUListElement | null>(null);
   const inputRef = useFocusOnMount();
@@ -61,6 +62,7 @@ export function Spotlight(): ReactElement {
   }, []);
 
   const runMedia = useCallback(async (media: MediaQuery) => {
+    textIntent.current = false;
     const id = ++seq.current;
     setLoading(true);
     setError(null);
@@ -91,11 +93,12 @@ export function Spotlight(): ReactElement {
   });
 
   const debouncedHybrid = useDebounced<string>((q) => {
-    void run(q, true);
+    if (textIntent.current) void run(q, true);
   }, 350);
 
   const onChange = useCallback(
     (value: string) => {
+      textIntent.current = true;
       setQuery(value);
       setActive(0);
       setMediaOf(null);

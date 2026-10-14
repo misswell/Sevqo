@@ -72,8 +72,19 @@ fn is_excluded_dir(name: &str, excludes: &[String]) -> bool {
 }
 
 fn under_prefixes(path: &Path, prefixes: &[String]) -> bool {
-    let s = path.to_string_lossy();
-    prefixes.iter().any(|p| !p.is_empty() && (s == *p || s.starts_with(&format!("{p}/"))))
+    prefixes.iter().any(|p| !p.is_empty() && path.starts_with(expand_home(p)))
+}
+
+/// Apply the same scope exclusions to a watcher event as to a directory walk.
+pub fn excluded_path(root: &Path, path: &Path, opts: &ScanOptions) -> bool {
+    if under_prefixes(path, opts.exclude_prefixes) {
+        return true;
+    }
+    let Ok(relative) = path.strip_prefix(root) else { return true };
+    relative.components().any(|c| {
+        let name = c.as_os_str().to_string_lossy();
+        name.starts_with('.') || is_excluded_dir(&name, opts.exclude_dirs)
+    })
 }
 
 /// Walk one root, emitting candidate files. `seen_ns` stamps every emitted file so a

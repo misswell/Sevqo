@@ -13,7 +13,7 @@ use std::time::Instant;
 use crate::db::Db;
 use crate::segment;
 use crate::vectors::MmapView;
-use crate::{Channel, EmbedItem, Error, FileRecord, Hit, Kind, Moment, Result, SearchRequest, SearchResponse};
+use crate::{Channel, EmbedItem, Error, FileRecord, Hit, Moment, Result, SearchRequest, SearchResponse};
 
 const RRF_K: f64 = 60.0;
 
@@ -77,8 +77,7 @@ impl Searcher {
                 view.dim()
             )));
         }
-        let kinds: Vec<Kind> = effective_kinds(req);
-        let candidates = self.db.vec_candidates(&kinds)?;
+        let candidates = self.db.vec_candidates_for(req)?;
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
@@ -283,15 +282,6 @@ fn hit_from_file(f: FileRecord, score: f64, channel: Channel) -> Hit {
     }
 }
 
-/// Which vector target kinds are worth scanning for this request.
-fn effective_kinds(req: &SearchRequest) -> Vec<Kind> {
-    if req.filters.kinds.is_empty() {
-        vec![Kind::Image, Kind::Video, Kind::Document, Kind::Code]
-    } else {
-        req.filters.kinds.clone()
-    }
-}
-
 /// One text query → one vector. The search-instruction prefix is what the model was
 /// trained with, so omitting it measurably costs precision.
 pub fn query_vector(
@@ -359,7 +349,7 @@ mod tests {
     use crate::db::Db;
     use crate::scan::Scanned;
     use crate::vectors::Store;
-    use crate::{EmbedRowKind, Filters, VecRow};
+    use crate::{EmbedRowKind, Filters, Kind, VecRow};
 
     fn setup(dim: usize) -> (tempfile::TempDir, Db, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -439,6 +429,67 @@ mod tests {
         let s = Searcher::new(Arc::new(db), &vp).unwrap();
         let hits = s.keyword(&req("parser"), "parser", 10).unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn media_without_body_text_is_searchable_by_filename() {
+        let (_d, db, vp) = setup(4);
+        let s = Searcher::new(Arc::new(db), &vp).unwrap();
+        let hits = s.keyword(&req("clip"), "clip", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(s.db.file(hits[0].0).unwrap().kind, Kind::Video);
+    }
+
+    #[test]
+    fn reopening_repairs_missing_filename_rows_without_reembedding() {
+        let (_d, db, vp) = setup(4);
+        let file = db.file_by_path("/tmp/photos/clip.mp4").unwrap();
+        // Reproduce an old index with a done file but no FTS body/metadata row.
+        db.store_text(file.id, None, "", false).unwrap();
+        let path = db.path().to_path_buf();
+        drop(db);
+        let reopened = Db::open(&path).unwrap();
+        let s = Searcher::new(Arc::new(reopened), &vp).unwrap();
+        assert_eq!(s.keyword(&req("clip"), "clip", 10).unwrap().len(), 1);
+        assert_eq!(s.db.file(file.id).unwrap().state, crate::FileState::Done);
+    }
+
+    #[test]
+    fn disabled_roots_are_absent_from_all_search_channels_and_queue() {
+        let (_d, db, vp) = setup(4);
+        let root = db.list_roots().unwrap()[0].id;
+        db.set_root_enabled(root, false).unwrap();
+        let s = Searcher::new(Arc::new(db), &vp).unwrap();
+        assert!(s.keyword(&req("海边"), "海边", 10).unwrap().is_empty());
+        assert!(s.semantic(&req("x"), &[1.0, 0.0, 0.0, 0.0], 10).unwrap().is_empty());
+        assert!(s.run(&req(""), None).unwrap().hits.is_empty());
+        let file = s.db.file_by_path("/tmp/photos/parser.rs").unwrap();
+        s.db.set_file_state(file.id, crate::FileState::Pending, None).unwrap();
+        assert!(s.db.pending(10, &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn semantic_applies_root_size_date_and_document_code_filters() {
+        let (_d, db, vp) = setup(4);
+        let s = Searcher::new(Arc::new(db), &vp).unwrap();
+        let query = [1.0, 1.0, 0.0, 0.0];
+        for filters in [
+            Filters { root_id: Some(9999), ..Default::default() },
+            Filters { min_size: Some(1025), ..Default::default() },
+            Filters { max_size: Some(1023), ..Default::default() },
+            Filters { after_ns: Some(i64::MAX), ..Default::default() },
+            Filters { before_ns: Some(0), ..Default::default() },
+            Filters { kinds: vec![Kind::Document], ..Default::default() },
+        ] {
+            let mut r = req("x");
+            r.filters = filters;
+            assert!(s.semantic(&r, &query, 10).unwrap().is_empty(), "{:?}", r.filters);
+        }
+        let mut r = req("x");
+        r.filters.kinds = vec![Kind::Code];
+        let hits = s.semantic(&r, &query, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(s.db.file(hits[0].0).unwrap().kind, Kind::Code);
     }
 
     #[test]

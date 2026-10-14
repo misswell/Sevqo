@@ -78,7 +78,7 @@ function list(raw: string): string[] {
 
 const numericFields: Array<{ key: keyof Draft; label: string; min: number }> = [
   { key: 'vectorDim', label: labels.settings.vectorDim, min: 1 },
-  { key: 'inferThreads', label: labels.settings.inferThreads, min: 1 },
+  { key: 'inferThreads', label: labels.settings.inferThreads, min: 0 },
   { key: 'inferBatch', label: labels.settings.inferBatch, min: 1 },
   { key: 'ramBudgetMb', label: labels.settings.ramBudgetMb, min: 1 },
   { key: 'videoWindowS', label: labels.settings.videoWindowS, min: 0.1 },
@@ -100,10 +100,6 @@ export function SettingsSheet({ settings, busy, onClose, onSave }: SettingsSheet
   const [draft, setDraft] = useState<Draft>(() => toDraft(settings));
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
-
-  useEffect(() => {
-    setDraft(toDraft(settings));
-  }, [settings]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -138,7 +134,7 @@ export function SettingsSheet({ settings, busy, onClose, onSave }: SettingsSheet
       indexCode: draft.indexCode,
       resumeOnLaunch: draft.resumeOnLaunch,
       vectorDim: Math.round(dim),
-      inferThreads: Math.round(num(draft.inferThreads, 1) ?? settings.inferThreads),
+      inferThreads: Math.round(num(draft.inferThreads, 0) ?? settings.inferThreads),
       inferBatch: Math.round(num(draft.inferBatch, 1) ?? settings.inferBatch),
       ramBudgetMb: Math.round(num(draft.ramBudgetMb, 1) ?? settings.ramBudgetMb),
       videoWindowS: num(draft.videoWindowS, 0.1) ?? settings.videoWindowS,
@@ -272,7 +268,7 @@ export function SettingsSheet({ settings, busy, onClose, onSave }: SettingsSheet
             <h3>{labels.settings.groupModel}</h3>
             <label className="field">
               <span className="field-label">{labels.settings.modelRepo}</span>
-              <TextInput value={draft.modelRepo} onChange={(v) => set('modelRepo', v)} mono />
+              <input className="input" value={draft.modelRepo} readOnly />
             </label>
             <label className="field">
               <span className="field-label">

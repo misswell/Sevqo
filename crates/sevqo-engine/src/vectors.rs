@@ -160,9 +160,13 @@ impl Store {
                 out.extend_from_slice(&x.to_le_bytes());
             }
         }
-        self.file.set_len(0)?;
-        self.file.seek(SeekFrom::Start(0))?;
-        self.file.write_all(&out)?;
+        // Existing search mappings must retain a valid old file; truncating it in
+        // place can cause SIGBUS while a search is reading the mapped pages.
+        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+        let mut replacement = tempfile::NamedTempFile::new_in(parent)?;
+        replacement.write_all(&out)?;
+        replacement.as_file().sync_all()?;
+        self.file = replacement.persist(&self.path).map_err(|e| Error::Io(e.error))?;
         self.rows = live.len();
         self.file.sync_data()?;
         Ok(())
@@ -299,6 +303,23 @@ mod tests {
         assert_eq!(hits[0].0.row, 0);
         assert!((hits[0].1 - 1.0).abs() < 1e-6);
         assert_eq!(hits[1].0.row, 2);
+    }
+
+    #[test]
+    fn compaction_keeps_existing_search_mappings_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("v.f32");
+        let mut store = Store::open(&p, 2).unwrap();
+        store.put(0, &[1.0, 0.0]).unwrap();
+        store.put(1, &[0.0, 1.0]).unwrap();
+        store.flush().unwrap();
+        let before = MmapView::open(&p).unwrap().unwrap();
+        store.compact(&[(1, 0)]).unwrap();
+        assert_eq!(before.row(0), &[1.0, 0.0]);
+        assert_eq!(before.row(1), &[0.0, 1.0]);
+        let after = MmapView::open(&p).unwrap().unwrap();
+        assert_eq!(after.rows(), 1);
+        assert_eq!(after.row(0), &[0.0, 1.0]);
     }
 
     #[test]

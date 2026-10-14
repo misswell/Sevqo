@@ -260,11 +260,27 @@ fn mtime_ns(meta: &std::fs::Metadata) -> i64 {
 /// Apply one watched change to the index. A file that no longer exists is deleted from
 /// the index, so results never point at a moved or trashed file.
 pub fn apply_change(db: &crate::db::Db, change: &Change, wanted_kinds: &[crate::Kind], max_file_bytes: u64) -> crate::Result<Applied> {
+    apply_change_with_options(db, change, &crate::scan::ScanOptions {
+        kinds: wanted_kinds,
+        max_file_bytes,
+        exclude_dirs: &[],
+        exclude_prefixes: &[],
+    })
+}
+
+pub fn apply_change_with_options(db: &crate::db::Db, change: &Change, opts: &crate::scan::ScanOptions) -> crate::Result<Applied> {
     use crate::db;
     use crate::scan::Scanned;
 
     let path = change.path();
     let s = path.to_string_lossy().to_string();
+    if !path.as_os_str().is_empty() {
+        let Some(root_id) = root_for(db, path)? else { return Ok(Applied::Ignored) };
+        let root = db.list_roots()?.into_iter().find(|r| r.id == root_id).unwrap();
+        if crate::scan::excluded_path(&crate::scan::expand_home(&root.path), path, opts) {
+            return Ok(Applied::Ignored);
+        }
+    }
     if let Change::Rescan(_) = change {
         return if path.as_os_str().is_empty() || !path.exists() {
             Ok(Applied::NeedsRescan)
@@ -289,7 +305,7 @@ pub fn apply_change(db: &crate::db::Db, change: &Change, wanted_kinds: &[crate::
     };
     let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     let ext = ext_of(&name);
-    if !crate::scan::wanted(&ext, wanted_kinds) || meta.len() > max_file_bytes {
+    if opts.kinds.is_empty() || !crate::scan::wanted(&ext, opts.kinds) || meta.len() > opts.max_file_bytes {
         return Ok(Applied::Ignored);
     }
     let root_id = match root_for(db, path)? {
@@ -332,6 +348,29 @@ pub fn root_for(db: &crate::db::Db, path: &Path) -> crate::Result<Option<i64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watcher_obeys_hidden_directory_and_prefix_exclusions() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open(&dir.path().join("index.sqlite")).unwrap();
+        db.add_root(&dir.path().to_string_lossy(), "test").unwrap();
+        let kinds = [crate::Kind::Document];
+        let prefixes = [dir.path().join("private").to_string_lossy().to_string()];
+        let opts = crate::scan::ScanOptions {
+            kinds: &kinds, max_file_bytes: 1024,
+            exclude_dirs: &["node_modules".into()], exclude_prefixes: &prefixes,
+        };
+        for name in [".hidden/note.txt", "node_modules/note.txt", "private/note.txt"] {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "excluded").unwrap();
+            assert_eq!(apply_change_with_options(&db, &Change::Modified(path.clone()), &opts).unwrap(), Applied::Ignored);
+            assert!(db.file_by_path(&path.to_string_lossy()).is_none());
+        }
+        let path = dir.path().join("note.txt");
+        std::fs::write(&path, "included").unwrap();
+        assert_eq!(apply_change_with_options(&db, &Change::Modified(path), &opts).unwrap(), Applied::NeedsIndex);
+    }
 
     fn p(s: &str) -> PathBuf {
         PathBuf::from(s)

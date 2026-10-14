@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::sync::Arc;
 
 use sevqo_engine::db::Db;
@@ -15,8 +15,8 @@ pub struct AppState {
     pub paths: Paths,
     pub settings: Mutex<Settings>,
     pub db: Arc<Db>,
-    pub client: Arc<Client>,
-    pub has_python: bool,
+    client: Mutex<Arc<Client>>,
+    pub has_python: AtomicBool,
     /// Model files are complete and verified, so the semantic channel may run.
     pub model_ready: AtomicBool,
     pub vision_ready: AtomicBool,
@@ -26,6 +26,9 @@ pub struct AppState {
     pub downloading: AtomicBool,
     pub watcher: Mutex<Option<WatcherHandle>>,
     pub vector_path: PathBuf,
+    /// A search holds its file mapping and DB row mapping together. Maintenance
+    /// must not replace one while a query is still using the other.
+    pub vector_access: RwLock<()>,
     /// The update we fetched but have not applied. Kept so installing needs no second
     /// manifest round-trip and so 取消 can drop it.
     pub pending_update: Mutex<Option<tauri_plugin_updater::Update>>,
@@ -43,8 +46,8 @@ impl AppState {
         let ready = status.complete && has_python;
         let vector_path = paths.vector_path.clone();
         AppState {
-            client: Arc::new(client),
-            has_python,
+            client: Mutex::new(Arc::new(client)),
+            has_python: AtomicBool::new(has_python),
             model_ready: AtomicBool::new(ready),
             vision_ready: AtomicBool::new(ready && need_vision),
             paths,
@@ -56,6 +59,7 @@ impl AppState {
             downloading: AtomicBool::new(false),
             watcher: Mutex::new(None),
             vector_path,
+            vector_access: RwLock::new(()),
             pending_update: Mutex::new(None),
             updating: AtomicBool::new(false),
             update_generation: AtomicU64::new(0),
@@ -64,6 +68,22 @@ impl AppState {
 
     pub fn model_ready(&self) -> bool {
         self.model_ready.load(Ordering::Relaxed)
+    }
+
+    pub fn client(&self) -> Arc<Client> {
+        self.client.lock().expect("推理配置锁已中毒").clone()
+    }
+
+    pub fn has_python(&self) -> bool {
+        self.has_python.load(Ordering::Relaxed)
+    }
+
+    pub fn configure_client(&self, cfg: &Settings) {
+        let next = Arc::new(Client::new(&self.paths, cfg));
+        let old = std::mem::replace(&mut *self.client.lock().expect("推理配置锁已中毒"), next);
+        old.shutdown();
+        self.has_python.store(sevqo_engine::infer::python_binary(cfg, None).is_some(), Ordering::Relaxed);
+        self.set_model_ready(sevqo_engine::model::status(&self.paths.model_dir).complete);
     }
 
     pub fn set_model_ready(&self, v: bool) {
@@ -77,12 +97,12 @@ impl AppState {
     }
 
     /// False when a pass is already running, so two triggers cannot race.
-    pub fn try_begin_index(&self) -> bool {
-        !self.indexing.swap(true, Ordering::SeqCst)
-    }
-
-    pub fn end_index(&self) {
-        self.indexing.store(false, Ordering::Relaxed);
+    pub fn try_begin_index(self: &Arc<Self>) -> Option<IndexGuard> {
+        if self.indexing.swap(true, Ordering::SeqCst) {
+            None
+        } else {
+            Some(IndexGuard(self.clone()))
+        }
     }
 
     pub fn settings(&self) -> Settings {
@@ -95,7 +115,7 @@ impl AppState {
 
     /// Semantic work needs both the weights and a usable interpreter.
     pub fn can_infer(&self) -> bool {
-        self.has_python && self.model_ready()
+        self.has_python() && self.model_ready()
     }
 
     pub fn watched_roots(&self) -> usize {
@@ -139,5 +159,62 @@ impl AppState {
     pub fn cancel_update(&self) {
         self.update_generation.fetch_add(1, Ordering::SeqCst);
         self.set_pending_update(None);
+    }
+}
+
+/// Releases the work slot on errors, panics and thread-spawn failures as well.
+pub struct IndexGuard(Arc<AppState>);
+
+impl Drop for IndexGuard {
+    fn drop(&mut self) {
+        self.0.indexing.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_state() -> (tempfile::TempDir, Arc<AppState>) {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths {
+        data_dir: dir.path().into(), cache_dir: dir.path().into(),
+        model_dir: dir.path().join("models"), thumb_dir: dir.path().join("thumbs"),
+        clip_thumb_dir: dir.path().join("clip-thumbs"), db_path: dir.path().join("index.sqlite"),
+        vector_path: dir.path().join("vectors.f32"), settings_path: dir.path().join("settings.json"),
+        log_dir: dir.path().join("logs"),
+    };
+    paths.ensure().unwrap();
+    let db = Arc::new(Db::open(&paths.db_path).unwrap());
+    let state = Arc::new(AppState::new(paths, Settings::default(), db));
+    (dir, state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn work_slot_is_exclusive_and_released_on_drop() {
+        let (_dir, state) = test_state();
+        let permit = state.try_begin_index().unwrap();
+        assert!(state.indexing());
+        assert!(state.try_begin_index().is_none());
+        drop(permit);
+        assert!(!state.indexing());
+        assert!(state.try_begin_index().is_some());
+    }
+
+    #[test]
+    fn interpreter_changes_replace_the_active_client() {
+        let (dir, state) = test_state();
+        let previous = state.client();
+        let mut cfg = state.settings();
+        cfg.infer_python = Some(dir.path().join("missing-python").to_string_lossy().into());
+        cfg.vector_dim = 256;
+        cfg.infer_threads = 2;
+        *state.settings.lock().unwrap() = cfg.clone();
+        state.configure_client(&cfg);
+        let current = state.client();
+        assert!(!Arc::ptr_eq(&previous, &current));
+        assert_eq!(state.vector_dim(), 256);
+        assert!(current.load().unwrap_err().to_string().contains("missing-python"));
     }
 }

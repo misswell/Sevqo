@@ -3619,7 +3619,7 @@ dependencies = [
 
 [[package]]
 name = "sevqo-desktop"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "crossbeam-channel",
@@ -3632,6 +3632,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-global-shortcut",
  "tauri-plugin-updater",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -3640,7 +3641,7 @@ dependencies = [
 
 [[package]]
 name = "sevqo-engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "crossbeam-channel",

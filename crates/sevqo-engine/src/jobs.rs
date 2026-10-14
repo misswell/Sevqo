@@ -82,6 +82,19 @@ struct Out {
     vectors: u64,
 }
 
+struct BatchRecovery<'a> {
+    db: &'a Db,
+    ids: Vec<i64>,
+}
+
+impl Drop for BatchRecovery<'_> {
+    fn drop(&mut self) {
+        if let Err(e) = self.db.recover_indexing_files(&self.ids) {
+            tracing::warn!("无法恢复中断的索引批次: {e}");
+        }
+    }
+}
+
 pub struct Indexer {
     db: Arc<Db>,
     paths: Paths,
@@ -189,14 +202,21 @@ impl Indexer {
         let path = scan::expand_home(&root.path);
         let seen = crate::db::now_ns();
         self.db.begin_scan(root_id)?;
+        // A text-only pass must still mark media as present. Otherwise its sweep
+        // deletes previously indexed images/videos when weights are unavailable.
+        let scan_kinds = self.kinds_for(Mode::Full);
+        if scan_kinds.is_empty() {
+            return Err(Error::Config("没有勾选任何要索引的文件类型".into()));
+        }
         let opts = ScanOptions {
             exclude_dirs: &self.settings.exclude_dirs,
             exclude_prefixes: &self.settings.exclude_path_prefixes,
             max_file_bytes: self.settings.max_file_bytes,
-            kinds: &self.kinds_for(mode),
+            kinds: &scan_kinds,
         };
         let kinds = self.kinds_for(mode);
-        let mut stats = ScanStats::default();
+        let mut candidates = 0u64;
+        let mut write_errors = 0u64;
         let mut queued = 0u64;
         let mut progress = Progress {
             phase: Phase::Scanning,
@@ -207,23 +227,29 @@ impl Indexer {
         let db = self.db.clone();
         let cancel = &self.control.cancel;
         let emit = self.emit.clone();
-        stats = scan::scan(root_id, &path, &opts, cancel, |f| {
+        let mut stats = scan::scan(root_id, &path, &opts, cancel, |f| {
+            candidates += 1;
             match db.upsert_file(&f, seen) {
                 Ok((_, needs)) => {
-                    stats.indexed_candidates += 1;
                     if needs {
                         queued += 1;
                     }
                 }
-                Err(_) => stats.errors += 1,
+                Err(_) => write_errors += 1,
             }
-            if stats.walked % 512 == 0 {
-                progress.discovered = stats.walked;
+            if candidates % 512 == 0 {
+                progress.discovered = candidates;
                 progress.queued = queued;
                 let _ = emit.try_send(progress.clone());
             }
         })?;
-        let removed = self.db.sweep(root_id, seen)?;
+        stats.errors += write_errors;
+        // An unreadable subtree is not evidence that its files were deleted.
+        let removed = if stats.errors == 0 && stats.unreadable == 0 {
+            self.db.sweep(root_id, seen)?
+        } else {
+            0
+        };
         let queued_now = self.db.pending(usize::MAX, &kinds)?.len() as u64;
         progress.discovered = stats.walked;
         progress.queued = queued_now;
@@ -257,7 +283,8 @@ impl Indexer {
                     return Ok(sum);
                 }
             }
-            let want = max_files.map(|m| (m as u64).saturating_sub(sum.done)).unwrap_or(usize::MAX as u64) as usize;
+            let processed = sum.done + sum.failed + sum.skipped;
+            let want = max_files.map(|m| (m as u64).saturating_sub(processed)).unwrap_or(usize::MAX as u64) as usize;
             if want == 0 {
                 break;
             }
@@ -295,7 +322,7 @@ impl Indexer {
                         break;
                     }
                     if consecutive_errors >= 3 {
-                        break;
+                        return Err(e);
                     }
                 }
             }
@@ -316,6 +343,8 @@ impl Indexer {
     }
 
     fn process_batch(&self, files: &mut [FileRecord], mode: Mode) -> Result<Out> {
+        // A cancelled or failed embed must be retryable without restarting the app.
+        let _recovery = BatchRecovery { db: &self.db, ids: files.iter().map(|f| f.id).collect() };
         let mut out = Out::default();
         let want_vectors = mode == Mode::Full && self.client.is_some();
         let mut items: Vec<EmbedItem> = Vec::new();
@@ -378,6 +407,7 @@ impl Indexer {
         let resp = client.embed(&items, batch, timeout)?;
 
         let mut writes: Vec<(usize, Vec<f32>)> = Vec::new();
+        let mut states = Vec::new();
         for (file_id, keys) in per_file {
             let mut ok = 0usize;
             let mut err: Option<String> = None;
@@ -398,12 +428,12 @@ impl Indexer {
             }
             if ok > 0 {
                 let note = err.filter(|_| ok < keys.len());
-                self.db.set_file_state(file_id, FileState::Done, note.as_deref())?;
+                states.push((file_id, FileState::Done, note));
                 out.done += 1;
                 out.vectors += ok as u64;
             } else {
                 let msg = err.unwrap_or_else(|| "模型未返回向量".into());
-                self.db.set_file_state(file_id, FileState::Failed, Some(&msg))?;
+                states.push((file_id, FileState::Failed, Some(msg)));
                 out.failed += 1;
             }
         }
@@ -412,7 +442,12 @@ impl Indexer {
             let mut g = self.store()?;
             if let Some(store) = g.as_mut() {
                 store.put_many(&writes)?;
+                store.flush()?;
             }
+        }
+        // Publish rows to search only after their bytes are durably written.
+        for (file_id, state, note) in states {
+            self.db.set_file_state(file_id, state, note.as_deref())?;
         }
         for (k, thumb) in &resp.thumbs {
             let Some((target, _row, ref_id)) = parse_key(k) else { continue };
@@ -766,6 +801,52 @@ mod tests {
         let expr = crate::segment::match_expression(&req.query).unwrap();
         let hits = h.db.keyword_search(&expr, &req, 10).unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn text_only_scan_preserves_existing_media_and_vectors() {
+        let h = harness();
+        let root = h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
+        let path = h.dir.path().join("photo.jpg");
+        std::fs::write(&path, "placeholder").unwrap();
+        let (idx, _) = indexer(&h, Settings::default());
+        idx.scan_root(root, Mode::Full).unwrap();
+        let photo = h.db.file_by_path(&path.to_string_lossy()).unwrap();
+        h.db.set_file_state(photo.id, FileState::Done, None).unwrap();
+        h.db.reserve_vec_row(EmbedRowKind::Image, photo.id, photo.id).unwrap();
+        idx.scan_root(root, Mode::TextOnly).unwrap();
+        assert!(h.db.file(photo.id).is_some(), "a text-only pass must not sweep media");
+        assert_eq!(h.db.alive_vec_rows().unwrap(), 1);
+    }
+
+    #[test]
+    fn embed_failure_requeues_the_batch_without_reopening_the_database() {
+        let h = harness();
+        h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
+        let doc = add_doc(&h, "retry.md", "this document must remain retryable");
+        let mut settings = text_settings();
+        settings.infer_python = Some(h.dir.path().join("missing-python").to_string_lossy().into());
+        let client = Arc::new(Client::new(&h.paths, &settings));
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let idx = Indexer::new(h.db.clone(), h.paths.clone(), settings, Some(client), tx);
+        assert!(idx.run(Mode::Full, None).is_err());
+        assert_eq!(h.db.file(doc.id).unwrap().state, FileState::Pending);
+        assert_eq!(h.db.pending(10, &[Kind::Document]).unwrap().len(), 1);
+        let (retry, _) = indexer(&h, text_settings());
+        assert_eq!(retry.run(Mode::TextOnly, None).unwrap().done, 1);
+    }
+
+    #[test]
+    fn replacing_video_clips_does_not_reuse_old_vector_rows() {
+        let h = harness();
+        h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
+        let video = add_doc(&h, "clip.mp4", "placeholder");
+        let clips = h.db.insert_clips(video.id, &[(0.0, 1.0)]).unwrap();
+        let old = h.db.reserve_vec_row(EmbedRowKind::Clip, clips[0].0, video.id).unwrap();
+        let replacement = h.db.insert_clips(video.id, &[(0.0, 2.0)]).unwrap();
+        let next = h.db.reserve_vec_row(EmbedRowKind::Clip, replacement[0].0, video.id).unwrap();
+        assert!(next > old);
+        assert_eq!(h.db.dead_rows().unwrap(), 1);
     }
 
     #[test]

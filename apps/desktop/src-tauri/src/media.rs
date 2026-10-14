@@ -104,15 +104,17 @@ fn span(raw: &str, total: u64) -> Option<(u64, u64)> {
     let (head, tail) = spec.split(',').next()?.trim().split_once('-')?;
     if head.is_empty() {
         // open start: the last N bytes
-        let n = tail.parse::<u64>().ok()?.min(total).max(1);
+        let n = tail.parse::<u64>().ok()?.min(total).min(CHUNK);
+        if n == 0 { return None; }
         return Some((total - n, last));
     }
     let start = head.parse::<u64>().ok()?;
     if start > last {
         return None;
     }
-    let wanted = tail.trim().parse::<u64>().ok().map(|v| v.min(last)).unwrap_or(last);
-    Some((start, wanted.min(start + CHUNK - 1)))
+    let wanted = if tail.trim().is_empty() { last } else { tail.trim().parse::<u64>().ok()?.min(last) };
+    if wanted < start { return None; }
+    Some((start, wanted.min(start.saturating_add(CHUNK - 1))))
 }
 
 fn content_type(ext: &str) -> &'static str {
@@ -178,6 +180,20 @@ mod tests {
         assert_eq!(span("bytes=0-20000", 1_000), Some((0, 999)));
         assert_eq!(span("bytes=0-100", 0), None);
         assert_eq!(span("garbage", 1_000), Some((0, 999)));
+    }
+
+    #[test]
+    fn suffix_ranges_cannot_allocate_the_whole_video() {
+        let total = 1 << 30;
+        assert_eq!(span("bytes=-1073741824", total), Some((total - CHUNK, total - 1)));
+    }
+
+    #[test]
+    fn invalid_ranges_never_underflow_or_overflow() {
+        for range in ["bytes=10-1", "bytes=-0", "bytes=0-oops"] {
+            assert_eq!(span(range, 100), None);
+        }
+        assert_eq!(span("bytes=18446744073709551612-", u64::MAX), Some((u64::MAX - 3, u64::MAX - 1)));
     }
 
     #[test]

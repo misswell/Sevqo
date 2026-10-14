@@ -52,9 +52,9 @@ fi
 [[ -n "$signing_identity" ]] || fail "没有 Developer ID Application 证书：${name} 的发布包必须签名，请先在 Keychain 里安装该证书"
 # Team ID 就写在证书名末尾的括号里，不硬编码
 team_id="$(printf '%s' "$signing_identity" | sed -n 's/.*(\([A-Z0-9]*\))$/\1/p')"
-log "签名身份：$signing_identity（Team ${team_id:-未知}）"
+log "签名身份：${signing_identity}（Team ${team_id:-未知}）"
 
-[[ -f "$updater_key" ]] || fail "找不到更新包签名私钥 $updater_key（用 cargo tauri signer generate 生成）"
+[[ -f "$updater_key" ]] || fail "找不到更新包签名私钥 ${updater_key}（用 cargo tauri signer generate 生成）"
 if [[ -z "${UPDATER_KEY_PASSWORD:-}" ]]; then
   [[ -f "$updater_pw_file" ]] || fail "私钥有口令，但 $updater_pw_file 不存在，也没给 UPDATER_KEY_PASSWORD"
   UPDATER_KEY_PASSWORD="$(cat "$updater_pw_file")"
@@ -62,7 +62,7 @@ fi
 
 # ------------------------------------------------------------------ 1. 构建
 if [[ "${SKIP_BUILD:-0}" != 1 ]]; then
-  log "构建 .app（$version）"
+  log "构建 .app（${version}）"
   # tauri 自带的 bundle_dmg.sh 会让 Finder 美化窗口，每次都要授权 AppleScript；只出 .app，镜像自己做
   (cd "$root/apps/desktop" && npm run tauri -- build --bundles app)
 fi
@@ -83,16 +83,7 @@ codesign --verify --deep --strict --verbose=2 "$app"
 codesign -dv --verbose=2 "$app" 2>&1 | grep -E 'Authority=|Timestamp=|TeamIdentifier='
 log "已签名 $mach_o 个 Mach-O 文件"
 
-# ------------------------------------------------------------------ 3. 镜像
-log "制作安装镜像"
-out="$(bash "$root/tools/make_dmg.sh" "$app" "$dmg_dir" | tail -1)"
-[[ -f "$out" ]] || fail "make_dmg.sh 没有产出镜像"
-# make_dmg.sh 按 tauri 的命名规则取名，统一到带 tag 的发布名
-mv -f "$out" "$dmg"
-codesign --force --timestamp --sign "$signing_identity" "$dmg"
-codesign --verify --verbose=2 "$dmg"
-
-# ------------------------------------------------------------------ 4. 公证
+# ------------------------------------------------------------------ 3. 公证 helper
 notarized=0
 # 凭据按顺序取第一条成立的：钥匙串 profile → ASC API key → Apple ID → asc 里存好的 key。
 # 后两条在无交互 shell 里常常写不进钥匙串，所以 ASC API key 路线是这台机器的实际主力。
@@ -137,14 +128,31 @@ notarize() {
   fi
   fail "没有可用的公证凭据（NOTARY_PROFILE / APPLE_API_KEY_* / APPLE_ID+app-specific / asc 全都不成立）；只想签名自检时加 SIGN_ONLY=1"
 }
-notarize "$dmg"
 
-# ------------------------------------------------------------------ 5. 装订
-if [[ "$notarized" == 1 ]]; then
-  log "装订公证凭据"
+# ------------------------------------------------------------------ 4. 先公证并装订 .app，保证镜像和更新包包含同一份已装订应用
+if [[ "${SIGN_ONLY:-0}" == 1 ]]; then
+  log "SIGN_ONLY=1：跳过公证"
+else
+  app_zip="$bundle/${name}_${tag}_macos_${arch}.notarization.zip"
+  rm -f "$app_zip"
+  ditto -c -k --keepParent "$app" "$app_zip"
+  notarize "$app_zip"
   xcrun stapler staple "$app"
-  xcrun stapler staple "$dmg"
   xcrun stapler validate "$app"
+  rm -f "$app_zip"
+fi
+
+# ------------------------------------------------------------------ 5. 由已装订 .app 制作最终镜像，并单独公证、装订镜像
+log "制作安装镜像"
+out="$(bash "$root/tools/make_dmg.sh" "$app" "$dmg_dir" | tail -1)"
+[[ -f "$out" ]] || fail "make_dmg.sh 没有产出镜像"
+mv -f "$out" "$dmg"
+codesign --force --timestamp --sign "$signing_identity" "$dmg"
+codesign --verify --verbose=2 "$dmg"
+
+if [[ "$notarized" == 1 ]]; then
+  notarize "$dmg"
+  xcrun stapler staple "$dmg"
   xcrun stapler validate "$dmg"
   spctl -a -vvv -t exec "$app"
 else
@@ -161,8 +169,9 @@ tar -tzf "$archive" | head -3
 
 log "用 minisign 私钥签名更新包"
 # --app-version 把版本写进签名的 trusted comment，清单里换版本号也配不上这份签名
+export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="$UPDATER_KEY_PASSWORD"
 (cd "$root/apps/desktop" && npm run tauri -- signer sign \
-  --private-key-path "$updater_key" --password "$UPDATER_KEY_PASSWORD" \
+  --private-key-path "$updater_key" \
   --app-version "$version" "$archive" >/dev/null)
 [[ -s "$archive.sig" ]] || fail "没有生成 $archive.sig"
 
@@ -172,7 +181,7 @@ repo="${GH_REPO:-misswell/Sevqo}"
 download="https://github.com/$repo/releases/download/$tag/$(basename "$archive")"
 jq -n \
   --arg version "$version" \
-  --arg notes "${RELEASE_NOTES:-${name} ${version}：完全离线的本地多模态文件搜索。}" \
+  --arg notes "${RELEASE_NOTES:-$(cat "$root/RELEASE_NOTES.md")}" \
   --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --arg signature "$(cat "$archive.sig")" \
   --arg url "$download" \

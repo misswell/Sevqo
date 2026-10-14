@@ -6,6 +6,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
   DownloadProgress,
   FileRecord,
+  Filters,
   Hit,
   IndexMode,
   Kind,
@@ -109,11 +110,12 @@ export const api = {
   // search
   search: (req: SearchRequest) => call<SearchResponse>('search', { req }),
   searchKeyword: (req: SearchRequest) => call<SearchResponse>('search_keyword', { req }),
-  searchMedia: (path: string, limit?: number, kinds?: Kind[]) =>
+  searchMedia: (path: string, limit?: number, kinds?: Kind[], filters?: Filters) =>
     call<SearchResponse>('search_media', {
       path,
       limit: limit && limit > 0 ? limit : null,
       kinds: kinds && kinds.length > 0 ? kinds : null,
+      filters: filters ?? null,
     }),
   recent: (limit?: number) => call<Hit[]>('recent', { limit: limit && limit > 0 ? limit : null }),
   moments: (fileId: number) => call<Moment[]>('moments', { fileId }),

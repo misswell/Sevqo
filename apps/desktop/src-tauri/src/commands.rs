@@ -10,6 +10,7 @@ use std::sync::Arc;
 use base64::Engine as _;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
+use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
 use sevqo_engine::db::{self, Db};
 use sevqo_engine::infer::python_binary;
@@ -18,9 +19,9 @@ use sevqo_engine::model::{self, ModelStatus};
 use sevqo_engine::scan::dir_label;
 use sevqo_engine::search::Searcher;
 use sevqo_engine::vectors::Store;
-use sevqo_engine::watch::{apply_change, Applied, Change, WatcherHandle};
+use sevqo_engine::watch::{apply_change_with_options, Applied, Change, WatcherHandle};
 use sevqo_engine::{
-    FileRecord, Hit, Kind, Moment, Paths, Phase, Progress, Root, SearchRequest, SearchResponse, Settings,
+    FileRecord, Filters, Hit, Kind, Moment, Paths, Phase, Progress, Root, SearchRequest, SearchResponse, Settings,
 };
 
 use crate::state::AppState;
@@ -57,8 +58,7 @@ fn app_state(app: &AppHandle) -> Arc<AppState> {
 /// Which pass makes sense now: vectors only when some media kind is on *and* the model
 /// is present, otherwise the text/filename pass that works with no weights at all.
 fn auto_mode(st: &AppState) -> Mode {
-    let s = st.settings();
-    if (s.index_images || s.index_video) && st.can_infer() {
+    if st.can_infer() {
         Mode::Full
     } else {
         Mode::TextOnly
@@ -174,8 +174,8 @@ fn overview(st: &AppState) -> Res<Overview> {
         by_kind,
         indexing: st.indexing(),
         semantic_ready: st.can_infer(),
-        has_python: st.has_python,
-        sidecar_running: st.client.is_running(),
+        has_python: st.has_python(),
+        sidecar_running: st.client().is_running(),
         vector_dim: st.vector_dim(),
         watched_roots: st.watched_roots(),
         vector_bytes: std::fs::metadata(&st.vector_path).map(|m| m.len() as i64).unwrap_or(0),
@@ -188,7 +188,7 @@ fn model_info(st: &AppState) -> ModelInfo {
         status: model::status(&st.paths.model_dir),
         downloading: st.downloading.load(Ordering::Relaxed),
         ready: st.can_infer(),
-        has_python: st.has_python,
+        has_python: st.has_python(),
         python: python_binary(&s, None).map(|p| p.display().to_string()),
         endpoints: s.model_endpoints.clone(),
         model_dir: st.paths.model_dir.display().to_string(),
@@ -212,18 +212,41 @@ pub async fn get_settings(app: AppHandle) -> Res<Settings> {
 pub async fn set_settings(app: AppHandle, next: Settings) -> Res<Settings> {
     let st = app_state(&app);
     block(move || {
+        let _permit = st.try_begin_index().ok_or("请先停止正在运行的索引或扫描")?;
+        let _vectors = st.vector_access.write().map_err(es)?;
         let mut cfg = next.clone();
         cfg.validate();
         let old = st.settings();
+        if cfg.model_repo != model::MODEL_REPO {
+            return Err(format!("当前版本仅支持模型 {}", model::MODEL_REPO));
+        }
         let dim_changed = old.vector_dim != cfg.vector_dim;
-        let vision_changed = (old.index_images || old.index_video) != (cfg.index_images || cfg.index_video);
+        let runtime_changed = dim_changed || old.infer_python != cfg.infer_python
+            || old.infer_threads != cfg.infer_threads
+            || (old.index_images || old.index_video) != (cfg.index_images || cfg.index_video);
         if dim_changed && st.db.alive_vec_rows().map_err(es)? > 0 {
             return Err("修改向量维度需要重建索引：确认后会清空现有向量并重新编码全部文件。".to_string());
         }
-        cfg.save(&st.paths.settings_path).map_err(es)?;
+        if dim_changed {
+            Store::delete_all(&st.vector_path).map_err(es)?;
+            st.db.reset_vectors().map_err(es)?;
+        }
+        let shortcut_changed = old.global_shortcut != cfg.global_shortcut;
+        if shortcut_changed {
+            app.global_shortcut().register(cfg.global_shortcut.as_str()).map_err(es)?;
+        }
+        if let Err(e) = cfg.save(&st.paths.settings_path) {
+            if shortcut_changed {
+                let _ = app.global_shortcut().unregister(cfg.global_shortcut.as_str());
+            }
+            return Err(es(e));
+        }
         *st.settings.lock().map_err(|_| "设置锁已中毒".to_string())? = cfg.clone();
-        if vision_changed {
-            st.client.set_needs_vision(cfg.index_images || cfg.index_video);
+        if runtime_changed {
+            st.configure_client(&cfg);
+        }
+        if shortcut_changed {
+            let _ = app.global_shortcut().unregister(old.global_shortcut.as_str());
         }
         let _ = st.db.set_meta("vector_dim", &cfg.vector_dim.to_string());
         Ok(cfg)
@@ -262,6 +285,7 @@ pub async fn add_root(app: AppHandle, path: String, label: Option<String>) -> Re
     let st = app_state(&app);
     let handle = app.clone();
     block(move || {
+        let _permit = st.try_begin_index().ok_or("请先停止正在运行的索引或扫描")?;
         let expanded = expand(&path);
         if !expanded.exists() {
             return Err(format!("目录不存在：{}", expanded.display()));
@@ -287,6 +311,7 @@ pub async fn remove_root(app: AppHandle, id: i64) -> Res<usize> {
     let st = app_state(&app);
     let handle = app.clone();
     block(move || {
+        let _permit = st.try_begin_index().ok_or("请先停止正在运行的索引或扫描")?;
         let n = st.db.remove_root(id).map_err(es)?;
         let _ = restart_watcher(&st, &handle);
         Ok(n)
@@ -299,6 +324,7 @@ pub async fn set_root_enabled(app: AppHandle, id: i64, enabled: bool) -> Res<()>
     let st = app_state(&app);
     let handle = app.clone();
     block(move || {
+        let _permit = st.try_begin_index().ok_or("请先停止正在运行的索引或扫描")?;
         st.db.set_root_enabled(id, enabled).map_err(es)?;
         let _ = restart_watcher(&st, &handle);
         Ok(())
@@ -311,7 +337,11 @@ pub async fn set_root_enabled(app: AppHandle, id: i64, enabled: bool) -> Res<()>
 #[tauri::command]
 pub async fn rescan(app: AppHandle, root_id: Option<i64>) -> Res<ScanReport> {
     let st = app_state(&app);
-    block(move || scan_all(&st, root_id)).await
+    block(move || {
+        let _permit = st.try_begin_index().ok_or("请先停止正在运行的索引或扫描")?;
+        st.control.reset();
+        scan_all(&st, root_id)
+    }).await
 }
 
 fn scan_all(st: &Arc<AppState>, root_id: Option<i64>) -> Res<ScanReport> {
@@ -359,9 +389,7 @@ fn scan_all(st: &Arc<AppState>, root_id: Option<i64>) -> Res<ScanReport> {
 #[tauri::command]
 pub fn index_start(app: AppHandle, mode: Option<String>, max_files: Option<usize>, scan: Option<bool>) -> Res<()> {
     let st = app_state(&app);
-    if !st.try_begin_index() {
-        return Err("索引正在运行中".to_string());
-    }
+    let permit = st.try_begin_index().ok_or("索引正在运行中")?;
     st.control.reset();
     let m = match mode.as_deref() {
         Some("text") | Some("textOnly") | Some("text_only") => Mode::TextOnly,
@@ -372,8 +400,8 @@ pub fn index_start(app: AppHandle, mode: Option<String>, max_files: Option<usize
     std::thread::Builder::new()
         .name("sevqo-index".into())
         .spawn(move || {
+            let _permit = permit;
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_index(&app2, &st, m, max_files, scan_first)));
-            st.end_index();
             match outcome {
                 Err(_) => {
                     tracing::error!("索引线程异常终止");
@@ -406,10 +434,13 @@ fn run_index(app: &AppHandle, st: &Arc<AppState>, mode: Mode, max_files: Option<
         tracing::warn!("模型未就绪，向量通道跳过");
         None
     } else {
-        Some(st.client.clone())
+        Some(st.client())
     };
     let idx = Indexer::new(st.db.clone(), st.paths.clone(), cfg, client, tx.clone()).with_control(st.control.clone());
     let result = (|| -> Res<IndexReport> {
+        if mode == Mode::Full {
+            st.db.mark_missing_vectors().map_err(es)?;
+        }
         if scan_first {
             emit_progress(app, Progress { phase: Phase::Scanning, message: Some("正在扫描目录".into()), ..Default::default() });
             let rep = scan_all(st, None)?;
@@ -426,8 +457,7 @@ fn run_index(app: &AppHandle, st: &Arc<AppState>, mode: Mode, max_files: Option<
             mode: if mode == Mode::Full { "full".into() } else { "text".into() },
         })
     })();
-    drop(tx);
-    let _ = fwd.join();
+    close_progress(idx, tx, fwd);
     match &result {
         Ok(rep) => {
             tracing::info!("索引一轮完成：{} 成功 / {} 失败 / {} 跳过", rep.done, rep.failed, rep.skipped);
@@ -443,7 +473,6 @@ fn run_index(app: &AppHandle, st: &Arc<AppState>, mode: Mode, max_files: Option<
                     ..Default::default()
                 },
             );
-            let _ = restart_watcher(st, app);
         }
         Err(msg) => emit_progress(app, Progress { phase: Phase::Failed, message: Some(msg.clone()), ..Default::default() }),
     }
@@ -471,9 +500,8 @@ pub fn index_cancel(app: AppHandle) {
 pub async fn rebuild_index(app: AppHandle, clear_vectors: bool) -> Res<usize> {
     let st = app_state(&app);
     block(move || {
-        if st.indexing() {
-            return Err("请先停止正在运行的索引".to_string());
-        }
+        let _permit = st.try_begin_index().ok_or("请先停止正在运行的索引")?;
+        let _vectors = st.vector_access.write().map_err(es)?;
         let n = st.db.reindex_all().map_err(es)?;
         if clear_vectors {
             Store::delete_all(&st.vector_path).map_err(es)?;
@@ -494,12 +522,18 @@ pub async fn backfill_vectors(app: AppHandle) -> Res<usize> {
 pub async fn compact_vectors(app: AppHandle) -> Res<usize> {
     let st = app_state(&app);
     block(move || {
-        if st.indexing() {
-            return Err("请等待索引完成后再压缩向量".to_string());
-        }
+        let _permit = st.try_begin_index().ok_or("请等待索引完成后再压缩向量")?;
+        let _vectors = st.vector_access.write().map_err(es)?;
         Ok(compact(&st.db, &st.vector_path, st.vector_dim()).map_err(es)?)
     })
     .await
+}
+
+fn close_progress(idx: Indexer, tx: crossbeam_channel::Sender<Progress>, fwd: std::thread::JoinHandle<()>) {
+    // The indexer also owns a sender; dropping only `tx` leaves recv() waiting forever.
+    drop(idx);
+    drop(tx);
+    let _ = fwd.join();
 }
 
 // ------------------------------------------------------------------ search
@@ -526,7 +560,7 @@ pub async fn search_keyword(app: AppHandle, req: SearchRequest) -> Res<SearchRes
 /// 以图搜图 / 以视频片段搜视频: the query is a media file, so only the semantic channel
 /// applies. The file's own kind decides which way it is encoded and what it is matched against.
 #[tauri::command]
-pub async fn search_media(app: AppHandle, path: String, limit: Option<usize>, kinds: Option<Vec<Kind>>) -> Res<SearchResponse> {
+pub async fn search_media(app: AppHandle, path: String, limit: Option<usize>, kinds: Option<Vec<Kind>>, filters: Option<Filters>) -> Res<SearchResponse> {
     let st = app_state(&app);
     block(move || {
         if !st.can_infer() {
@@ -544,15 +578,21 @@ pub async fn search_media(app: AppHandle, path: String, limit: Option<usize>, ki
         let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
         let kind = Kind::from_ext(&ext);
         let v = match kind {
-            Kind::Image => sevqo_engine::search::query_vector_from_image(&st.client, &p, s.infer_batch),
-            Kind::Video => sevqo_engine::search::query_vector_from_video(&st.client, &p, s.video_window_s, s.infer_batch),
+            Kind::Image => sevqo_engine::search::query_vector_from_image(&st.client(), &p, s.infer_batch),
+            Kind::Video => sevqo_engine::search::query_vector_from_video(&st.client(), &p, s.video_window_s, s.infer_batch),
             _ => return Err(format!("不支持用 .{ext} 作为查询，支持图片与视频文件")),
         }
         .map_err(es)?;
+        let mut filters = filters.unwrap_or_default();
+        if let Some(kinds) = kinds {
+            filters.kinds = kinds;
+        } else if filters.kinds.is_empty() {
+            filters.kinds = vec![kind];
+        }
         let mut req = SearchRequest {
             limit: limit.unwrap_or(60).clamp(1, 500),
             semantic: true,
-            filters: sevqo_engine::Filters { kinds: kinds.unwrap_or_else(|| vec![kind]), ..Default::default() },
+            filters,
             ..Default::default()
         };
         req.query = String::new();
@@ -565,6 +605,7 @@ pub async fn search_media(app: AppHandle, path: String, limit: Option<usize>, ki
 pub async fn recent(app: AppHandle, limit: Option<usize>) -> Res<Vec<Hit>> {
     let st = app_state(&app);
     block(move || {
+        let _vectors = st.vector_access.read().map_err(es)?;
         let mut req = SearchRequest {
             limit: limit.unwrap_or(40).clamp(1, 300),
             semantic: false,
@@ -605,7 +646,7 @@ fn resolve_query_vector(st: &Arc<AppState>, searcher: &Searcher, req: &SearchReq
     if !st.can_infer() {
         return (None, Some("模型未就绪，仅按文件名与正文匹配".to_string()));
     }
-    match sevqo_engine::search::query_vector(&st.client, req.query.trim(), st.settings().infer_batch) {
+    match sevqo_engine::search::query_vector(&st.client(), req.query.trim(), st.settings().infer_batch) {
         Ok(v) if v.len() == dim => (Some(v), None),
         Ok(v) => (
             None,
@@ -616,6 +657,7 @@ fn resolve_query_vector(st: &Arc<AppState>, searcher: &Searcher, req: &SearchReq
 }
 
 fn run_search(st: &Arc<AppState>, mut req: SearchRequest, injected: Option<Vec<f32>>) -> Res<SearchResponse> {
+    let _vectors = st.vector_access.read().map_err(es)?;
     req.limit = req.limit.clamp(1, 500);
     let searcher = Searcher::new(st.db.clone(), &st.vector_path).map_err(es)?;
     let (qv, degraded) = match injected {
@@ -751,7 +793,7 @@ pub fn model_download_start(app: AppHandle) -> Res<()> {
 /// Fetch whatever the model directory is missing, reporting through `model://progress`.
 /// Shared by the command and by launch-time auto-resume.
 pub fn spawn_model_download(st: Arc<AppState>, app: AppHandle) -> Res<()> {
-    if !st.has_python {
+    if !st.has_python() {
         return Err("未找到 Python 运行环境，无法加载模型。请在设置里指定解释器路径。".to_string());
     }
     if st.can_infer() {
@@ -765,6 +807,7 @@ pub fn spawn_model_download(st: Arc<AppState>, app: AppHandle) -> Res<()> {
     let endpoints = st.settings().model_endpoints.clone();
     let proxy = st.settings().net_proxy.clone();
     let dir = st.paths.model_dir.clone();
+    let spawn_state = st.clone();
     let app2 = app.clone();
     std::thread::Builder::new()
         .name("sevqo-model".into())
@@ -801,7 +844,10 @@ pub fn spawn_model_download(st: Arc<AppState>, app: AppHandle) -> Res<()> {
             };
             let _ = app2.emit(EV_MODEL_STATE, serde_json::json!({ "ready": ready, "note": note, "cancelled": cancelled }));
         })
-        .map_err(es)?;
+        .map_err(|e| {
+            spawn_state.end_download();
+            es(e)
+        })?;
     Ok(())
 }
 
@@ -818,7 +864,7 @@ pub async fn model_runtime(app: AppHandle) -> Res<Runtime> {
         if !st.can_infer() {
             return Err("模型未就绪".to_string());
         }
-        let info = st.client.load().map_err(es)?;
+        let info = st.client().load().map_err(es)?;
         Ok(Runtime {
             device: info.device,
             dtype: info.dtype,
@@ -838,10 +884,45 @@ pub async fn model_runtime(app: AppHandle) -> Res<Runtime> {
 pub async fn model_verify(app: AppHandle) -> Res<String> {
     let st = app_state(&app);
     block(move || {
-        model::verify(&st.paths.model_dir).map_err(es)?;
+        if let Err(e) = model::verify(&st.paths.model_dir) {
+            st.set_model_ready(false);
+            return Err(es(e));
+        }
+        st.set_model_ready(true);
         Ok("校验通过".to_string())
     })
     .await
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+
+    #[test]
+    fn finishing_a_pass_closes_the_progress_forwarder() {
+        let (_dir, state) = crate::state::test_state();
+        let (tx, rx) = crossbeam_channel::unbounded::<Progress>();
+        let fwd = std::thread::spawn(move || while rx.recv().is_ok() {});
+        let idx = Indexer::new(state.db.clone(), state.paths.clone(), state.settings(), None, tx.clone());
+        let (done, wait) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            close_progress(idx, tx, fwd);
+            done.send(()).unwrap();
+        });
+        wait.recv_timeout(std::time::Duration::from_secs(2)).expect("progress sender held by Indexer must be dropped before join");
+    }
+
+    #[test]
+    fn text_only_configuration_uses_full_mode_when_model_is_ready() {
+        let (_dir, state) = crate::state::test_state();
+        let mut cfg = state.settings();
+        cfg.index_images = false;
+        cfg.index_video = false;
+        *state.settings.lock().unwrap() = cfg;
+        state.has_python.store(true, Ordering::Relaxed);
+        state.set_model_ready(true);
+        assert_eq!(auto_mode(&state), Mode::Full);
+    }
 }
 
 // ------------------------------------------------------------------ watcher
@@ -888,34 +969,59 @@ pub fn restart_watcher(st: &Arc<AppState>, app: &AppHandle) -> Res<usize> {
 
 fn watch_loop(st: &Arc<AppState>, app: &AppHandle, rx: crossbeam_channel::Receiver<Change>) {
     let mut dirty = false;
+    let mut pending_changes = HashMap::<PathBuf, Change>::new();
     loop {
         let change = match rx.recv_timeout(std::time::Duration::from_millis(800)) {
             Ok(c) => Some(c),
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => None,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         };
-        let cfg = st.settings();
-        let kinds = index_kinds(&cfg);
-        if let Some(c) = &change {
-            let path = c.path().to_string_lossy().to_string();
-            match apply_change(&st.db, c, &kinds, cfg.max_file_bytes) {
-                Ok(applied) => {
-                    let _ = app.emit(
-                        EV_WATCH,
-                        serde_json::json!({ "path": path, "type": c.kind_name(), "applied": applied_name(applied) }),
-                    );
-                    if matches!(applied, Applied::NeedsIndex | Applied::NeedsRescan | Applied::Removed) {
-                        dirty = true;
+        if let Some(c) = change {
+            pending_changes.insert(c.path().to_path_buf(), c);
+            dirty = true;
+        } else if dirty {
+            // Keep changes queued during a full pass: applying a write while its
+            // old contents are being embedded would attach stale vectors to it.
+            if let Some(_permit) = st.try_begin_index() {
+                let cfg = st.settings();
+                let kinds = index_kinds(&cfg);
+                let opts = sevqo_engine::scan::ScanOptions {
+                    kinds: &kinds,
+                    max_file_bytes: cfg.max_file_bytes,
+                    exclude_dirs: &cfg.exclude_dirs,
+                    exclude_prefixes: &cfg.exclude_path_prefixes,
+                };
+                let mut needs_rescan = false;
+                for (_, c) in pending_changes.drain() {
+                    let path = c.path().to_string_lossy().to_string();
+                    match apply_change_with_options(&st.db, &c, &opts) {
+                        Ok(applied) => {
+                            needs_rescan |= matches!(applied, Applied::NeedsRescan);
+                            let _ = app.emit(EV_WATCH, serde_json::json!({
+                                "path": path, "type": c.kind_name(), "applied": applied_name(applied)
+                            }));
+                        }
+                        Err(err) => {
+                            needs_rescan = true;
+                            tracing::warn!("监听处理失败 {path}: {err}");
+                        }
                     }
                 }
-                Err(err) => tracing::warn!("监听处理失败 {path}: {err}"),
-            }
-        } else if dirty {
-            // quiet for 800 ms: fold the trickle into one bounded pass
-            dirty = false;
-            if !st.indexing() {
-                if let Err(err) = incremental_pass(st, app) {
-                    tracing::warn!("增量索引失败: {err}");
+                st.control.reset();
+                let result = (|| -> Res<bool> {
+                    if needs_rescan {
+                        scan_all(st, None)?;
+                    }
+                    incremental_pass(st, app)
+                })();
+                match result {
+                    Ok(more) => dirty = more,
+                    Err(err) => {
+                        tracing::warn!("增量索引失败: {err}");
+                        // Retry the reconciliation rather than losing the events.
+                        pending_changes.insert(PathBuf::new(), Change::Rescan(PathBuf::new()));
+                        dirty = true;
+                    }
                 }
             }
         }
@@ -950,11 +1056,7 @@ fn index_kinds(cfg: &Settings) -> Vec<Kind> {
 }
 
 /// A bounded pass over what the watcher just marked pending; never fights a full run.
-fn incremental_pass(st: &Arc<AppState>, app: &AppHandle) -> Res<()> {
-    if !st.try_begin_index() {
-        return Ok(());
-    }
-    st.control.reset();
+fn incremental_pass(st: &Arc<AppState>, app: &AppHandle) -> Res<bool> {
     let (tx, rx) = crossbeam_channel::unbounded::<Progress>();
     let fwd = {
         let app = app.clone();
@@ -965,14 +1067,13 @@ fn incremental_pass(st: &Arc<AppState>, app: &AppHandle) -> Res<()> {
         })
     };
     let mode = auto_mode(st);
-    let client = if mode == Mode::Full && st.can_infer() { Some(st.client.clone()) } else { None };
+    let client = if mode == Mode::Full && st.can_infer() { Some(st.client()) } else { None };
     let idx = Indexer::new(st.db.clone(), st.paths.clone(), st.settings(), client, tx.clone()).with_control(st.control.clone());
     let out = idx.run(mode, Some(64));
-    drop(tx);
-    let _ = fwd.join();
-    st.end_index();
+    let kinds = idx.kinds_for(mode);
+    close_progress(idx, tx, fwd);
     out.map_err(es)?;
-    Ok(())
+    Ok(!st.control.is_cancelled() && !st.db.pending(1, &kinds).map_err(es)?.is_empty())
 }
 
 // ------------------------------------------------------------------ windows

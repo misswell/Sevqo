@@ -50,6 +50,7 @@ export function SearchArea({
   const [activeIndex, setActiveIndex] = useState(-1);
 
   const seq = useRef(0);
+  const textIntent = useRef(true);
 
   const filters = useMemo(() => {
     const [minSize, maxSize] = sizeRange(sizeIdx);
@@ -93,11 +94,9 @@ export function SearchArea({
       if (!q) {
         setLoading(true);
         try {
-          const list = await api.recent(limit);
+          const r = await api.searchKeyword(buildReq('', false));
           if (id !== seq.current) return;
-          setHits(list);
-          setResp(null);
-          setNote(null);
+          applyResponse(r);
         } catch (e) {
           if (id !== seq.current) return;
           setError(errorText(e));
@@ -126,11 +125,12 @@ export function SearchArea({
   );
 
   const debouncedHybrid = useDebounced<string>((q) => {
-    void runText(q, true);
+    if (textIntent.current) void runText(q, true);
   }, 350);
 
   const onQueryChange = useCallback(
     (value: string) => {
+      textIntent.current = true;
       setQuery(value);
       void runText(value, false);
       debouncedHybrid(value);
@@ -140,11 +140,14 @@ export function SearchArea({
 
   const runMedia = useCallback(
     async (path: string, withKinds: boolean) => {
+      textIntent.current = false;
       const id = ++seq.current;
+      setMode('image');
+      setImageActive(path);
       setLoading(true);
       setError(null);
       try {
-        const r = await api.searchMedia(path, limit, withKinds ? kinds : undefined);
+        const r = await api.searchMedia(path, limit, withKinds ? kinds : undefined, filters);
         if (id !== seq.current) return;
         setMode('image');
         setImageActive(path);
@@ -158,7 +161,7 @@ export function SearchArea({
         if (id === seq.current) setLoading(false);
       }
     },
-    [applyResponse, kinds, limit],
+    [applyResponse, filters, kinds, limit],
   );
 
   const dropping = useFileDrop((paths) => {

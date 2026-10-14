@@ -29,3 +29,4 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 minisign-verify = "0.3.0"
+tempfile = { workspace = true }

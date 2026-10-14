@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import math
 import os
 from dataclasses import dataclass
 
@@ -71,6 +72,9 @@ def sample_video(
     """
     import av
 
+    if not math.isfinite(fps) or fps <= 0 or max_frames < 1:
+        raise ValueError("invalid video sampling settings")
+
     with av.open(path) as container:
         stream = next((s for s in container.streams if s.type == "video"), None)
         if stream is None:
@@ -79,13 +83,14 @@ def sample_video(
         origin = float(stream.start_time or 0) * tb
         total = float(stream.duration) * tb if stream.duration else 0.0
         if end is None:
-            end = (total or start + max_frames / fps) - start
+            end = total or start + max_frames / fps
         window_start, window_end = start, min(end, total) if total else end
         if window_end <= window_start:
             raise ValueError("empty window")
 
         container.seek(int((origin + window_start) / tb), stream=stream, backward=True)
         step = 1.0 / fps
+        next_sample = window_start
         pairs = []
         for frame in container.decode(stream):
             t = float(frame.pts or 0) * tb - origin
@@ -93,15 +98,16 @@ def sample_video(
                 continue
             if t > window_end:
                 break
-            if pairs and t - pairs[-1][0] < step * 0.6:
+            if t + 1e-6 < next_sample:
                 continue
             pairs.append((t, _fit(frame.to_image(), 448 * 448)))
-            if len(pairs) * step >= (window_end - window_start) + step:
-                break
+            next_sample = window_start + (math.floor((t - window_start) / step + 1e-6) + 1) * step
         if not pairs:
             raise ValueError("no frames decoded")
 
-        if len(pairs) > max_frames:
+        if max_frames == 1:
+            pairs = [pairs[len(pairs) // 2]]
+        elif len(pairs) > max_frames:
             last = len(pairs) - 1
             pairs = [pairs[int(round(i * last / (max_frames - 1)))] for i in range(max_frames)]
 

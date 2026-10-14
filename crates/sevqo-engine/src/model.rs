@@ -302,6 +302,7 @@ pub fn ensure(
         proxy.map(|s| s.trim()).filter(|s| !s.is_empty()),
     )?;
     let fetch = Fetch { client: &client, dir, endpoints: &endpoints };
+    let recorded = recorded_checksums(dir);
 
     let mut overall = 0u64;
     for (i, f) in FILES.iter().enumerate() {
@@ -309,7 +310,14 @@ pub fn ensure(
             return Err(Error::Cancelled);
         }
         let p = dir.join(f.path);
-        if std::fs::metadata(&p).map(|m| m.len() == f.size).unwrap_or(false) {
+        let size_ok = std::fs::metadata(&p).map(|m| m.len() == f.size).unwrap_or(false);
+        let checksum_ok = if size_ok {
+            match recorded.get(f.path).and_then(|v| v.as_str()) {
+                Some(want) => sha256_of(&p)? == want,
+                None => true,
+            }
+        } else { false };
+        if checksum_ok {
             overall += f.size;
             on_progress(DownloadProgress {
                 file: f.path.to_string(),
@@ -337,13 +345,17 @@ pub fn ensure(
 }
 
 /// Size check for everything, plus recorded checksums when we have them.
-pub fn verify(dir: &Path) -> Result<()> {
+fn recorded_checksums(dir: &Path) -> serde_json::Map<String, serde_json::Value> {
     let idx = dir.join("checksums.json");
-    let recorded: serde_json::Map<String, serde_json::Value> = std::fs::read_to_string(&idx)
+    std::fs::read_to_string(&idx)
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .and_then(|v| v.as_object().cloned())
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+pub fn verify(dir: &Path) -> Result<()> {
+    let recorded = recorded_checksums(dir);
     for f in FILES {
         let p = dir.join(f.path);
         let m = std::fs::metadata(&p).map_err(|_| Error::Download(format!("缺少 {}", f.path)))?;
@@ -353,8 +365,7 @@ pub fn verify(dir: &Path) -> Result<()> {
         if let Some(serde_json::Value::String(want)) = recorded.get(f.path) {
             let got = sha256_of(&p)?;
             if &got != want {
-                let _ = std::fs::remove_file(&p);
-                return Err(Error::Download(format!("{} 校验失败，已删除待重下", f.path)));
+                return Err(Error::Download(format!("{} 校验失败，请重新下载模型", f.path)));
             }
         }
     }
@@ -368,6 +379,20 @@ pub fn model_dir_marker(dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verification_never_deletes_a_corrupt_user_model_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = &FILES[0];
+        let path = dir.path().join(first.path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bytes = vec![b'x'; first.size as usize];
+        std::fs::write(&path, &bytes).unwrap();
+        let recorded = std::collections::HashMap::from([(first.path, "incorrect")]);
+        std::fs::write(dir.path().join("checksums.json"), serde_json::to_vec(&recorded).unwrap()).unwrap();
+        assert!(verify(dir.path()).unwrap_err().to_string().contains("校验失败"));
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
 
     fn placeholder(dir: &Path, rel: &str, len: u64) {
         let p = dir.join(rel);
