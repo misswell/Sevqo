@@ -133,7 +133,9 @@ bash tools/release_macos.sh      # 构建 → Developer ID 签名 → 公证 →
 bash tools/publish_release.sh    # gh 发布 Release，并回读 releases/latest/download/latest.json 确认生效
 ```
 
-本轮 v0.1.1 已于 2026-10-14 08:51（北京时间）在 [GitHub Release](https://github.com/misswell/Sevqo/releases/tag/v0.1.1) 发布；本机脚本完成构建、Developer ID 签名、公证、装订与打包。仓库变量 `RELEASE_PROVIDER=local` 让新版标签的 GitHub Actions 只跑前端和 Rust 验证；云端构建与发布任务会跳过。未设置该变量时保留原来的云端签名、公证和发布路径。`publish_release.sh` 会检查产物、更新清单与远端 Release；发现同名 Release 时退出，不覆盖附件或说明。`SKIP_BUILD=1` 复用已构建的 `.app`，`SIGN_ONLY=1` 只签名不公证（自检用，不能用于正式发布）。
+本轮 v0.1.2 已于 2026-10-14 21:27（北京时间）在 [GitHub Release](https://github.com/misswell/Sevqo/releases/tag/v0.1.2) 发布；本机脚本完成构建、Developer ID 签名、公证、装订与打包。仓库变量 `RELEASE_PROVIDER=local` 让新版标签的 GitHub Actions 只跑前端和 Rust 验证；云端构建与发布任务会跳过。未设置该变量时保留原来的云端签名、公证和发布路径。`publish_release.sh` 会检查产物、更新清单与远端 Release；发现同名 Release 时退出，不覆盖附件或说明。`SKIP_BUILD=1` 复用已构建的 `.app`，`SIGN_ONLY=1` 只签名不公证（自检用，不能用于正式发布）。
+
+本机那把 Developer ID 不在登录钥匙串里，直接跑 `release_macos.sh` 会在签名这一步报 `no identity found`。发布时把证书导进一个一次性钥匙串，**追加**到用户搜索列表（`security list-keychains -d user -s 新钥匙串 原有钥匙串…`）并 `security set-key-partition-list -S apple-tool:,apple:,codesign:` 放行 `/usr/bin/codesign`，跑完删掉并还原搜索列表与默认钥匙串；只 `security create-keychain` 而不挂列表是不够的。
 
 更新包用 minisign 签名，`cargo tauri signer sign --app-version` 会把版本号写进签名的 trusted comment：
 
@@ -155,7 +157,7 @@ CI 在 `.github/workflows/release.yml`。云端发布路线需要的仓库 secre
 自动化部分已经绿：`cargo test -p sevqo-engine`（82 项）与端到端 `smoke`（15 项，`SMOKE OK`，含「自然语言只搜图片也确实走语义通道」「关闭后 sidecar 进程确实被回收」）。下面这些只有肉眼能确认，用 `npm run tauri dev` 或打包好的 `Sevqo.app` 逐条勾。
 
 - [ ] **首启下载**：删掉权重目录后启动，自动开始下载并显示 14 个文件 / 1.49 GB 的进度；Spotlight 输入框下方、搜索结果的「仅按文件名与正文匹配」提示下方、设置 → 模型 顶部这三处都能就地看到「一键下载」并点它开始；能取消、能续传；**没配 Python 时也允许下载**；完成后悬浮框搜索不再提示「模型未就绪」。
-- [ ] **装到应用程序后仍可用**：把 `Sevqo_v0.1.1_macos_aarch64.dmg` 拖进「应用程序」并从那里启动（不是在仓库里跑），在设置里把 Python 路径指向装好依赖的解释器，语义搜索即可用；启动后缓存目录出现 `sidecar/sevqo_embed/`，日志里没有 `ModuleNotFoundError`。走 `tools/release_macos.sh` 的产物是 Developer ID 签名 + 公证 + 装订，双击即可打开；只跑 `tauri build` + `make_dmg.sh` 的本机产物是 adhoc 签名、没公证，发给别人要 `bash tools/release_macos.sh`。
+- [ ] **装到应用程序后仍可用**：把 `Sevqo_v0.1.2_macos_aarch64.dmg` 拖进「应用程序」并从那里启动（不是在仓库里跑），在设置里把 Python 路径指向装好依赖的解释器，语义搜索即可用；启动后缓存目录出现 `sidecar/sevqo_embed/`，日志里没有 `ModuleNotFoundError`。走 `tools/release_macos.sh` 的产物是 Developer ID 签名 + 公证 + 装订，双击即可打开；只跑 `tauri build` + `make_dmg.sh` 的本机产物是 adhoc 签名、没公证，发给别人要 `bash tools/release_macos.sh`。
 - [ ] **应用内更新**：启动约 20 秒后侧栏「关于与更新」自己显示检查状态；当前版本与 `tauri.conf.json` / Release 标签一致；手动「检查更新」在已最新时不动作，有新版本时显示版本号、发布时间和更新说明；「下载并安装」有进度条且下载途中可取消，装完自动重启，重启后版本号变化、索引与设置不受影响；把 `latest.json` 的签名改一个字符后再检查，应报签名校验失败而不是安装。
 - [ ] **代理与直连**：在设置里填一个不通的代理后检查更新，日志出现「改走直连」并且最终仍拿到结果；填本机可用代理则走代理。关掉「启动时检查更新」后，启动不再发请求。
 - [ ] **索引速度**：添加一个几百张图的目录，进度持续推进，实测约 1.5 s/张；期间搜索仍可用。
