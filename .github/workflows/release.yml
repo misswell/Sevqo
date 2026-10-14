@@ -39,7 +39,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
       - name: 前端构建
         working-directory: apps/desktop
         run: |
@@ -47,9 +47,33 @@ jobs:
           npm run build
       - name: Rust 测试
         run: cargo test -q --workspace
+      - name: 发布凭据是否齐备
+        env:
+          APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          missing=()
+          [ -n "${APPLE_DEVELOPER_ID_P12_BASE64:-}" ] || missing+=("APPLE_DEVELOPER_ID_P12_BASE64(+_PASSWORD)")
+          [ -n "${APPLE_ID:-}" ] || missing+=("APPLE_ID(+APPLE_TEAM_ID/APPLE_APP_SPECIFIC_PASSWORD)")
+          [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ] || missing+=("TAURI_SIGNING_PRIVATE_KEY(+_PASSWORD)")
+          if [ ${#missing[@]} -eq 0 ]; then
+            echo "签名与公证凭据齐备，构建任务会运行。"
+          else
+            {
+              echo "### 缺少的 secrets"
+              for m in "${missing[@]}"; do echo "- \`$m\`"; done
+              echo "构建与发布任务会被跳过（未签名的安装包没有发布意义）。本机发版走 \`bash tools/release_macos.sh && bash tools/publish_release.sh\`。"
+            } >>"$GITHUB_STEP_SUMMARY"
+            echo "缺凭据，后续构建任务将跳过：${missing[*]}"
+          fi
 
   build-macos:
+    if: vars.RELEASE_PROVIDER != 'local'
     needs: verify
+    # 没签名证书就没必要跑 20 分钟构建，也别在 release 上留一条红色的必需步骤；
+    # 缺 secrets 时这里直接跳过，release 任务随 needs 一起跳过。
+    if: ${{ needs.verify.result == 'success' && secrets.APPLE_DEVELOPER_ID_P12_BASE64 != '' && secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -120,7 +144,7 @@ jobs:
 
   release:
     needs: build-macos
-    if: github.event_name == 'push' || inputs.publish
+    if: vars.RELEASE_PROVIDER != 'local' && (github.event_name == 'push' || inputs.publish)
     runs-on: ubuntu-latest
     permissions:
       contents: write
