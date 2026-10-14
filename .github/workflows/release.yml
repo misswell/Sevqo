@@ -39,6 +39,8 @@ env:
 
 jobs:
   verify:
+    # 探针跑不需要先花十几分钟装工具链、跑测试；build-macos 随它一起跳过。
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.probeCredentials) }}
     runs-on: macos-14
     outputs:
       signing_ready: ${{ steps.credentials.outputs.ready }}
