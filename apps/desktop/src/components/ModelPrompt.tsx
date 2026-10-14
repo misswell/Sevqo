@@ -5,7 +5,7 @@ import { useEffect, type ReactElement } from 'react';
 import { formatBytes, formatPercent, formatSpeed } from '../format';
 import { labels } from '../i18n';
 import { useModel } from '../useModel';
-import { DownloadIcon } from './Icons';
+import { DownloadIcon, GearIcon } from './Icons';
 import { Bar, Btn, Note } from './ui';
 
 export interface ModelPromptProps {
@@ -20,6 +20,8 @@ export function ModelPrompt({ compact = false, onChange }: ModelPromptProps): Re
   const status = model?.status ?? null;
   const partial = !!status && status.present > 0;
   const needPython = !!model && model.status.complete && !model.hasPython;
+  // 权重齐了就没有「下载」这回事：这时卡住语义的是 Python，再摆一个继续下载会把人支到错误的那一步。
+  const wantDownload = incomplete || downloading;
 
   useEffect(() => {
     onChange?.();
@@ -27,7 +29,7 @@ export function ModelPrompt({ compact = false, onChange }: ModelPromptProps): Re
 
   if (!model) return null;
   // 权重齐了、也没卡在缺 Python，就没有要提醒的事。
-  if (!incomplete && !downloading && !needPython) return null;
+  if (!wantDownload && !needPython) return null;
 
   const detail = status
     ? partial
@@ -37,22 +39,31 @@ export function ModelPrompt({ compact = false, onChange }: ModelPromptProps): Re
 
   return (
     <div className={`model-prompt${compact ? ' model-prompt-compact' : ''}`}>
-      <div className="model-prompt-line">
-        <span className="model-prompt-text">
-          <DownloadIcon size={13} />
-          <span>{labels.model.downloadPrompt}</span>
-          <span className="muted mono">{detail}</span>
-        </span>
-        {downloading ? (
-          <Btn small onClick={() => void cancel()} disabled={busy}>
-            {labels.model.cancelDownload}
-          </Btn>
-        ) : (
-          <Btn small tone="primary" onClick={() => void start()} disabled={busy}>
-            {partial ? labels.model.resumeDownload : labels.model.oneClick}
-          </Btn>
-        )}
-      </div>
+      {wantDownload ? (
+        <div className="model-prompt-line">
+          <span className="model-prompt-text">
+            <DownloadIcon size={13} />
+            <span>{labels.model.downloadPrompt}</span>
+            <span className="muted mono">{detail}</span>
+          </span>
+          {downloading ? (
+            <Btn small onClick={() => void cancel()} disabled={busy}>
+              {labels.model.cancelDownload}
+            </Btn>
+          ) : (
+            <Btn small tone="primary" onClick={() => void start()} disabled={busy}>
+              {partial ? labels.model.resumeDownload : labels.model.oneClick}
+            </Btn>
+          )}
+        </div>
+      ) : (
+        <div className="model-prompt-line">
+          <span className="model-prompt-text">
+            <GearIcon size={13} />
+            <span>{labels.model.missingPythonHint}</span>
+          </span>
+        </div>
+      )}
 
       {download ? (
         <div className="model-prompt-progress">
@@ -75,8 +86,9 @@ export function ModelPrompt({ compact = false, onChange }: ModelPromptProps): Re
         </div>
       ) : null}
 
-      {needPython && !downloading ? <Note>{labels.model.missingPythonHint}</Note> : null}
-      {note && !downloading ? <Note>{note}</Note> : null}
+      {wantDownload && needPython && !downloading ? <Note>{labels.model.missingPythonHint}</Note> : null}
+      {/* 只缺 Python 时上面那行已经把话说完了，后端那句「权重已经完整」再挂一遍就是三行同义。 */}
+      {wantDownload && note && !downloading ? <Note>{note}</Note> : null}
       {error ? <Note tone="error">{error}</Note> : null}
     </div>
   );
