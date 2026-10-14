@@ -134,7 +134,7 @@ bash tools/publish_release.sh    # gh 发布 Release，并回读 releases/latest
 bash tools/release_macos.sh && cargo test -p sevqo-desktop -- --ignored
 ```
 
-CI 在 `.github/workflows/release.yml`。云端发布路线需要 `APPLE_DEVELOPER_ID_P12_BASE64`、`APPLE_DEVELOPER_ID_P12_PASSWORD`、`APPLE_ID`、`APPLE_TEAM_ID`、`APPLE_APP_SPECIFIC_PASSWORD`、`TAURI_SIGNING_PRIVATE_KEY`、`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` 等仓库 secrets。Windows / Linux 暂时不在发布线里；sidecar 依赖的 Python 打包在那些平台还没验证。
+CI 在 `.github/workflows/release.yml`。云端发布路线需要的仓库 secrets：签名的 `APPLE_DEVELOPER_ID_P12_BASE64` + `APPLE_DEVELOPER_ID_P12_PASSWORD`；公证二选一，`APPLE_API_KEY_BASE64` + `APPLE_API_KEY_ID` + `APPLE_API_ISSUER` 或 `APPLE_ID` + `APPLE_TEAM_ID` + `APPLE_APP_SPECIFIC_PASSWORD`；更新包的 `TAURI_SIGNING_PRIVATE_KEY` + `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。这批已在 2026-10-14 由本机已有材料配齐，Runner 上的证书导入、真试签与公证接口连通都在 `probe-credentials` 里验过。想确认凭据是否还有效，手动跑一次 Release 并勾 `probeCredentials`：它只花十几秒，不构建也不发布。Windows / Linux 暂时不在发布线里；sidecar 依赖的 Python 打包在那些平台还没验证。
 
 ## 实跑验收清单
 
