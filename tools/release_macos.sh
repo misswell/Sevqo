@@ -172,7 +172,7 @@ repo="${GH_REPO:-misswell/Sevqo}"
 download="https://github.com/$repo/releases/download/$tag/$(basename "$archive")"
 jq -n \
   --arg version "$version" \
-  --arg notes "$(RELEASE_NOTES:-"${name} ${version}")" \
+  --arg notes "${RELEASE_NOTES:-${name} ${version}：完全离线的本地多模态文件搜索。}" \
   --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --arg signature "$(cat "$archive.sig")" \
   --arg url "$download" \

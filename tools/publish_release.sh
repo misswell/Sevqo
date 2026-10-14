@@ -40,6 +40,9 @@ fi
 
 jq -e --arg v "$version" '.version == $v and (.platforms | length > 0)' "$up_dir/latest.json" >/dev/null \
   || fail "latest.json 的版本与 tauri.conf.json 不一致，或没有平台条目"
+# notes 是更新卡片上唯一的说明文字，空字符串会显示成一片空白
+jq -e '.notes | length > 0' "$up_dir/latest.json" >/dev/null \
+  || fail "latest.json 的 notes 是空的，客户端的更新卡片会没有说明"
 jq -e --arg a "$(basename "$archive")" '[.platforms[].url] | all(endswith($a))' "$up_dir/latest.json" >/dev/null \
   || fail "latest.json 里的下载地址指的不是 $archive"
 

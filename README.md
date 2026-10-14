@@ -110,12 +110,40 @@ cargo run -p sevqo-engine --example smoke -- .research/fixtures   # 端到端：
 - **英文比中文高 5.8 个百分点**（0.848 vs 0.790）：中文口语描述更依赖关键词通道兜底，这正是混合检索存在的理由。
 - **吞吐**：单图 1.52→1.74 s（p50 1.67，p95 2.31），约 34 张/分钟；进程常驻峰值 ~1.07 GB。测速期间有 Rust release 构建抢占 CPU，纯索引时按 1.5 s/张 估算更准。
 
+## 发布与应用内更新
+
+发布链路拆成两段，本机和 CI 用的是同一套脚本：
+
+```bash
+bash tools/release_macos.sh      # 构建 → Developer ID 签名 → 公证 → 装订 → .dmg + .app.tar.gz + .sig + latest.json
+bash tools/publish_release.sh    # gh 发布 Release，并回读 releases/latest/download/latest.json 确认生效
+```
+
+`release_macos.sh` 只做产物、不碰 GitHub；`publish_release.sh` 上传前会核对产物齐全、`latest.json` 的版本与下载地址指向本地产物，并按是否装订了公证凭据决定发行说明里写不写绕过 Gatekeeper 的那段。`SKIP_BUILD=1` 复用已构建的 `.app`，`SIGN_ONLY=1` 只签名不公证（自检用，别拿这种产物发版）。三条公证路线（notarytool 钥匙串 profile → App Store Connect API key → Apple ID + app-specific password → `asc` 已存的凭据）全都不成立时脚本直接失败退出，不会悄悄发一个没公证的包。
+
+更新包用 minisign 签名，`cargo tauri signer sign --app-version` 会把版本号写进签名的 trusted comment：
+
+- 私钥 `apps/desktop/src-tauri/.tauri/sevqo-updater.key`（连同 `.password`）已 gitignore，不进仓库。
+- 公钥内嵌在 `tauri.conf.json` 的 `plugins.updater.pubkey`，更新源是 `https://github.com/misswell/Sevqo/releases/latest/download/latest.json`。
+- 清单形状是 `{version, notes, pub_date, platforms:{"darwin-aarch64":{signature,url}}}`；签名与公钥不符的包不会被安装。
+- `createUpdaterArtifacts` 刻意关着：本机的免签构建也能照常跑，签名由脚本自己完成。
+
+`tauri signer` 没有 verify 子命令，所以加了一条 `--ignored` 测试来证明「发出去的包确实配得上仓库里那个公钥」：
+
+```bash
+bash tools/release_macos.sh && cargo test -p sevqo-desktop -- --ignored
+```
+
+CI 在 `.github/workflows/release.yml`：`push v*` 标签（或手动 dispatch）跑 verify → arm64/x86_64 构建 → 签名公证 → minisign → 发布，需要的 secrets 是 `APPLE_DEVELOPER_ID_P12_BASE64`、`APPLE_DEVELOPER_ID_P12_PASSWORD`、`APPLE_ID`、`APPLE_TEAM_ID`、`APPLE_APP_SPECIFIC_PASSWORD`、`TAURI_SIGNING_PRIVATE_KEY`、`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。Windows / Linux 暂时不在发布线里：sidecar 依赖的 Python 打包在那两个平台还没验证过，发一个装不上推理环境的包比不发更糟。
+
 ## 实跑验收清单
 
-自动化部分已经绿：`cargo test -p sevqo-engine`（78 项）与端到端 `smoke`（15 项，`SMOKE OK`，含「自然语言只搜图片也确实走语义通道」「关闭后 sidecar 进程确实被回收」）。下面这些只有肉眼能确认，用 `npm run tauri dev` 或打包好的 `Sevqo.app` 逐条勾。
+自动化部分已经绿：`cargo test -p sevqo-engine`（82 项）与端到端 `smoke`（15 项，`SMOKE OK`，含「自然语言只搜图片也确实走语义通道」「关闭后 sidecar 进程确实被回收」）。下面这些只有肉眼能确认，用 `npm run tauri dev` 或打包好的 `Sevqo.app` 逐条勾。
 
 - [ ] **首启下载**：删掉权重目录后启动，模型卡片显示 14 个文件 / 1.49 GB 的进度，能取消、能续传；完成后悬浮框搜索不再提示「模型未就绪」。
-- [ ] **装到应用程序后仍可用**：把 `Sevqo_0.1.0_aarch64.dmg` 拖进「应用程序」并从那里启动（不是在仓库里跑），在设置里把 Python 路径指向装好依赖的解释器，语义搜索即可用；启动后缓存目录出现 `sidecar/sevqo_embed/`，日志里没有 `ModuleNotFoundError`。注意产物是 adhoc 签名（没有 Developer ID 证书），本机构建的镜像不带隔离属性所以直接能开；发给别人要签名+公证，否则得右键「打开」或 `xattr -dr com.apple.quarantine`。
+- [ ] **装到应用程序后仍可用**：把 `Sevqo_v0.1.0_macos_aarch64.dmg` 拖进「应用程序」并从那里启动（不是在仓库里跑），在设置里把 Python 路径指向装好依赖的解释器，语义搜索即可用；启动后缓存目录出现 `sidecar/sevqo_embed/`，日志里没有 `ModuleNotFoundError`。走 `tools/release_macos.sh` 的产物是 Developer ID 签名 + 公证 + 装订，双击即可打开；只跑 `tauri build` + `make_dmg.sh` 的本机产物是 adhoc 签名、没公证，发给别人要 `bash tools/release_macos.sh`，否则得右键「打开」或 `xattr -dr com.apple.quarantine`。
+- [ ] **应用内更新**：启动约 20 秒后侧栏「关于与更新」自己显示检查状态；当前版本与 `tauri.conf.json` / Release 标签一致；手动「检查更新」在已最新时不动作，有新版本时显示版本号、发布时间和更新说明；「下载并安装」有进度条且下载途中可取消，装完自动重启，重启后版本号变化、索引与设置不受影响；把 `latest.json` 的签名改一个字符后再检查，应报签名校验失败而不是安装。
+- [ ] **代理与直连**：在设置里填一个不通的代理后检查更新，日志出现「改走直连」并且最终仍拿到结果；填本机可用代理则走代理。关掉「启动时检查更新」后，启动不再发请求。
 - [ ] **索引速度**：添加一个几百张图的目录，进度持续推进，实测约 1.5 s/张；期间搜索仍可用。
 - [ ] **自然语言搜图**：用一句图里没出现的中文描述（「黄昏的海滩 有人骑车」）能命中对应图片。
 - [ ] **精确文件名**：输入 `invoice_2026` 这类片段，目标排在第一且标为 keyword/both 通道。

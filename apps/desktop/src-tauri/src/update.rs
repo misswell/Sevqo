@@ -350,14 +350,25 @@ mod tests {
 
         let dir = std::env::var("SEVQO_UPDATE_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| manifest.join("../../target/release/bundle/updater"));
+            // src-tauri → desktop → apps → repo root, where `target/` lives
+            .unwrap_or_else(|_| manifest.join("../../../target/release/bundle/updater"));
         let list = archives(&dir);
         assert!(!list.is_empty(), "{} 里没有 *.app.tar.gz", dir.display());
         for archive in list {
             let sig_path = PathBuf::from(format!("{}.sig", archive.display()));
             let bytes = std::fs::read(&archive).unwrap();
-            let signature = minisign_verify::Signature::from_file(&sig_path)
-                .unwrap_or_else(|e| panic!("{} 的签名读不出来：{e}", sig_path.display()));
+            // `tauri signer` writes the minisign file base64-packed on one line — the same
+            // string that goes into latest.json — so the plugin's format and ours match.
+            let packed = std::fs::read_to_string(&sig_path)
+                .unwrap_or_else(|e| panic!("{} 读不出来：{e}", sig_path.display()));
+            let text = String::from_utf8(
+                base64::engine::general_purpose::STANDARD
+                    .decode(packed.trim())
+                    .unwrap_or_else(|e| panic!("{} 不是合法 base64：{e}", sig_path.display())),
+            )
+            .expect("签名不是 UTF-8");
+            let signature = minisign_verify::Signature::decode(&text)
+                .unwrap_or_else(|e| panic!("{} 的签名解析失败：{e}", sig_path.display()));
             public
                 .verify(&bytes, &signature, false)
                 .unwrap_or_else(|e| panic!("{} 与配置里的公钥不匹配：{e}", archive.display()));
