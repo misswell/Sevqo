@@ -1,0 +1,14 @@
+# Inference sidecar deps. Python 3.11+ / arm64 or x86_64.
+# sentence-transformers must be >=6.1.0: older versions ignore the order of multimodal
+# dict inputs, which silently breaks multi-image embeddings.
+torch>=2.9
+torchvision
+transformers>=5.18
+sentence-transformers>=6.1.0
+huggingface-hub>=0.30
+pillow
+pillow-heif
+av>=14
+pypdf>=5
+numpy
+psutil

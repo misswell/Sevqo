@@ -1,0 +1,27 @@
+# 构建产物
+/target
+/apps/desktop/dist
+/apps/desktop/node_modules
+/apps/desktop/src-tauri/gen/
+
+# 发布产物（tools/release_macos.sh 生成，走 GitHub Release 分发，不进 git）
+/testdata/
+
+# 模型权重与缓存：首启按需下载，不入库
+/models/
+.model-cache/
+
+# 第三方评测数据集与本机 Python 环境
+.research/
+.venv/
+
+# 更新包签名私钥与口令，绝不入库
+/apps/desktop/src-tauri/.tauri/
+
+# 本地状态
+.DS_Store
+*.log
+.idea/
+.vscode/
+__pycache__/
+*.py[cod]

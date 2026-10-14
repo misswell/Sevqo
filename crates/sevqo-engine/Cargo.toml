@@ -1,0 +1,30 @@
+[package]
+name = "sevqo-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+rusqlite = { workspace = true }
+notify = { workspace = true }
+walkdir = { workspace = true }
+image = { workspace = true }
+reqwest = { workspace = true }
+zip = { workspace = true }
+chrono = { workspace = true }
+crossbeam-channel = { workspace = true }
+rayon = { workspace = true }
+memmap2 = { workspace = true }
+dirs = { workspace = true }
+urlencoding = { workspace = true }
+encoding_rs = { workspace = true }
+tracing = { workspace = true }
+sha2 = "0.10"
+tempfile = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,188 @@
+name: Release
+
+# macOS 双架构构建 → Developer ID 签名 → 公证 → 装订 → minisign 更新包 → latest.json → GitHub Release。
+# 需要仓库 secrets（缺一不可，脚本会显式报错而不是悄悄跳过）：
+#   APPLE_DEVELOPER_ID_P12_BASE64 / APPLE_DEVELOPER_ID_P12_PASSWORD   签名证书
+#   APPLE_ID / APPLE_TEAM_ID / APPLE_APP_SPECIFIC_PASSWORD            公证凭据
+#   TAURI_SIGNING_PRIVATE_KEY / TAURI_SIGNING_PRIVATE_KEY_PASSWORD    更新包 minisign 私钥
+#   （公钥已经写进 apps/desktop/src-tauri/tauri.conf.json，换了密钥要同步）
+# Windows / Linux 暂不在发版链路里：推理侧的 Python 依赖在那些平台上还没验证过，
+# 与其发一个装不上的安装包，不如只发验证过的平台。
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 用于产物命名的版本（例如 v0.1.0）
+        required: true
+        type: string
+      publish:
+        description: 校验通过后是否发布 GitHub Release
+        required: true
+        default: false
+        type: boolean
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  SOURCE_REF: ${{ github.event_name == 'workflow_dispatch' && github.sha || github.ref_name }}
+
+jobs:
+  verify:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_REF }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: 前端构建
+        working-directory: apps/desktop
+        run: |
+          npm ci
+          npm run build
+      - name: Rust 测试
+        run: cargo test -q --workspace
+
+  build-macos:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            target: aarch64-apple-darwin
+            platform: darwin-aarch64
+          - arch: x86_64
+            target: x86_64-apple-darwin
+            platform: darwin-x86_64
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_REF }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: 安装 Tauri CLI
+        run: cargo install tauri-cli --version "^2.0" --locked
+
+      - name: 构建 .app
+        working-directory: apps/desktop
+        # tauri 自带的 bundle_dmg.sh 会让 Finder 美化窗口，无人值守跑不了；镜像自己做
+        run: cargo tauri build --target ${{ matrix.target }} --bundles app
+
+      - name: 导入 Developer ID 证书
+        env:
+          DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+        run: bash .github/scripts/import_signing_identity.sh
+
+      - name: 签名、镜像、公证、装订
+        env:
+          ARCH: ${{ matrix.arch }}
+          TARGET: ${{ matrix.target }}
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: bash .github/scripts/sign_notarize_macos.sh
+
+      - name: 打包并签名更新归档
+        env:
+          ARCH: ${{ matrix.arch }}
+          TARGET: ${{ matrix.target }}
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: bash .github/scripts/pack_updater.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: release/*
+
+      - name: 清理临时钥匙串
+        if: always()
+        run: |
+          if [ -n "${SIGNING_KEYCHAIN:-}" ] && [ -e "${SIGNING_KEYCHAIN}" ]; then
+            security delete-keychain "${SIGNING_KEYCHAIN}"
+          fi
+
+  release:
+    needs: build-macos
+    if: github.event_name == 'push' || inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_REF }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 汇总产物与更新清单
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find artifacts -type f \( -name '*.dmg' -o -name '*.tar.gz' -o -name '*.sig' \) -exec cp {} release/ \;
+          version="${RELEASE_TAG#v}"
+          platform_json='{}'
+          for arch in aarch64 x86_64; do
+            archive="Sevqo_${RELEASE_TAG}_macos_${arch}.app.tar.gz"
+            [ -s "release/${archive}" ] || { echo "缺少 ${archive}" >&2; ls -l release; exit 1; }
+            platform_json="$(jq \
+              --arg key "darwin-${arch}" \
+              --arg url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${archive}" \
+              --rawfile sig "release/${archive}.sig" \
+              '.[$key] = {signature: ($sig | rtrimstr("\n")), url: $url}' <<<"$platform_json")"
+          done
+          jq -n \
+            --arg version "$version" \
+            --arg notes "Sevqo ${version}：完全离线的本地多模态文件搜索。" \
+            --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --argjson platforms "$platform_json" \
+            '{version:$version,notes:$notes,pub_date:$pub_date,platforms:$platforms}' \
+            >release/latest.json
+          jq . release/latest.json
+          ls -lh release/
+
+      - name: 发布 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: Sevqo ${{ env.RELEASE_TAG }}
+          body: |
+            ## Sevqo
+            本地离线的跨模态文件搜索：自然语言搜图、以图搜图、以片段定位视频，全部在本机完成，不上传文件、不需要 API Key。
+
+            ### 下载
+            | 平台 | 文件 |
+            |------|------|
+            | Apple Silicon | `Sevqo_${{ env.RELEASE_TAG }}_macos_aarch64.dmg` |
+            | Intel | `Sevqo_${{ env.RELEASE_TAG }}_macos_x86_64.dmg` |
+
+            `.app.tar.gz` 与 `.sig` 供应用内更新使用，无需手动下载。
+
+            ### 首次启动
+            模型权重不打进安装包，启动时按设置里的下载源自动拉取并校验，可断点续传。推理需要装有 torch / sentence-transformers / av / pillow-heif / pypdf 的 Python 环境。
+
+            ### 更新
+            「关于与更新」可手动检查更新，启动后也会后台检查一次；更新包带 minisign 签名，与配置里的公钥不符就不会安装。
+          files: release/*
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false
+          make_latest: true

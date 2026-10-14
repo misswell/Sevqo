@@ -1,0 +1,72 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Sevqo",
+  "version": "0.1.0",
+  "identifier": "com.sevqo.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "spotlight",
+        "title": "Sevqo 搜索",
+        "width": 760,
+        "height": 60,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "resizable": false,
+        "maximizable": false,
+        "minimizable": false,
+        "closable": false,
+        "visible": false,
+        "focus": false,
+        "center": true,
+        "shadow": true
+      },
+      {
+        "label": "main",
+        "title": "Sevqo",
+        "width": 1180,
+        "height": 780,
+        "minWidth": 880,
+        "minHeight": 560,
+        "center": true,
+        "visible": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data: blob: asset: http://asset.localhost; media-src 'self' sevqo-media: http://sevqo-media.localhost blob:; style-src 'self' 'unsafe-inline'; script-src 'self'"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IENFRTlBM0IwRjEzNUE5M0YKUldRL3FUWHhzS1BwenZmQkVvWFZiazhsRFR5QmFZWjRkY3R0NHRlUW5qZldhdlR3RVQ3eDRLUloK",
+      "endpoints": [
+        "https://github.com/misswell/Sevqo/releases/latest/download/latest.json"
+      ]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "Utility",
+    "shortDescription": "本地多模态文件搜索",
+    "longDescription": "完全离线的图片、视频、文档语义搜索工具",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/icon.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    }
+  }
+}
