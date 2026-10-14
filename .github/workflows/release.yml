@@ -54,6 +54,9 @@ jobs:
         env:
           RELEASE_PROVIDER: ${{ vars.RELEASE_PROVIDER }}
           APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: |
@@ -67,7 +70,12 @@ jobs:
           fi
           missing=()
           [ -n "${APPLE_DEVELOPER_ID_P12_BASE64:-}" ] || missing+=("APPLE_DEVELOPER_ID_P12_BASE64(+_PASSWORD)")
-          [ -n "${APPLE_ID:-}" ] || missing+=("APPLE_ID(+APPLE_TEAM_ID/APPLE_APP_SPECIFIC_PASSWORD)")
+          # 公证两条路线任取其一：App Store Connect API key 或 Apple ID + app-specific password
+          if [ -n "${APPLE_API_KEY_BASE64:-}" ] || [ -n "${APPLE_ID:-}" ]; then
+            :
+          else
+            missing+=("APPLE_API_KEY_BASE64(+APPLE_API_KEY_ID/APPLE_API_ISSUER) 或 APPLE_ID(+APPLE_TEAM_ID/APPLE_APP_SPECIFIC_PASSWORD)")
+          fi
           [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ] || missing+=("TAURI_SIGNING_PRIVATE_KEY(+_PASSWORD)")
           if [ ${#missing[@]} -eq 0 ]; then
             echo "ready=true" >>"$GITHUB_OUTPUT"
@@ -129,6 +137,9 @@ jobs:
           ARCH: ${{ matrix.arch }}
           TARGET: ${{ matrix.target }}
           RELEASE_TAG: ${{ env.RELEASE_TAG }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
