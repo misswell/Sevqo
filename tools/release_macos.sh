@@ -11,9 +11,11 @@
 # 环境变量：
 #   SIGNING_IDENTITY          默认自动探测 "Developer ID Application: …"
 #   NOTARY_PROFILE            xcrun notarytool 的钥匙串凭据 profile 名
-#   APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD / APPLE_TEAM_ID   notarytool 的直接凭据
+#   APPLE_API_KEY_PATH / APPLE_API_KEY_ID / APPLE_API_ISSUER   App Store Connect API key
+#   APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD                      notarytool 的 Apple ID 路线
 #   UPDATER_KEY               默认 apps/desktop/src-tauri/.tauri/sevqo-updater.key
 #   UPDATER_KEY_PASSWORD      默认读同名的 .password 文件
+# 三条公证路线都不成立时脚本会失败退出，不会悄悄发一个没公证的包。
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -48,7 +50,9 @@ if [[ -z "$signing_identity" ]]; then
     | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)"
 fi
 [[ -n "$signing_identity" ]] || fail "没有 Developer ID Application 证书：${name} 的发布包必须签名，请先在 Keychain 里安装该证书"
-log "签名身份：$signing_identity"
+# Team ID 就写在证书名末尾的括号里，不硬编码
+team_id="$(printf '%s' "$signing_identity" | sed -n 's/.*(\([A-Z0-9]*\))$/\1/p')"
+log "签名身份：$signing_identity（Team ${team_id:-未知}）"
 
 [[ -f "$updater_key" ]] || fail "找不到更新包签名私钥 $updater_key（用 cargo tauri signer generate 生成）"
 if [[ -z "${UPDATER_KEY_PASSWORD:-}" ]]; then
@@ -90,32 +94,48 @@ codesign --verify --verbose=2 "$dmg"
 
 # ------------------------------------------------------------------ 4. 公证
 notarized=0
+# 凭据按顺序取第一条成立的：钥匙串 profile → ASC API key → Apple ID → asc 里存好的 key。
+# 后两条在无交互 shell 里常常写不进钥匙串，所以 ASC API key 路线是这台机器的实际主力。
 notarize() {
   local file="$1"
   if [[ "${SIGN_ONLY:-0}" == 1 ]]; then
     log "SIGN_ONLY=1：跳过公证"
     return 0
   fi
-  if command -v asc >/dev/null 2>&1 && asc auth status >/dev/null 2>&1; then
-    log "用 asc 提交公证：$(basename "$file")"
-    asc notarization submit --file "$file" --wait --output json >"$bundle/notarize-$(basename "$file").json"
-    notarized=1
-    return 0
-  fi
-  if [[ -n "${NOTARY_PROFILE:-}" ]]; then
-    log "用 notarytool（profile：$NOTARY_PROFILE）提交公证"
+  if [[ -n "${NOTARY_PROFILE:-}" ]] && xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null 2>&1; then
+    log "公证凭据：钥匙串 profile $NOTARY_PROFILE"
     xcrun notarytool submit "$file" --keychain-profile "$NOTARY_PROFILE" --wait
     notarized=1
     return 0
   fi
-  if [[ -n "${APPLE_ID:-}" && -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" && -n "${APPLE_TEAM_ID:-}" ]]; then
-    log "用 notarytool（Apple ID）提交公证"
-    xcrun notarytool submit "$file" --apple-id "$APPLE_ID" \
-      --password "$APPLE_APP_SPECIFIC_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+  if [[ -n "${APPLE_API_KEY_PATH:-}" && -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER:-}" ]]; then
+    [[ -f "$APPLE_API_KEY_PATH" ]] || fail "APPLE_API_KEY_PATH 指向的文件不存在：$APPLE_API_KEY_PATH"
+    log "公证凭据：App Store Connect API key"
+    xcrun notarytool submit "$file" --key "$APPLE_API_KEY_PATH" \
+      --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER" --wait
     notarized=1
     return 0
   fi
-  fail "没有可用的公证凭据：asc / NOTARY_PROFILE / APPLE_ID 三者都没有。确实只想签名自检时加 SIGN_ONLY=1"
+  if [[ -n "${APPLE_ID:-}" && -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]]; then
+    log "公证凭据：Apple ID + app-specific password"
+    xcrun notarytool submit "$file" --apple-id "$APPLE_ID" \
+      --team-id "${APPLE_TEAM_ID:-$team_id}" --password "$APPLE_APP_SPECIFIC_PASSWORD" --wait
+    notarized=1
+    return 0
+  fi
+  if command -v asc >/dev/null 2>&1 && asc auth status >/dev/null 2>&1; then
+    log "公证凭据：asc 保存的 App Store Connect API key"
+    local resp="$bundle/notarization.json"
+    asc notarization submit --file "$file" --wait --output json >"$resp" \
+      || { sed -n '1,20p' "$resp" >&2; fail "asc 公证提交失败，详见 $resp"; }
+    if grep -qiE '"result"[^,]*"invalid"' "$resp"; then
+      sed -n '1,20p' "$resp" >&2
+      fail "公证被 Apple 拒绝，详见 $resp"
+    fi
+    notarized=1
+    return 0
+  fi
+  fail "没有可用的公证凭据（NOTARY_PROFILE / APPLE_API_KEY_* / APPLE_ID+app-specific / asc 全都不成立）；只想签名自检时加 SIGN_ONLY=1"
 }
 notarize "$dmg"
 
