@@ -59,6 +59,22 @@ jobs:
           npm run build
       - name: Rust 测试
         run: cargo test -q --workspace
+      - name: 标签版本与配置版本是否一致
+        run: |
+          # latest.json 的版本取自标签，而 minisign 签名里的 app-version 取自 tauri.conf.json。
+          # 只改标签不改配置，发出去的更新会因为签名里的版本对不上而被客户端拒装。
+          # 手动触发允许拿任意标签自检，所以只在真正推标签时拦。
+          set -euo pipefail
+          conf="$(jq -r .version apps/desktop/src-tauri/tauri.conf.json)"
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            [ "v${conf}" = "${RELEASE_TAG}" ] || {
+              echo "标签 ${RELEASE_TAG} 对不上 tauri.conf.json 的 ${conf}：先改版本号再打标签" >&2
+              exit 1
+            }
+            echo "==> ${RELEASE_TAG} 与 tauri.conf.json 的 ${conf} 一致"
+          else
+            echo "==> 手动触发，跳过一致性检查（标签 ${RELEASE_TAG} 仅用于产物命名，配置版本仍是 ${conf}）"
+          fi
       - name: 发布凭据是否齐备
         id: credentials
         env:
