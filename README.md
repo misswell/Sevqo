@@ -126,14 +126,18 @@ cargo run -p sevqo-engine --example smoke -- .research/fixtures   # 端到端：
 
 ## 发布与应用内更新
 
-发布脚本分成本机产物和 GitHub 上传两步：
+发布默认由 GitHub Actions 完成：推一个 `v*` 标签，云端就依次做双架构构建 → Developer ID 签名 → 公证 → 装订 → minisign 更新包 → `latest.json` → GitHub Release。签名材料全在仓库 secrets 里，**不依赖任何一台机器的钥匙串**，所以从哪台电脑推标签都一样能发出去。
+
+本机的两个脚本留作离线兜底（runner 排队、凭据轮换、断网时用），产出与云端同构：
 
 ```bash
 bash tools/release_macos.sh      # 构建 → Developer ID 签名 → 公证 → 装订 → .dmg + .app.tar.gz + .sig + latest.json
 bash tools/publish_release.sh    # gh 发布 Release，并回读 releases/latest/download/latest.json 确认生效
 ```
 
-本轮 v0.1.2 已于 2026-10-14 21:27（北京时间）在 [GitHub Release](https://github.com/misswell/Sevqo/releases/tag/v0.1.2) 发布；本机脚本完成构建、Developer ID 签名、公证、装订与打包。仓库变量 `RELEASE_PROVIDER=local` 让新版标签的 GitHub Actions 只跑前端和 Rust 验证；云端构建与发布任务会跳过。未设置该变量时保留原来的云端签名、公证和发布路径。`publish_release.sh` 会检查产物、更新清单与远端 Release；发现同名 Release 时退出，不覆盖附件或说明。`SKIP_BUILD=1` 复用已构建的 `.app`，`SIGN_ONLY=1` 只签名不公证（自检用，不能用于正式发布）。
+开关是仓库变量 `RELEASE_PROVIDER`：`github`（当前值，2026-10-15 起）走云端；`local` 让标签触发的 Actions 只跑前端和 Rust 验证，构建与发布任务跳过，由上面两个脚本在本机发。`publish_release.sh` 会检查产物、更新清单与远端 Release；发现同名 Release 时退出，不覆盖附件或说明。`SKIP_BUILD=1` 复用已构建的 `.app`，`SIGN_ONLY=1` 只签名不公证（自检用，不能用于正式发布）。
+
+版本说明只有 `RELEASE_NOTES.md` 一个来源：本机脚本和 CI 都把它写进 `latest.json` 的 `notes`（更新卡片上唯一的文字），CI 还把它当作 Release 正文的开头。发版前先更新它，否则说明会停在上一版。
 
 本机那把 Developer ID 不在登录钥匙串里，直接跑 `release_macos.sh` 会在签名这一步报 `no identity found`。发布时把证书导进一个一次性钥匙串，**追加**到用户搜索列表（`security list-keychains -d user -s 新钥匙串 原有钥匙串…`）并 `security set-key-partition-list -S apple-tool:,apple:,codesign:` 放行 `/usr/bin/codesign`，跑完删掉并还原搜索列表与默认钥匙串；只 `security create-keychain` 而不挂列表是不够的。
 
@@ -150,7 +154,9 @@ bash tools/publish_release.sh    # gh 发布 Release，并回读 releases/latest
 bash tools/release_macos.sh && cargo test -p sevqo-desktop -- --ignored
 ```
 
-CI 在 `.github/workflows/release.yml`。云端发布路线需要的仓库 secrets：签名的 `APPLE_DEVELOPER_ID_P12_BASE64` + `APPLE_DEVELOPER_ID_P12_PASSWORD`；公证二选一，`APPLE_API_KEY_BASE64` + `APPLE_API_KEY_ID` + `APPLE_API_ISSUER` 或 `APPLE_ID` + `APPLE_TEAM_ID` + `APPLE_APP_SPECIFIC_PASSWORD`；更新包的 `TAURI_SIGNING_PRIVATE_KEY` + `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。这批已在 2026-10-14 由本机已有材料配齐，Runner 上的证书导入、真试签与公证接口连通都在 `probe-credentials` 里验过。想确认凭据是否还有效，手动跑一次 Release 并勾 `probeCredentials`：它只花十几秒，不构建也不发布。Windows / Linux 暂时不在发布线里；sidecar 依赖的 Python 打包在那些平台还没验证。
+CI 在 `.github/workflows/release.yml`。云端发布路线需要的仓库 secrets：签名的 `APPLE_DEVELOPER_ID_P12_BASE64` + `APPLE_DEVELOPER_ID_P12_PASSWORD`；公证二选一，`APPLE_API_KEY_BASE64` + `APPLE_API_KEY_ID` + `APPLE_API_ISSUER` 或 `APPLE_ID` + `APPLE_TEAM_ID` + `APPLE_APP_SPECIFIC_PASSWORD`（脚本优先用 API key，配了 API key 时后一条路线是死代码）；更新包的 `TAURI_SIGNING_PRIVATE_KEY` + `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。这批已在 2026-10-14 由本机已有材料配齐，Runner 上的证书导入、真试签与公证接口连通都在 `probe-credentials` 里验过。想确认凭据是否还有效，手动跑一次 Release 并勾 `probeCredentials`：它只花十几秒，不构建也不发布。Windows / Linux 暂时不在发布线里；sidecar 依赖的 Python 打包在那些平台还没验证。
+
+CI 的矩阵出 `aarch64` 与 `x86_64` 两个包，但 **Intel 包至今没被任何人在真机上打开过**——v0.1.2 及以前的正式产物只出过 arm64。在拿到一台 Intel 机器实测之前，`RELEASE_NOTES.md` 里不要写「支持 Intel」。
 
 ## 实跑验收清单
 

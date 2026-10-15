@@ -47,3 +47,4 @@
 - 移动端尚未实现。CPython sidecar 无法直接作为 iOS 的交付方案。
 - 本轮没有完成 Windows/Linux 真机验证、十万级素材压力测试或打包后 GUI 全流程验收。
 - Sevqo v0.1.2 已于 2026-10-14 21:27（北京时间）发布到 [GitHub Release](https://github.com/misswell/Sevqo/releases/tag/v0.1.2)。tag 指向发布提交；GitHub Actions 前端和 Rust 验证成功，本机负责签名、公证、打包与发布。
+- 2026-10-15 起发布路径切到 GitHub Actions：仓库变量 `RELEASE_PROVIDER=github`，签名、公证、装订、更新包与 Release 全在 runner 上完成，推 `v*` 标签即发版，不再依赖本机的钥匙串；本机两个脚本降级为离线兜底。CI 的 `latest.json.notes` 与 Release 正文改读 `RELEASE_NOTES.md`，与本机路线同一个来源。
