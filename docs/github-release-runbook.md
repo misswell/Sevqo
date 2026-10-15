@@ -157,6 +157,10 @@ tar -xzf <App>_<tag>_macos_<arch>.app.tar.gz -C /tmp/u && xcrun stapler validate
 ```
 
 从 GitHub 直连下载可能很慢，挂后台跑，别因此跳过第 2 步。
+dry run 没有 Release 可拉，就验 Runner 上传的 artifact：`gh run download <run-id> -D /tmp/x`，
+里面是 `.dmg` / `.app.tar.gz` / `.sig`，同样跑 `stapler validate` 和 `codesign -dv --verbose=4`；
+`.sig` 是 base64 套 base64，解开后拿它的 minisign key id 跟配置里的 `pubkey` 对一遍，
+再看 trusted comment 里的 `version:` 是不是配置文件那个版本——这两条对上，应用内更新才会认这个包。
 构建目录里那个 `notarization.json` 常常是上一版残留，不能当证据。
 
 ## 9. 这次真踩到的坑
@@ -170,7 +174,9 @@ tar -xzf <App>_<tag>_macos_<arch>.app.tar.gz -C /tmp/u && xcrun stapler validate
   产物和文案自相矛盾。要么摘掉矩阵，要么别在文案里承诺支持。
 - **别跳过只验证凭据的探针**：它十几秒，完整构建几十分钟。第一次上云就直接跑完整构建，等于用 40 分钟换一个 `tsc: command not found`。
 - **dry run 别用真实版本号命名**：手动触发时 `RELEASE_TAG` 直接决定产物文件名，用 `v0.1.2` 自检就产出一堆
-  `Sevqo_v0.1.2_macos_aarch64.dmg`，和线上那个 Release 的资产同名，隔几天回头看极易误当"已经发过了"。
+  `Sevqo_v0.1.2_macos_aarch64.dmg`，和线上那个 Release 的资产同名。这次就留下了实证：
+  云端 dry run 的 aarch64 dmg 是 `c00e1f2d022e493e…`，线上已发布的 v0.1.2 同名 dmg 是 `2153c31ddf06c239…`，
+  **文件名一模一样、字节完全不同**。隔几天回头看极易误当"已经发过了"。
   版本守卫在 `workflow_dispatch` 上是跳过的，所以自检尽管用 `v9.9.9-dryrun` 这类测试标签。
 
 ## 10. 当前状态
@@ -184,6 +190,12 @@ tar -xzf <App>_<tag>_macos_<arch>.app.tar.gz -C /tmp/u && xcrun stapler validate
 - Apple 侧独立佐证（不读 CI 日志，直接查 Apple 记录）：
   `11910e34-0e04-4b7d-91ac-432f8c59805f` = `Sevqo_v0.1.2_macos_x86_64.dmg` Accepted，createdDate 2026-10-15T14:29:03Z；
   `0a4b921e-9a6a-4c69-914d-e01ff6e93dcd` = `Sevqo_v0.1.2_macos_aarch64.dmg` Accepted，createdDate 2026-10-15T14:31:43Z。
+- **产物字节级复核（把 §8 的第 3 步用在 CI 产物上）**：`gh run download 38749873546 -D /tmp/sevqo-ci` 拉回 Runner 上传的
+  artifact，本机实测 aarch64 那份：`.dmg` 与解包后的 `Sevqo.app` 都 `The validate action worked!`（票据真的在表里），
+  `codesign` 出完整 Developer ID 链 + `flags=0x10000(runtime)`，`spctl` accepted，
+  更新包 `.sig` 解出来的 minisign key id `CEE9A3B0F135A93F` 与 `tauri.conf.json` 里那个公钥一致，
+  trusted comment 是 `version:0.1.2`（等于配置版本，客户端才会装）。
+  这一步证明的是"装订之后才打包"这个顺序真的生效——只看 CI 日志的时间戳还不够。
 - **还没证明的两件事**：`release` 任务（拼 `latest.json` + 发 GitHub Release）从未在云端跑过，
   它只在 ubuntu runner 上拼 JSON，风险低但没实测；`x86_64` 包这次是**真的被公证了**，但仍然没有任何人在 Intel 机器上打开过。
 - 下一步就是正式发：改版本号那 4 处 + `RELEASE_NOTES.md`，提交后 `git push origin v<新版本>`（只单推一个标签），
