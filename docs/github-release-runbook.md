@@ -187,9 +187,12 @@ dry run 没有 Release 可拉，就验 Runner 上传的 artifact：`gh run downl
 - **只公证 dmg，包里的 .app 是没票据的**：CI 那条路线原来是"造 dmg → 签 dmg → 公证 dmg → 给 app 和 dmg 都装订"，
   装订发生在 dmg 已经造完之后，于是镜像里那份副本永远追不上票据。`stapler validate` 对 dmg 本身是过的，
   看起来一切正常；挂上镜像再验包内那个 app 才露馅：`Sevqo.app does not have a ticket stapled to it.`。
-  没有票据的包第一次打开要联网查 cdhash，断网或走代理就报"已损坏"。正确顺序照搬本机路线：
-  **先公证并装订 .app，再从带票据的 .app 造 dmg**（`sign_notarize_macos.sh`）。验收也必须挂在挂载之后：
-  `hdiutil attach -readonly -nobrowse -mountpoint … "$dmg"` 然后对 `$mnt/Sevqo.app` 跑 `stapler validate` + `spctl`。
+  按 Apple 的设计，没票据的那份第一次打开要联网查 cdhash，离线或被代理挡住时就可能被判"已损坏"（这一条本机没法实测，
+  属于人工验收；能实测的是下一条）。正确顺序照搬本机路线：**先公证并装订 .app，再从带票据的 .app 造 dmg**
+  （`sign_notarize_macos.sh`）。验收也必须挂在挂载之后，而且要跑 `stapler validate`：
+  `hdiutil attach -readonly -nobrowse -mountpoint … "$dmg"` → `xcrun stapler validate "$mnt/Sevqo.app"`。
+  **别拿 `spctl` 当这条的判据**——这台机器联网时对 v0.1.3（无票据）和 v0.1.4（有票据）的包内 app 都报 `accepted`，
+  在线查询会替票据补上上下文，只有 `stapler validate` 分得开。
 - **下载被限速截断会伪装成签名失败**：`gh run download` / `gh release download` 并发或断流时能写出一个尺寸不对的
   `.app.tar.gz`，用它验 minisign 就报不匹配，看着像私钥或公钥配错了。先核 sha256 与文件大小再核签名；
   重下时用单独的 `gh run download`（别并发写同一目录）、必要时 `--retry`，截断的那份直接删掉重下。
@@ -201,16 +204,34 @@ dry run 没有 Release 可拉，就验 Runner 上传的 artifact：`gh run downl
   此前只在本机跑过的 `release` 任务（ubuntu runner 拼清单 + 上传资产）也在这次第一次实测通过。
 - 宣布"已发布"要看这四条，不看 CI 的绿灯：
   1. `releases/latest/download/latest.json` 返回新版本（这是产品自己读的更新通道），两个平台的 `signature` 非空、`notes` 非空；
-  2. Apple 侧按名字过滤能看到本版两条 dmg 都 `Accepted`；
-  3. Release 资产数量与命名齐（`.dmg` / `.app.tar.gz` / `.sig` × 两架构 + `latest.json`）；
-  4. 线上产物拉到本机复核（§8 第 3 步）：票据、`flags=0x10000(runtime)`、`spctl`、`lipo -archs` 与包名一致、
-     `.sig` 的 key id 对得上仓库公钥、trusted comment 的 `version:` 等于配置版本。
-- v0.1.3 的复核结果：aarch64 dmg `8806f502c1a2ecc0…`、更新包 `84d9050112c46c34…`，dmg 与解出的 app 都带票据，
-  `spctl` accepted，主二进制 `arm64`，`CFBundleShortVersionString` 为 0.1.3，`.sig` key id `CEE9A3B0F135A93F` 与公钥一致、
-  trusted comment `version:0.1.3`。x86_64 两份同样复核过（见提交历史）。
+  2. Apple 侧按名字过滤能看到本版**四条**记录都 `Accepted`——每个架构一条 `.notarization.zip`（`.app` 本体）加一条 dmg，
+     且 zip 的 `createdDate` 早于 dmg。只剩两条 dmg 就等于 `.app` 从没提交过公证；
+  3. Release 资产数量与命名齐（`.dmg` / `.app.tar.gz` / `.sig` × 两架构 + `latest.json`），本地下来的字节数与
+     `gh release view --json assets` 里的 `size` 逐个对上，对不上先怀疑截断；
+  4. 线上产物拉到本机复核（§8 第 3 步）：**挂载后对包内 app 跑 `stapler validate`**、`flags=0x10000(runtime)`、
+     签名链、`lipo -archs` 与包名一致、`.sig` 的 key id 对得上仓库公钥、trusted comment 的 `version:` 等于配置版本，
+     再用应用自己的 `release_packages_verify_with_the_configured_pubkey` 验一遍更新包。
+- **v0.1.4 才是当前该装的那一版**（run [`38769213489`](https://github.com/misswell/Sevqo/actions/runs/38769213489)，2026-10-15T16:42:53Z 发布）。
+  它只改发布脚本，前端与引擎相对 v0.1.3 零改动（`git diff --stat v0.1.3..v0.1.4 -- apps/desktop/src crates` 为空），
+  修的是"镜像里那份 `.app` 没有公证票据"。四个包本机逐字节复核过：
+  aarch64 dmg `786dd9d812cf51f5…` / 更新包 `676a566c7abab79c…`，x86_64 dmg `a90fa9d15763119e…` / 更新包 `04b7528573a937e6…`；
+  **挂载 dmg 后对包内 `Sevqo.app` 跑 `stapler validate` 两侧都 `The validate action worked!`**（v0.1.3 这里是 `does not have a ticket`），
+  `lipo -archs` 分别 `arm64` / `x86_64`，`Info.plist` 都是 0.1.4，签名链到 Developer ID Application → Certification Authority → Apple Root CA，
+  `flags=0x10000(runtime)`，两份 `.sig` key id 均 `CEE9A3B0F135A93F` 等于仓库公钥、trusted comment `version:0.1.4` 等于配置版本，
+  `SEVQO_UPDATE_DIR=/tmp/sevqo-v014 cargo test -p sevqo-desktop --lib -- --ignored release_packages_verify` 一次过两个平台。
+  Apple 侧本版四条记录全 `Accepted`，且两条 `.notarization.zip`（16:41:15 / 16:41:34）**早于**两条 dmg（16:41:49 / 16:42:08）；
+  v0.1.3 只有两条 dmg 记录——`.app` 本体从没提交给 Apple，这就是包内没票据的根因。
+- **"票据在不在"只有两条路能证明，`spctl` 不在此列**：这台机器联网时，对 v0.1.3（无票据）和 v0.1.4（有票据）的包内 app
+  加 `com.apple.quarantine` 后跑 `spctl --assess` 两边都是 `accepted`——有网络就能在线查到 cdhash。
+  能分辨的只有 `xcrun stapler validate <挂载点>/Sevqo.app`，或者真断网点一次（后者归人工验收，见 README 清单）。
+  别把 CI 日志里的 `accepted` 当成包里有票据。
+- v0.1.3 的复核结果（保留，因为它是那条坑的物证）：aarch64 dmg `8806f502c1a2ecc0…`、x86_64 dmg `dbc5c52cfd8d6d7b…`、
+  更新包 `84d9050112c46c34…` / `6a2b400d06e4341d…`。dmg 自身和更新包里的 app 都带票据，**唯独镜像里那份 `.app` 两份都报
+  `does not have a ticket stapled to it`**——`spctl` 当时也报 accepted，所以这个缺陷只在挂载后验包内才露出来。
 - **怎么证明"修的那处真进了发出去的包"**：前端资源是编译进二进制的，包里没有 `.js` 文件，
   但 `strings <App>.app/Contents/MacOS/<bin> | grep -oE 'index-[A-Za-z0-9_-]{8}\.(js|css)'` 能把 Vite 的内容哈希文件名抠出来，
   与本机在同一提交上 `npm run build` 产出的名字对比——哈希由内容决定，名字对上就等于内容对上。
+  v0.1.4 的包内是 `index-CDMap3bl.js` / `index-BMIx_VAr.css`，与本机一致；主二进制叫 `sevqo-desktop`（crate 名），不是 `Sevqo`。
   这比"我看日志里构建成功了"硬得多，也是回答"你到底修没修"的最省事办法。
 - 仍然没证明的：`x86_64` 包被公证过、也被本机验过票据与架构，但**没有任何人在 Intel 真机上打开过**，
   所以 `RELEASE_NOTES.md` 里只写"Intel 包尚未完成真机验证"，不写"支持 Intel"。
