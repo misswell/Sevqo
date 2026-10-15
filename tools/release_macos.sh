@@ -155,6 +155,14 @@ if [[ "$notarized" == 1 ]]; then
   xcrun stapler staple "$dmg"
   xcrun stapler validate "$dmg"
   spctl -a -vvv -t exec "$app"
+  # 挂载后验的是镜像里那份副本——装订发生在造镜像之前还是之后，只有这里能看出来
+  log "挂载镜像复核包内 .app 的票据"
+  mnt="$(mktemp -d)"; trap 'hdiutil detach "$mnt" -force >/dev/null 2>&1 || true; rmdir "$mnt" 2>/dev/null || true' EXIT
+  hdiutil attach -readonly -nobrowse -mountpoint "$mnt" "$dmg" >/dev/null
+  xcrun stapler validate "$mnt/Sevqo.app"
+  spctl -a -vvv -t exec "$mnt/Sevqo.app"
+  hdiutil detach "$mnt" >/dev/null
+  trap - EXIT
 else
   log "未装订：这台机器只做了签名"
 fi

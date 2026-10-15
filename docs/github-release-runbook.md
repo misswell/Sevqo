@@ -151,6 +151,7 @@ xcrun stapler validate /tmp/x/*.dmg
 
 # 3) 包内：挂载后验签名链、hardened runtime、Gatekeeper；更新包同样查一遍
 hdiutil attach -readonly -nobrowse -mountpoint /tmp/m /tmp/x/*.dmg
+xcrun stapler validate /tmp/m/<App>.app        # ← 这条才是"票据真进得去镜像"的断言，别只对 dmg 跑
 codesign --verify --deep --strict -vvv /tmp/m/<App>.app
 codesign -dv --verbose=4 /tmp/m/<App>.app | grep -E 'Authority|Timestamp|flags'   # 要看到 0x10000(runtime)
 spctl --assess --type open -vvv /tmp/m/<App>.app
