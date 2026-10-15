@@ -154,6 +154,7 @@ codesign --verify --deep --strict -vvv /tmp/m/<App>.app
 codesign -dv --verbose=4 /tmp/m/<App>.app | grep -E 'Authority|Timestamp|flags'   # 要看到 0x10000(runtime)
 spctl --assess --type open -vvv /tmp/m/<App>.app
 tar -xzf <App>_<tag>_macos_<arch>.app.tar.gz -C /tmp/u && xcrun stapler validate /tmp/u/<App>.app
+lipo -archs /tmp/u/<App>.app/Contents/MacOS/*   # 架构要和文件名里那个 arch 一致
 ```
 
 从 GitHub 直连下载可能很慢，挂后台跑，别因此跳过第 2 步。
@@ -191,11 +192,14 @@ dry run 没有 Release 可拉，就验 Runner 上传的 artifact：`gh run downl
   `11910e34-0e04-4b7d-91ac-432f8c59805f` = `Sevqo_v0.1.2_macos_x86_64.dmg` Accepted，createdDate 2026-10-15T14:29:03Z；
   `0a4b921e-9a6a-4c69-914d-e01ff6e93dcd` = `Sevqo_v0.1.2_macos_aarch64.dmg` Accepted，createdDate 2026-10-15T14:31:43Z。
 - **产物字节级复核（把 §8 的第 3 步用在 CI 产物上）**：`gh run download 38749873546 -D /tmp/sevqo-ci` 拉回 Runner 上传的
-  artifact，本机实测 aarch64 那份：`.dmg` 与解包后的 `Sevqo.app` 都 `The validate action worked!`（票据真的在表里），
-  `codesign` 出完整 Developer ID 链 + `flags=0x10000(runtime)`，`spctl` accepted，
-  更新包 `.sig` 解出来的 minisign key id `CEE9A3B0F135A93F` 与 `tauri.conf.json` 里那个公钥一致，
-  trusted comment 是 `version:0.1.2`（等于配置版本，客户端才会装）。
-  这一步证明的是"装订之后才打包"这个顺序真的生效——只看 CI 日志的时间戳还不够。
+  artifact，两个架构都本机实测过：
+  - aarch64：dmg `c00e1f2d022e493e…`、tar.gz `e565416e09d5a4df…`，主二进制 `arm64`
+  - x86_64：dmg `604e0b3a571bae2c…`、tar.gz `ebc12d69d909ea3e…`，主二进制 `x86_64`
+  四份都 `The validate action worked!`（dmg 与解包后的 app 都带票据），`codesign` 出完整 Developer ID 链 +
+  `flags=0x10000(runtime)`，`spctl` accepted；更新包 `.sig` 解出来的 minisign key id `CEE9A3B0F135A93F`
+  与 `tauri.conf.json` 里的公钥一致，trusted comment 是 `version:0.1.2`（等于配置版本，客户端才会装）。
+  这一步证明的是"装订之后才打包"这个顺序真的生效——只看 CI 日志的时间戳还不够；`lipo -archs` 证明矩阵
+  没把 arm64 二进制塞进 x86_64 的包名里。
 - **还没证明的两件事**：`release` 任务（拼 `latest.json` + 发 GitHub Release）从未在云端跑过，
   它只在 ubuntu runner 上拼 JSON，风险低但没实测；`x86_64` 包这次是**真的被公证了**，但仍然没有任何人在 Intel 机器上打开过。
 - 下一步就是正式发：改版本号那 4 处 + `RELEASE_NOTES.md`，提交后 `git push origin v<新版本>`（只单推一个标签），
