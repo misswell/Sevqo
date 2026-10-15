@@ -64,7 +64,8 @@ notarize() {
 
 work="$(mktemp -d)"
 mnt="$(mktemp -d)"
-trap 'rm -rf "$work" "$mnt"' EXIT
+# 先卸载再删目录：验收失败时 $mnt 还挂着镜像，直接 rm -rf 等于对活挂载点动手
+trap 'hdiutil detach "$mnt" -force >/dev/null 2>&1 || true; rm -rf "$work" "$mnt"' EXIT
 app_zip="$work/Sevqo_${RELEASE_TAG}_macos_${ARCH}.notarization.zip"
 ditto -c -k --keepParent "$app" "$app_zip"
 notarize "$app_zip"
