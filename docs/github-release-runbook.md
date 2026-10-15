@@ -11,7 +11,7 @@
 
 ## 1. 先看这些文件和网址
 
-仓库是公开的：<https://github.com/misswell/Sevqo>。下面路径都相对仓库根，行号以 `main`（提交 `4165452`）为准。
+仓库是公开的：<https://github.com/misswell/Sevqo>。下面路径都相对仓库根，行号以 `main` 当前内容为准。
 
 ### 发版链路上的文件
 
@@ -31,11 +31,12 @@
 这三处是源头，两个 lockfile 跟着动（v0.1.2 那次实际提交 `eb7c991` 改的就是这 6 个文件）：
 
 ```
-Cargo.toml:6                                  version = "0.1.2"   ← workspace 版本
-apps/desktop/src-tauri/Cargo.toml:3           version.workspace = true  ← 继承，不用改
-apps/desktop/src-tauri/tauri.conf.json:4      "version": "0.1.2"  ← CI 守卫读的就是它
-apps/desktop/package.json:4                   "version": "0.1.2"
-Cargo.lock, apps/desktop/package-lock.json    跟着 lock 更新
+Cargo.toml:6                                  version = "<x.y.z>"        ← workspace 版本
+apps/desktop/src-tauri/Cargo.toml:3           version.workspace = true   ← 继承，不用改
+apps/desktop/src-tauri/tauri.conf.json:4      "version": "<x.y.z>"       ← CI 守卫读的就是它
+apps/desktop/package.json:4                   "version": "<x.y.z>"
+Cargo.lock, apps/desktop/package-lock.json    跟着刷新：cargo update -w --offline
+                                              && (cd apps/desktop && npm install --package-lock-only --no-audit --no-fund)
 ```
 
 ### 要在浏览器里打开的页面
@@ -179,28 +180,27 @@ dry run 没有 Release 可拉，就验 Runner 上传的 artifact：`gh run downl
   云端 dry run 的 aarch64 dmg 是 `c00e1f2d022e493e…`，线上已发布的 v0.1.2 同名 dmg 是 `2153c31ddf06c239…`，
   **文件名一模一样、字节完全不同**。隔几天回头看极易误当"已经发过了"。
   版本守卫在 `workflow_dispatch` 上是跳过的，所以自检尽管用 `v9.9.9-dryrun` 这类测试标签。
+- **"已修"不等于"用户能装上"**：两个界面缺陷当天修完提交在 main，用户跑的还是前一天装的旧包，于是看起来等于没修，
+  还搭上一句"你这一堆 bug 怎么测的"。修完就发一版让他装得到；发不了就先说清"这处在下一个版本里，你现在这个包没有"。
+  验证也别只停在 mock 出来的界面状态——至少证明改动真的进了发出去的那个二进制（见 §10 最后一条）。
 
 ## 10. 当前状态
 
-- `RELEASE_PROVIDER=github`。凭据探针 run `38513417118` 通过（证书导入 + 真试签 + `notarytool history`）。
-- 第一次完整云端构建 run `38748196817` **失败**：两个架构都卡在 `构建 .app`（缺 `npm ci`）。已修（提交 `4165452`）。
-- 第二次 dry run **run [`38749873546`](https://github.com/misswell/Sevqo/actions/runs/38749873546) 全绿**（2026-10-15T14:32Z 结束，`publish=false`，没有发任何东西）：
-  verify success、两个架构的 build-macos success、release skipped。至此 §4 的四件事在 Runner 上全部实测到位：
-  证书导入并 grep 出身份名 → `Current status: Accepted`（`notarytool submit --wait` 真的跑通了）→
-  `spctl … accepted` + `origin=Developer ID Application` → **装订之后**才出 `.app.tar.gz` 并 minisign 签名。
-- Apple 侧独立佐证（不读 CI 日志，直接查 Apple 记录）：
-  `11910e34-0e04-4b7d-91ac-432f8c59805f` = `Sevqo_v0.1.2_macos_x86_64.dmg` Accepted，createdDate 2026-10-15T14:29:03Z；
-  `0a4b921e-9a6a-4c69-914d-e01ff6e93dcd` = `Sevqo_v0.1.2_macos_aarch64.dmg` Accepted，createdDate 2026-10-15T14:31:43Z。
-- **产物字节级复核（把 §8 的第 3 步用在 CI 产物上）**：`gh run download 38749873546 -D /tmp/sevqo-ci` 拉回 Runner 上传的
-  artifact，两个架构都本机实测过：
-  - aarch64：dmg `c00e1f2d022e493e…`、tar.gz `e565416e09d5a4df…`，主二进制 `arm64`
-  - x86_64：dmg `604e0b3a571bae2c…`、tar.gz `ebc12d69d909ea3e…`，主二进制 `x86_64`
-  四份都 `The validate action worked!`（dmg 与解包后的 app 都带票据），`codesign` 出完整 Developer ID 链 +
-  `flags=0x10000(runtime)`，`spctl` accepted；更新包 `.sig` 解出来的 minisign key id `CEE9A3B0F135A93F`
-  与 `tauri.conf.json` 里的公钥一致，trusted comment 是 `version:0.1.2`（等于配置版本，客户端才会装）。
-  这一步证明的是"装订之后才打包"这个顺序真的生效——只看 CI 日志的时间戳还不够；`lipo -archs` 证明矩阵
-  没把 arm64 二进制塞进 x86_64 的包名里。
-- **还没证明的两件事**：`release` 任务（拼 `latest.json` + 发 GitHub Release）从未在云端跑过，
-  它只在 ubuntu runner 上拼 JSON，风险低但没实测；`x86_64` 包这次是**真的被公证了**，但仍然没有任何人在 Intel 机器上打开过。
-- 下一步就是正式发：改版本号那 4 处 + `RELEASE_NOTES.md`，提交后 `git push origin v<新版本>`（只单推一个标签），
-  云端会连着走完 build → 签名 → 公证 → release。
+- `RELEASE_PROVIDER=github`。**v0.1.3 是第一个完全由云端发出的版本**（run [`38762869057`](https://github.com/misswell/Sevqo/actions/runs/38762869057)，2026-10-15T15:58:47Z 发布）：
+  verify → 双架构 build → Developer ID 签名 → Apple 公证 → 装订 → minisign 更新包 → `latest.json` → Release，全绿。
+  此前只在本机跑过的 `release` 任务（ubuntu runner 拼清单 + 上传资产）也在这次第一次实测通过。
+- 宣布"已发布"要看这四条，不看 CI 的绿灯：
+  1. `releases/latest/download/latest.json` 返回新版本（这是产品自己读的更新通道），两个平台的 `signature` 非空、`notes` 非空；
+  2. Apple 侧按名字过滤能看到本版两条 dmg 都 `Accepted`；
+  3. Release 资产数量与命名齐（`.dmg` / `.app.tar.gz` / `.sig` × 两架构 + `latest.json`）；
+  4. 线上产物拉到本机复核（§8 第 3 步）：票据、`flags=0x10000(runtime)`、`spctl`、`lipo -archs` 与包名一致、
+     `.sig` 的 key id 对得上仓库公钥、trusted comment 的 `version:` 等于配置版本。
+- v0.1.3 的复核结果：aarch64 dmg `8806f502c1a2ecc0…`、更新包 `84d9050112c46c34…`，dmg 与解出的 app 都带票据，
+  `spctl` accepted，主二进制 `arm64`，`CFBundleShortVersionString` 为 0.1.3，`.sig` key id `CEE9A3B0F135A93F` 与公钥一致、
+  trusted comment `version:0.1.3`。x86_64 两份同样复核过（见提交历史）。
+- **怎么证明"修的那处真进了发出去的包"**：前端资源是编译进二进制的，包里没有 `.js` 文件，
+  但 `strings <App>.app/Contents/MacOS/<bin> | grep -oE 'index-[A-Za-z0-9_-]{8}\.(js|css)'` 能把 Vite 的内容哈希文件名抠出来，
+  与本机在同一提交上 `npm run build` 产出的名字对比——哈希由内容决定，名字对上就等于内容对上。
+  这比"我看日志里构建成功了"硬得多，也是回答"你到底修没修"的最省事办法。
+- 仍然没证明的：`x86_64` 包被公证过、也被本机验过票据与架构，但**没有任何人在 Intel 真机上打开过**，
+  所以 `RELEASE_NOTES.md` 里只写"Intel 包尚未完成真机验证"，不写"支持 Intel"。
