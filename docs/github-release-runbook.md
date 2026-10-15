@@ -169,11 +169,22 @@ tar -xzf <App>_<tag>_macos_<arch>.app.tar.gz -C /tmp/u && xcrun stapler validate
 - **未验证的架构照样被矩阵发出去**：矩阵出 `x86_64` 但从来没人真机打开过，而说明文字写着"Intel 未验证"——
   产物和文案自相矛盾。要么摘掉矩阵，要么别在文案里承诺支持。
 - **别跳过只验证凭据的探针**：它十几秒，完整构建几十分钟。第一次上云就直接跑完整构建，等于用 40 分钟换一个 `tsc: command not found`。
+- **dry run 别用真实版本号命名**：手动触发时 `RELEASE_TAG` 直接决定产物文件名，用 `v0.1.2` 自检就产出一堆
+  `Sevqo_v0.1.2_macos_aarch64.dmg`，和线上那个 Release 的资产同名，隔几天回头看极易误当"已经发过了"。
+  版本守卫在 `workflow_dispatch` 上是跳过的，所以自检尽管用 `v9.9.9-dryrun` 这类测试标签。
 
-## 10. 当前状态（截至本文写完）
+## 10. 当前状态
 
-- `RELEASE_PROVIDER=github`，凭据探针已跑通（证书导入 + 真试签 + `notarytool history`，run `38513417118`）。
-- 第一次完整云端构建 run `38748196817` **失败**：两个架构都卡在 `构建 .app`（缺 `npm ci`），签名与公证两步没跑到。已修（提交 `4165452`）。
-- 第二次 dry run（`publish=false`，不发任何东西）正在跑：run <https://github.com/misswell/Sevqo/actions/runs/38749873546>。
-  **在它走完之前，"runner 能真提交公证"只是高度可信、尚未证明。**
-- 复测命令：`gh run view 38749873546 --json status,jobs`；失败细节 `gh run view 38749873546 --log-failed`。
+- `RELEASE_PROVIDER=github`。凭据探针 run `38513417118` 通过（证书导入 + 真试签 + `notarytool history`）。
+- 第一次完整云端构建 run `38748196817` **失败**：两个架构都卡在 `构建 .app`（缺 `npm ci`）。已修（提交 `4165452`）。
+- 第二次 dry run **run [`38749873546`](https://github.com/misswell/Sevqo/actions/runs/38749873546) 全绿**（2026-10-15T14:32Z 结束，`publish=false`，没有发任何东西）：
+  verify success、两个架构的 build-macos success、release skipped。至此 §4 的四件事在 Runner 上全部实测到位：
+  证书导入并 grep 出身份名 → `Current status: Accepted`（`notarytool submit --wait` 真的跑通了）→
+  `spctl … accepted` + `origin=Developer ID Application` → **装订之后**才出 `.app.tar.gz` 并 minisign 签名。
+- Apple 侧独立佐证（不读 CI 日志，直接查 Apple 记录）：
+  `11910e34-0e04-4b7d-91ac-432f8c59805f` = `Sevqo_v0.1.2_macos_x86_64.dmg` Accepted，createdDate 2026-10-15T14:29:03Z；
+  `0a4b921e-9a6a-4c69-914d-e01ff6e93dcd` = `Sevqo_v0.1.2_macos_aarch64.dmg` Accepted，createdDate 2026-10-15T14:31:43Z。
+- **还没证明的两件事**：`release` 任务（拼 `latest.json` + 发 GitHub Release）从未在云端跑过，
+  它只在 ubuntu runner 上拼 JSON，风险低但没实测；`x86_64` 包这次是**真的被公证了**，但仍然没有任何人在 Intel 机器上打开过。
+- 下一步就是正式发：改版本号那 4 处 + `RELEASE_NOTES.md`，提交后 `git push origin v<新版本>`（只单推一个标签），
+  云端会连着走完 build → 签名 → 公证 → release。
