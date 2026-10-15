@@ -183,6 +183,15 @@ dry run 没有 Release 可拉，就验 Runner 上传的 artifact：`gh run downl
 - **"已修"不等于"用户能装上"**：两个界面缺陷当天修完提交在 main，用户跑的还是前一天装的旧包，于是看起来等于没修，
   还搭上一句"你这一堆 bug 怎么测的"。修完就发一版让他装得到；发不了就先说清"这处在下一个版本里，你现在这个包没有"。
   验证也别只停在 mock 出来的界面状态——至少证明改动真的进了发出去的那个二进制（见 §10 最后一条）。
+- **只公证 dmg，包里的 .app 是没票据的**：CI 那条路线原来是"造 dmg → 签 dmg → 公证 dmg → 给 app 和 dmg 都装订"，
+  装订发生在 dmg 已经造完之后，于是镜像里那份副本永远追不上票据。`stapler validate` 对 dmg 本身是过的，
+  看起来一切正常；挂上镜像再验包内那个 app 才露馅：`Sevqo.app does not have a ticket stapled to it.`。
+  没有票据的包第一次打开要联网查 cdhash，断网或走代理就报"已损坏"。正确顺序照搬本机路线：
+  **先公证并装订 .app，再从带票据的 .app 造 dmg**（`sign_notarize_macos.sh`）。验收也必须挂在挂载之后：
+  `hdiutil attach -readonly -nobrowse -mountpoint … "$dmg"` 然后对 `$mnt/Sevqo.app` 跑 `stapler validate` + `spctl`。
+- **下载被限速截断会伪装成签名失败**：`gh run download` / `gh release download` 并发或断流时能写出一个尺寸不对的
+  `.app.tar.gz`，用它验 minisign 就报不匹配，看着像私钥或公钥配错了。先核 sha256 与文件大小再核签名；
+  重下时用单独的 `gh run download`（别并发写同一目录）、必要时 `--retry`，截断的那份直接删掉重下。
 
 ## 10. 当前状态
 
