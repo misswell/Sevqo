@@ -126,7 +126,7 @@ cargo run -p sevqo-engine --example smoke -- .research/fixtures   # 端到端：
 
 ## 发布与应用内更新
 
-发布默认由 GitHub Actions 完成：推一个 `v*` 标签，云端就依次做双架构构建 → Developer ID 签名 → 公证 → 装订 → minisign 更新包 → `latest.json` → GitHub Release。签名材料全在仓库 secrets 里，**不依赖任何一台机器的钥匙串**，所以从哪台电脑推标签都一样能发出去。
+发布默认由 GitHub Actions 完成：推一个 `v*` 标签，云端就依次做双架构构建 → Developer ID 签名 → 公证 → 装订 → minisign 更新包 → `latest.json` → GitHub Release。签名材料全在仓库 secrets 里，**不依赖任何一台机器的钥匙串**，所以从哪台电脑推标签都一样能发出去。为什么这么配、验收要实测哪几步，见 `docs/github-release-runbook.md`。
 
 本机的两个脚本留作离线兜底（runner 排队、凭据轮换、断网时用），产出与云端同构：
 
