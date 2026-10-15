@@ -259,6 +259,8 @@ jobs:
           mkdir -p release
           find artifacts -type f \( -name '*.dmg' -o -name '*.tar.gz' -o -name '*.sig' \) -exec cp {} release/ \;
           version="${RELEASE_TAG#v}"
+          # 说明文字只有 RELEASE_NOTES.md 一个来源：CI 不再自带模板，否则本机发和仓库发的说明会走偏。
+          [ -s RELEASE_NOTES.md ] || { echo "缺少 RELEASE_NOTES.md，更新卡片和 Release 正文都没东西可写" >&2; exit 1; }
           platform_json='{}'
           for arch in aarch64 x86_64; do
             archive="Sevqo_${RELEASE_TAG}_macos_${arch}.app.tar.gz"
@@ -271,11 +273,33 @@ jobs:
           done
           jq -n \
             --arg version "$version" \
-            --arg notes "Sevqo ${version}：完全离线的本地多模态文件搜索。" \
+            --rawfile notes RELEASE_NOTES.md \
             --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --argjson platforms "$platform_json" \
-            '{version:$version,notes:$notes,pub_date:$pub_date,platforms:$platforms}' \
+            '{version:$version,notes:($notes|rtrimstr("\n")),pub_date:$pub_date,platforms:$platforms}' \
             >release/latest.json
+          # notes 是更新卡片上唯一的说明文字，空字符串会显示成一片空白
+          jq -e '.notes | length > 0' release/latest.json >/dev/null \
+            || { echo 'latest.json 的 notes 是空的' >&2; exit 1; }
+          # Release 正文写在 release/ 外面：那个目录整个当附件上传，混进去就多一个奇怪的文件。
+          {
+            cat RELEASE_NOTES.md
+            echo
+            echo '## 下载'
+            echo
+            echo '| 平台 | 文件 |'
+            echo '|------|------|'
+            echo "| Apple Silicon | \`Sevqo_${RELEASE_TAG}_macos_aarch64.dmg\` |"
+            echo "| Intel | \`Sevqo_${RELEASE_TAG}_macos_x86_64.dmg\` |"
+            echo
+            echo '`.app.tar.gz` 与 `.sig` 供应用内更新使用，无需手动下载。'
+            echo
+            echo '### 首次启动'
+            echo '模型权重不打进安装包，启动后在搜索框、结果提示或设置 → 模型里一键下载，可中断续传。推理需要装有 torch / sentence-transformers / av / pillow-heif / pypdf 的 Python 环境，在设置里指定路径。'
+            echo
+            echo '### 更新'
+            echo '「关于与更新」可手动检查更新，启动后也会后台检查一次；更新包带 minisign 签名，与配置里的公钥不符就不会安装。'
+          } >release-body.md
           jq . release/latest.json
           ls -lh release/
 
@@ -284,23 +308,7 @@ jobs:
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           name: Sevqo ${{ env.RELEASE_TAG }}
-          body: |
-            ## Sevqo
-            本地离线的跨模态文件搜索：自然语言搜图、以图搜图、以片段定位视频，全部在本机完成，不上传文件、不需要 API Key。
-
-            ### 下载
-            | 平台 | 文件 |
-            |------|------|
-            | Apple Silicon | `Sevqo_${{ env.RELEASE_TAG }}_macos_aarch64.dmg` |
-            | Intel | `Sevqo_${{ env.RELEASE_TAG }}_macos_x86_64.dmg` |
-
-            `.app.tar.gz` 与 `.sig` 供应用内更新使用，无需手动下载。
-
-            ### 首次启动
-            模型权重不打进安装包，启动时按设置里的下载源自动拉取并校验，可断点续传。推理需要装有 torch / sentence-transformers / av / pillow-heif / pypdf 的 Python 环境。
-
-            ### 更新
-            「关于与更新」可手动检查更新，启动后也会后台检查一次；更新包带 minisign 签名，与配置里的公钥不符就不会安装。
+          body_path: release-body.md
           files: release/*
           fail_on_unmatched_files: true
           draft: false
