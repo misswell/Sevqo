@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# CI 专用：签名 .app → 出镜像 → 签名镜像 → 公证 → 装订。
+# CI 专用：签名 .app → 公证并装订 .app → 用带票据的 .app 出镜像 → 签名镜像 → 公证并装订镜像 → 挂载复核。
 # 需要环境变量：ARCH（aarch64|x86_64）、TARGET（Rust 三元组）、RELEASE_TAG，
 # 以及 SIGNING_IDENTITY（由 import_signing_identity.sh 写入）和 APPLE_* 公证凭据。
 set -euo pipefail
@@ -46,6 +46,31 @@ codesign --verify --deep --strict --verbose=2 "$app"
 exe="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
 lipo -archs "$app/Contents/MacOS/$exe"
 
+log "公证并装订（顺序要紧：镜像必须从已经带票据的 .app 造出来）"
+notarize() {
+  # 两条凭据路线共用；.p8 只落临时文件，用完就删——runner 的 workspace 会进日志
+  if [ "$api_key_ready" = 1 ]; then
+    key_file="$(mktemp)"
+    chmod 600 "$key_file"
+    printf '%s' "$APPLE_API_KEY_BASE64" | base64 -D >"$key_file"
+    xcrun notarytool submit "$1" --key "$key_file" \
+      --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER" --wait
+    rm -f "$key_file"
+  else
+    xcrun notarytool submit "$1" --apple-id "$APPLE_ID" \
+      --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" --wait
+  fi
+}
+
+work="$(mktemp -d)"
+mnt="$(mktemp -d)"
+trap 'rm -rf "$work" "$mnt"' EXIT
+app_zip="$work/Sevqo_${RELEASE_TAG}_macos_${ARCH}.notarization.zip"
+ditto -c -k --keepParent "$app" "$app_zip"
+notarize "$app_zip"
+xcrun stapler staple "$app"
+xcrun stapler validate "$app"
+
 log "制作并签名镜像"
 out="$(ARCH="$ARCH" bash "$root/tools/make_dmg.sh" "$app" "$root/target/dmg-ci" | tail -1)"
 dmg="$release/Sevqo_${RELEASE_TAG}_macos_${ARCH}.dmg"
@@ -53,30 +78,15 @@ mv -f "$out" "$dmg"
 codesign --force --timestamp --sign "$SIGNING_IDENTITY" "$dmg"
 codesign --verify --verbose=2 "$dmg"
 
-log "提交公证"
-if [ "$api_key_ready" = 1 ]; then
-  # .p8 落在临时文件里，提交完删掉；runner 的 workspace 会进日志，别留
-  key_file="$(mktemp)"
-  chmod 600 "$key_file"
-  trap 'rm -f "$key_file"' EXIT
-  printf '%s' "$APPLE_API_KEY_BASE64" | base64 -D > "$key_file"
-  xcrun notarytool submit "$dmg" \
-    --key "$key_file" \
-    --key-id "$APPLE_API_KEY_ID" \
-    --issuer "$APPLE_API_ISSUER" \
-    --wait
-  rm -f "$key_file"
-else
-  xcrun notarytool submit "$dmg" \
-    --apple-id "$APPLE_ID" \
-    --team-id "$APPLE_TEAM_ID" \
-    --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-    --wait
-fi
-
-log "装订并验收"
-xcrun stapler staple "$app"
+notarize "$dmg"
 xcrun stapler staple "$dmg"
-xcrun stapler validate "$app"
 xcrun stapler validate "$dmg"
+
+log "验收"
 spctl -a -vvv -t exec "$app"
+# 挂载后查镜像里那份 app：CI 一度先造镜像、后装订 .app，用户从 dmg 拖出来的是没票据的副本，
+# 离线或 ocsp 不通时 Gatekeeper 就会拦。只看 dmg 自己的票据发现不了这件事。
+hdiutil attach -readonly -nobrowse -mountpoint "$mnt" "$dmg" >/dev/null
+xcrun stapler validate "$mnt/Sevqo.app"
+spctl -a -vvv -t exec "$mnt/Sevqo.app"
+hdiutil detach "$mnt" >/dev/null
