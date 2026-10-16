@@ -21,6 +21,18 @@
 
 只有 Apple Development 证书就能停在这儿了——公证不认它，报 `not signed with a valid Developer ID certificate`。
 
+**别只凭一条命令就下结论说"没有 Developer ID 证书"**：`security find-identity -v -p codesigning` 只查登录钥匙串，
+而 Developer ID 常常装在**另一个钥匙串文件**里（自建签名钥匙串、或干脆只在 `.p12` 里）。
+判断依据是"有没有一张 Developer ID 证书 + 它的私钥"，不是"登录钥匙串里能不能列出来"——
+走 CI 的话只要 `.p12` 就够了，本机钥匙串装着与否根本不影响。先三处都找一遍：
+
+```bash
+security find-identity -v -p codesigning                          # 只看到 Apple Development / Distribution 别急着停
+ls ~/Library/Keychains/*.keychain-db 2>/dev/null                  # 逐个再查一遍
+security find-identity -v -p codesigning ~/Library/Keychains/<那个>.keychain-db
+ls ~/Desktop/*signing*/*.p12 ~/Desktop/*signing*/*.p12password 2>/dev/null   # 有 p12 就等于有证书+私钥
+```
+
 ### 上面这些，哪一步必须用户、哪一步 agent 自己就能做完
 
 | 步骤 | 谁能做 |
