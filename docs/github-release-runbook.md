@@ -90,7 +90,7 @@ Secret **名字存在不等于值能用**（可能填了占位符、可能已被
 - 注意 `history` 证明的是"这把凭据能读"，`submit` 才是"能提交公证"。两者用同一份凭据，
   但严格说 `submit` 要等第一次真公证才算证明。别把前者说成后者。
 
-## 4. Runner 上必须真的做这四件事
+## 4. Runner 上必须真的做这五件事
 
 缺一个就会发出"看起来成功、用户装不上"的包：
 
@@ -98,8 +98,11 @@ Secret **名字存在不等于值能用**（可能填了占位符、可能已被
    身份名不要写死在 workflow 里，从钥匙串里 grep 出来（换证书不用改配置）。
 2. **真试签**：签一个无关文件并 `codesign --verify --strict`。只有证书列表里有名字是不够的。
 3. **真提交公证并等结果**：`notarytool submit … --wait`。签名带 `--options runtime --timestamp`（hardened runtime）。
-4. **装订之后才生成更新包**：`stapler staple` → `stapler validate` → 再 `tar` 成 updater 归档并 minisign 签名。
-   顺序反了，走应用内更新装到的包里就没有公证票据。
+4. **顺序：先公证并装订 `.app` → 再从这份带票据的 `.app` 造 dmg → 最后才生成更新包**。
+   装订发生在造镜像之后，镜像里那份副本就没有票据（v0.1.3 真实翻车点，见 §9）；
+   更新包早于装订，走应用内更新装到的包里就没有公证票据。
+5. **断言要能被这条缺陷弄红**：`xcrun stapler validate` 必须跑在**挂载后的包内 app** 上
+   （`hdiutil attach` → `$mnt/Sevqo.app`），不能只对 dmg 自己跑。`spctl` 联网时对无票据的包也报 accepted，抓不到这条。
 
 `spctl -a -t exec -vv` 和 `xcrun stapler validate` 都放进 CI 断言里，别只打印。
 
