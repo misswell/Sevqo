@@ -276,7 +276,10 @@ pub fn apply_change_with_options(db: &crate::db::Db, change: &Change, opts: &cra
     let s = path.to_string_lossy().to_string();
     if !path.as_os_str().is_empty() {
         let Some(root_id) = root_for(db, path)? else { return Ok(Applied::Ignored) };
-        let root = db.list_roots()?.into_iter().find(|r| r.id == root_id).unwrap();
+        let Some(root) = db.list_roots()?.into_iter().find(|r| r.id == root_id) else {
+            // 根目录在校验和读取之间被删掉了：当作不在索引范围内，别把进程带崩。
+            return Ok(Applied::Ignored);
+        };
         if crate::scan::excluded_path(&crate::scan::expand_home(&root.path), path, opts) {
             return Ok(Applied::Ignored);
         }

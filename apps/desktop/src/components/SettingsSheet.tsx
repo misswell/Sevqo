@@ -87,17 +87,18 @@ const numericFields: Array<{ key: keyof Draft; label: string; min: number }> = [
   { key: 'videoFps', label: labels.settings.videoFps, min: 0.1 },
   { key: 'maxTextStoreKb', label: labels.settings.maxTextStoreKb, min: 1 },
   { key: 'maxExtractMb', label: labels.settings.maxExtractBytes, min: 0 },
-  { key: 'maxFileMb', label: labels.settings.maxFileBytes, min: 0 },
+  { key: 'maxFileMb', label: labels.settings.maxFileBytes, min: 1 },
 ];
 
 export interface SettingsSheetProps {
   settings: Settings;
   busy: boolean;
+  indexing: boolean;
   onClose: () => void;
-  onSave: (next: Settings) => Promise<boolean>;
+  onSave: (next: Settings) => Promise<string | null>;
 }
 
-export function SettingsSheet({ settings, busy, onClose, onSave }: SettingsSheetProps): ReactElement {
+export function SettingsSheet({ settings, busy, indexing, onClose, onSave }: SettingsSheetProps): ReactElement {
   const [draft, setDraft] = useState<Draft>(() => toDraft(settings));
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
@@ -153,11 +154,13 @@ export function SettingsSheet({ settings, busy, onClose, onSave }: SettingsSheet
       excludePathPrefixes: list(draft.excludePathPrefixes),
       globalShortcut: draft.globalShortcut.trim() || settings.globalShortcut,
     };
-    const ok = await onSave(next);
-    if (ok) {
-      setSaved(true);
-      onClose();
+    const failure = await onSave(next);
+    if (failure) {
+      setError(failure);
+      return;
     }
+    setSaved(true);
+    onClose();
   }, [draft, onClose, onSave, settings]);
 
   const numField = (key: keyof Draft, label: string, hint?: string) => (
@@ -323,6 +326,7 @@ export function SettingsSheet({ settings, busy, onClose, onSave }: SettingsSheet
             </label>
           </div>
 
+          {indexing && dirty ? <Note>{labels.settings.indexingBlocked}</Note> : null}
           {error ? <Note tone="error">{error}</Note> : null}
           {saved ? <Note>{labels.settings.saved}</Note> : null}
         </div>
@@ -331,7 +335,7 @@ export function SettingsSheet({ settings, busy, onClose, onSave }: SettingsSheet
           <Btn tone="ghost" onClick={onClose}>
             {labels.settings.discard}
           </Btn>
-          <Btn tone="primary" onClick={() => void submit()} disabled={busy || !dirty}>
+          <Btn tone="primary" onClick={() => void submit()} disabled={busy || !dirty || indexing}>
             {labels.common.save}
           </Btn>
         </footer>

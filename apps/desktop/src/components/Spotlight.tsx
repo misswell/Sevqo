@@ -183,6 +183,7 @@ export function Spotlight(): ReactElement {
         case 'Escape':
           e.preventDefault();
           if (query) {
+            debouncedHybrid.cancel();
             setQuery('');
             setActive(0);
             void run('', true);
@@ -204,7 +205,7 @@ export function Spotlight(): ReactElement {
           break;
       }
     },
-    [active, hits, mediaOf, open, query, run, scrollActiveIntoView],
+    [active, debouncedHybrid, hits, mediaOf, open, query, run, scrollActiveIntoView],
   );
 
   // Hide when the panel loses focus, but only after it genuinely had focus once

@@ -63,11 +63,12 @@ export interface Backend {
   changes: WatchChange[];
   bootError: string | null;
   busy: boolean;
+  indexing: boolean;
   updateBusy: boolean;
   flash: Flash | null;
   dismissFlash: () => void;
   refreshAll: () => Promise<void>;
-  saveSettings: (next: Settings) => Promise<boolean>;
+  saveSettings: (next: Settings) => Promise<string | null>;
   addRoot: (path: string, label?: string) => Promise<void>;
   removeRoot: (root: Root) => Promise<void>;
   toggleRoot: (root: Root, enabled: boolean) => Promise<void>;
@@ -106,12 +107,12 @@ export function useBackend(): Backend {
 
   const flashSeq = useRef(0);
   const alive = useRef(true);
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    alive.current = true;
+    return () => {
       alive.current = false;
-    },
-    [],
-  );
+    };
+  }, []);
 
   const say = useCallback((text: string, kind: Flash['kind'] = 'info') => {
     flashSeq.current += 1;
@@ -243,18 +244,23 @@ export function useBackend(): Backend {
   );
 
   const saveSettings = useCallback(
-    async (next: Settings): Promise<boolean> => {
-      const ok = await run(
-        () =>
-          api.setSettings(next).then((s) => {
-            setSettings(s);
-            return s;
-          }),
-        () => labels.settings.saved,
-      );
-      return ok;
+    async (next: Settings): Promise<string | null> => {
+      setBusy(true);
+      try {
+        const s = await api.setSettings(next);
+        if (!alive.current) return null;
+        setSettings(s);
+        say(labels.settings.saved, 'ok');
+        await refreshAll();
+        return null;
+      } catch (e) {
+        // 设置面板盖住 flash 提示，失败原因必须回到面板里显示。
+        return errorText(e);
+      } finally {
+        if (alive.current) setBusy(false);
+      }
     },
-    [run],
+    [refreshAll, say],
   );
 
   const addRoot = useCallback(
@@ -395,6 +401,7 @@ export function useBackend(): Backend {
     changes,
     bootError,
     busy,
+    indexing: isRunning(progress),
     updateBusy,
     flash,
     dismissFlash,

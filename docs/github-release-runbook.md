@@ -19,7 +19,7 @@
 | --- | --- | --- |
 | `.github/workflows/release.yml` | 整条云端流水线：`verify` / `probe-credentials` / `build-macos`（矩阵 aarch64 + x86_64）/ `release` | 改 `on.push.tags`、matrix 里的 `platform`、任务名；`:37-38` 的 `RELEASE_TAG`/`SOURCE_REF` 是两条触发路线共用变量的写法，照抄 |
 | `.github/scripts/import_signing_identity.sh` | Runner 上建一次性钥匙串、导 P12、放行 `/usr/bin/codesign`、**真试签一个文件** | 身份名是从钥匙串 grep 出来的，不写死，一般不用改；改 `SIGNING_KEYCHAIN` 命名即可 |
-| `.github/scripts/sign_notarize_macos.sh` | 签 `.app` → 出 dmg → 签 dmg → `notarytool submit --wait` → staple → `spctl` | `:15-30` 决定走哪条公证路线（见 §2），`:57` 是 API key 分支；dmg 的窗口美化/命名规则在 `tools/make_dmg.sh` |
+| `.github/scripts/sign_notarize_macos.sh` | 签 `.app` → 公证并装订 `.app` → 从带票据的 `.app` 出 dmg → 签 dmg → 公证并装订 dmg → `spctl` | `:15-30` 决定走哪条公证路线（见 §2），`:57` 是 API key 分支；dmg 的窗口美化/命名规则在 `tools/make_dmg.sh` |
 | `.github/scripts/pack_updater.sh` | **先** `stapler validate` 再 `tar` 成更新包，然后 `cargo tauri signer sign --app-version $(jq -r .version …)` | `--app-version` 读的那个配置路径必须和 §4 的守卫读同一个文件 |
 | `apps/desktop/src-tauri/tauri.conf.json` | `:4` 版本号；`:49` 更新公钥；`:51` 更新清单地址 | 换项目要换 `pubkey`（新生成密钥对）和 `endpoints`（指向自己的 repo） |
 | `RELEASE_NOTES.md` | 说明文字的唯一来源：本机脚本写进 `latest.json.notes`，CI 当 Release 正文开头 | 换项目照样只留这一份，别在 workflow 里另写模板 |
@@ -119,7 +119,11 @@ conf="$(jq -r .version apps/desktop/src-tauri/tauri.conf.json)"
 [ "v${conf}" = "${RELEASE_TAG}" ] || { echo "标签 ${RELEASE_TAG} 对不上配置的 ${conf}" >&2; exit 1; }
 ```
 
-只在真正发布的事件（推标签）上强制；手动自检允许用任意命名标签，否则测试流水线自己被卡住。
+发布事件（推标签，或手动触发且勾了 `publish`）上强制；只有不发布的手动自检允许用任意命名标签，否则测试流水线自己被卡住。
+
+客户端侧也开了 `plugins.updater.requireSignedVersion`：清单里的版本必须与更新包签名 trusted comment 里的 `version:` 一致。
+`build-macos` 在打包后跑 `release_packages_verify_with_the_configured_pubkey -- --ignored`，同时验公钥和这个版本，
+漏传 `--app-version` 的包会在 CI 里直接变红，而不是等用户安装时才被拒。
 
 ## 6. 版本说明只能有一个来源
 
@@ -145,7 +149,7 @@ README 里写"已公证"不算验收。按这三步实测：
 ```bash
 # 1) Apple 侧：这个账号的 history 混着其他 app，必须按名字过滤
 xcrun notarytool history --key <.p8> --key-id <ID> --issuer <ISSUER> \
-  | grep -i -B3 -A2 '<AppName>'          # 期望每次发布两条 Accepted，且早于 Release 的 publishedAt
+  | grep -i -B3 -A2 '<AppName>'          # 期望每次发布四条 Accepted：每架构各一份 .notarization.zip + 一份 dmg，且 zip 的 createdDate 早于 dmg。只剩 dmg 记录说明 .app 没提交过公证
 
 # 2) 线上产物：拉下来跟本机产物逐字节比，并验票据
 gh release download <tag> -R <owner>/<repo> --pattern '*.dmg' -D /tmp/x

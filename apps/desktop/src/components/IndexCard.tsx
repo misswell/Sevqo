@@ -50,6 +50,8 @@ export function IndexCard({
 
   const running = progress.phase === 'indexing' || progress.phase === 'scanning';
   const paused = progress.phase === 'paused';
+  // 暂停只是让索引线程睡着，许可仍被它握着：这时再点开始/重建只会被后端拒绝。
+  const working = running || paused;
   const processed = progress.done + progress.failed + progress.skipped;
   const total = progress.totalEstimate > 0 ? progress.totalEstimate : processed + progress.queued;
   const pct = total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 0;
@@ -113,19 +115,19 @@ export function IndexCard({
           small
           tone="danger"
           onClick={() => void onCancel()}
-          disabled={!(running || paused) || busy}
+          disabled={!working || busy}
           title={labels.index.cancel}
         >
           <StopIcon size={12} />
           <span>{labels.index.cancel}</span>
         </Btn>
-        <Btn small onClick={() => void onRescan()} disabled={busy || running}>
+        <Btn small onClick={() => void onRescan()} disabled={busy || working}>
           {labels.index.scan}
         </Btn>
-        <Btn small onClick={() => void onStart('text', maxFiles)} disabled={busy || running}>
+        <Btn small onClick={() => void onStart('text', maxFiles)} disabled={busy || working}>
           {labels.index.textPass}
         </Btn>
-        <Btn small tone="primary" onClick={() => void onStart('full', maxFiles)} disabled={busy || running}>
+        <Btn small tone="primary" onClick={() => void onStart('full', maxFiles)} disabled={busy || working}>
           {labels.index.fullPass}
         </Btn>
       </div>
@@ -137,16 +139,16 @@ export function IndexCard({
       </label>
 
       <div className="btn-grid btn-grid-quiet">
-        <Btn small tone="ghost" onClick={() => void onRebuild(false)} disabled={busy || running}>
+        <Btn small tone="ghost" onClick={() => void onRebuild(false)} disabled={busy || working}>
           {labels.index.rebuildText}
         </Btn>
-        <Btn small tone="ghost" onClick={() => void onRebuild(true)} disabled={busy || running}>
+        <Btn small tone="ghost" onClick={() => void onRebuild(true)} disabled={busy || working}>
           {labels.index.rebuildVectors}
         </Btn>
-        <Btn small tone="ghost" onClick={() => void onBackfill()} disabled={busy || running}>
+        <Btn small tone="ghost" onClick={() => void onBackfill()} disabled={busy || working}>
           {labels.index.backfill}
         </Btn>
-        <Btn small tone="ghost" onClick={() => void onCompact()} disabled={busy || running}>
+        <Btn small tone="ghost" onClick={() => void onCompact()} disabled={busy || working}>
           {labels.index.compact}
         </Btn>
         <Btn small tone="ghost" onClick={() => void onRestartWatch()} disabled={busy}>

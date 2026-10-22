@@ -250,7 +250,7 @@ impl Indexer {
         } else {
             0
         };
-        let queued_now = self.db.pending(usize::MAX, &kinds)?.len() as u64;
+        let queued_now = self.db.pending_count(&kinds)?;
         progress.discovered = stats.walked;
         progress.queued = queued_now;
         progress.message = Some(format!("扫描完成：新增 {queued} 个，清理 {removed} 个已删除"));

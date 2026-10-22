@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -61,6 +61,8 @@ impl Drop for Session {
 
 pub struct Client {
     inner: Arc<Mutex<Option<Session>>>,
+    /// 子进程 pid 单独存一份：请求在途时锁被占用，退出流程只能靠它杀进程。
+    pid: AtomicU32,
     next_id: AtomicU64,
     log_path: PathBuf,
     program: Vec<String>,
@@ -155,6 +157,7 @@ impl Client {
         env.insert("OMP_NUM_THREADS".into(), settings.infer_threads.max(1).to_string());
         Client {
             inner: Arc::new(Mutex::new(None)),
+            pid: AtomicU32::new(0),
             next_id: AtomicU64::new(1),
             log_path: paths.log_dir.join("sidecar.log"),
             program: vec![
@@ -231,7 +234,9 @@ impl Client {
     fn session(&self) -> Result<std::sync::MutexGuard<'_, Option<Session>>> {
         let mut guard = self.inner.lock().map_err(|_| Error::Infer("锁中毒".into()))?;
         if guard.is_none() {
-            *guard = Some(self.start()?);
+            let s = self.start()?;
+            self.pid.store(s.child.id(), Ordering::Relaxed);
+            *guard = Some(s);
         }
         Ok(guard)
     }
@@ -242,13 +247,14 @@ impl Client {
             Err(_) => return,
         };
         if let Some(mut s) = guard.take() {
+            self.pid.store(0, Ordering::Relaxed);
             let _ = s.child.kill();
             let _ = s.child.wait();
         }
     }
 
     pub fn is_running(&self) -> bool {
-        self.inner.lock().map(|g| g.is_some()).unwrap_or(false)
+        self.pid.load(Ordering::Relaxed) != 0
     }
 
     fn request(&self, payload: Value, timeout: Duration) -> Result<Value> {
@@ -336,12 +342,23 @@ impl Client {
             ));
         }
         let mut resp: EmbedResponse = serde_json::from_value(v.clone()).unwrap_or_default();
-        resp.vectors.retain(|_, v| {
-            if v.len() != self.dim {
-                return false;
+        let mut bad: Vec<(String, String)> = Vec::new();
+        resp.vectors.retain(|k, v| {
+            let good = v.len() == self.dim && v.iter().all(|x| x.is_finite());
+            if !good {
+                let why = if v.len() != self.dim {
+                    format!("向量维度 {} 不符", v.len())
+                } else {
+                    "向量含非有限值".to_string()
+                };
+                bad.push((k.clone(), why));
             }
-            v.iter().all(|x| x.is_finite())
+            good
         });
+        // 静默丢掉的向量会让调用方以为模型根本没返回，记进 errors 才能落到失败计数里。
+        for (k, why) in bad {
+            resp.errors.entry(k).or_insert(why);
+        }
         Ok(resp)
     }
 
@@ -380,21 +397,42 @@ impl Client {
     }
 
     pub fn shutdown(&self) {
-        let guard = self.inner.lock();
-        if let Ok(mut g) = guard {
-            if let Some(mut s) = g.take() {
-                let _ = s.stdin.write_all(b"{\"cmd\":\"shutdown\"}\n");
-                let _ = s.stdin.flush();
-                let _ = s.child.wait_timeout(Duration::from_secs(3));
-                let _ = s.child.kill();
+        let mut guard = match self.inner.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                // 一次在途的 embed 会把锁握住几分钟。退出流程不能等它：直接杀子进程，
+                // 在途请求随即失败，应用照常退出。
+                let pid = self.pid.swap(0, Ordering::Relaxed);
+                if pid != 0 {
+                    terminate(pid);
+                }
+                return;
             }
+        };
+        self.pid.store(0, Ordering::Relaxed);
+        if let Some(mut s) = guard.take() {
+            let _ = s.stdin.write_all(b"{\"cmd\":\"shutdown\"}\n");
+            let _ = s.stdin.flush();
+            let _ = s.child.wait_timeout(Duration::from_secs(3));
+            let _ = s.child.kill();
+            let _ = s.child.wait();
         }
     }
 
     /// Ask the OS to stop the reader thread when the app quits.
     pub fn pid(&self) -> Option<u32> {
-        self.inner.lock().ok().and_then(|g| g.as_ref().map(|s| s.child.id()))
+        let pid = self.pid.load(Ordering::Relaxed);
+        (pid != 0).then_some(pid)
     }
+}
+
+/// Kill a child whose `Child` handle is unreachable because a request owns the mutex.
+fn terminate(pid: u32) {
+    #[cfg(unix)]
+    let _ = Command::new("/bin/kill").args(["-9", &pid.to_string()]).status();
+    #[cfg(windows)]
+    let _ = Command::new("taskkill").args(["/PID", &pid.to_string(), "/F"]).status();
 }
 
 trait WaitTimeout {

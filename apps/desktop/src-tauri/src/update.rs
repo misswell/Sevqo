@@ -340,6 +340,7 @@ mod tests {
         let encoded = conf["plugins"]["updater"]["pubkey"]
             .as_str()
             .expect("tauri.conf.json 里要有 plugins.updater.pubkey");
+        let version = conf["version"].as_str().expect("tauri.conf.json 里要有 version");
         let text = String::from_utf8(
             base64::engine::general_purpose::STANDARD
                 .decode(encoded)
@@ -372,6 +373,18 @@ mod tests {
             public
                 .verify(&bytes, &signature, false)
                 .unwrap_or_else(|e| panic!("{} 与配置里的公钥不匹配：{e}", archive.display()));
+            // `requireSignedVersion` 依赖 trusted comment 里的版本；漏掉 --app-version
+            // 的包在本地验签会过，装到客户端却被拒。
+            let signed = signature
+                .trusted_comment()
+                .split('\t')
+                .find_map(|f| f.strip_prefix("version:"));
+            assert_eq!(
+                signed,
+                Some(version),
+                "{} 的 trusted comment 版本与 tauri.conf.json 的 {version} 不一致",
+                archive.display()
+            );
         }
     }
 }

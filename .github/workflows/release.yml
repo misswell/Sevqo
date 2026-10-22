@@ -60,20 +60,22 @@ jobs:
       - name: Rust 测试
         run: cargo test -q --workspace
       - name: 标签版本与配置版本是否一致
+        env:
+          PUBLISH: ${{ github.event_name == 'workflow_dispatch' && inputs.publish || 'false' }}
         run: |
           # latest.json 的版本取自标签，而 minisign 签名里的 app-version 取自 tauri.conf.json。
           # 只改标签不改配置，发出去的更新会因为签名里的版本对不上而被客户端拒装。
-          # 手动触发允许拿任意标签自检，所以只在真正推标签时拦。
+          # 手动触发只做自检时允许任意标签；一旦勾了发布，就必须和配置版本一致。
           set -euo pipefail
           conf="$(jq -r .version apps/desktop/src-tauri/tauri.conf.json)"
-          if [ "$GITHUB_EVENT_NAME" = push ]; then
+          if [ "$GITHUB_EVENT_NAME" = push ] || [ "$PUBLISH" = true ]; then
             [ "v${conf}" = "${RELEASE_TAG}" ] || {
               echo "标签 ${RELEASE_TAG} 对不上 tauri.conf.json 的 ${conf}：先改版本号再打标签" >&2
               exit 1
             }
             echo "==> ${RELEASE_TAG} 与 tauri.conf.json 的 ${conf} 一致"
           else
-            echo "==> 手动触发，跳过一致性检查（标签 ${RELEASE_TAG} 仅用于产物命名，配置版本仍是 ${conf}）"
+            echo "==> 手动触发且不发布，跳过一致性检查（标签 ${RELEASE_TAG} 仅用于产物命名，配置版本仍是 ${conf}）"
           fi
       - name: 发布凭据是否齐备
         id: credentials
@@ -247,6 +249,13 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: bash .github/scripts/pack_updater.sh
+
+      - name: 校验更新包签名、公钥与签名内版本
+        # 用应用自己的验签测试：公钥取自 tauri.conf.json，版本必须和 trusted comment 对齐，
+        # 否则开了 requireSignedVersion 的客户端会拒绝安装这份更新。
+        env:
+          SEVQO_UPDATE_DIR: ${{ github.workspace }}/release
+        run: cargo test -q -p sevqo-desktop release_packages_verify_with_the_configured_pubkey -- --ignored
 
       - uses: actions/upload-artifact@v4
         with:

@@ -72,6 +72,7 @@ export function Main(): ReactElement {
         <SettingsSheet
           settings={backend.settings}
           busy={backend.busy}
+          indexing={backend.indexing}
           onClose={() => setSettingsOpen(false)}
           onSave={backend.saveSettings}
         />

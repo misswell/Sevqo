@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type RefObject } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from 'react';
 
 import { getCurrentWindow } from '@tauri-apps/api/window';
 
@@ -25,17 +25,27 @@ export function useInterval(action: () => void, ms: number | null): void {
   }, [ms, ref]);
 }
 
+export interface Debounced<A> {
+  (arg: A): void;
+  /** Drop the pending call. Clearing the box must not let an older keystroke land after it. */
+  cancel: () => void;
+}
+
 /** Fires `action` `wait` ms after the last call; `reset` restarts the timer. */
-export function useDebounced<A>(action: (arg: A) => void, wait: number): (arg: A) => void {
+export function useDebounced<A>(action: (arg: A) => void, wait: number): Debounced<A> {
   const ref = useEventCallback(action);
   const timer = useRef<number | null>(null);
+  const cancel = useCallback(() => {
+    if (timer.current != null) window.clearTimeout(timer.current);
+    timer.current = null;
+  }, []);
   useEffect(
     () => () => {
       if (timer.current != null) window.clearTimeout(timer.current);
     },
     [],
   );
-  return useCallback(
+  const run = useCallback(
     (arg: A) => {
       if (timer.current != null) window.clearTimeout(timer.current);
       timer.current = window.setTimeout(() => {
@@ -45,6 +55,7 @@ export function useDebounced<A>(action: (arg: A) => void, wait: number): (arg: A
     },
     [ref, wait],
   );
+  return useMemo(() => Object.assign(run, { cancel }), [run, cancel]);
 }
 
 // ---------------------------------------------------------------- thumbnails

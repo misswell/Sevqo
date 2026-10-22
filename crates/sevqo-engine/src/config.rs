@@ -124,9 +124,29 @@ impl Settings {
         self.video_step_s = self.video_step_s.clamp(1.0, self.video_window_s);
         self.video_fps = self.video_fps.clamp(0.1, 4.0);
         self.infer_batch = self.infer_batch.clamp(1, 32);
+        // 0 不是「不限制」而是「一个文件都不收」：扫描会静默跳过全部内容，
+        // 队列看起来像扫完了。留在 1MB 以上才是个有意义的单文件上限。
+        self.max_file_bytes = self.max_file_bytes.clamp(1024 * 1024, 16 * 1024 * 1024 * 1024);
         if (self.video_window_s * self.video_fps) as usize > 32 {
             // never ask the encoder for more than max_frames
             self.video_fps = 32.0 / self.video_window_s;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_size_limit_stays_usable() {
+        let mut s = Settings::default();
+        s.max_file_bytes = 0;
+        s.validate();
+        assert_eq!(s.max_file_bytes, 1024 * 1024);
+
+        s.max_file_bytes = u64::MAX;
+        s.validate();
+        assert_eq!(s.max_file_bytes, 16 * 1024 * 1024 * 1024);
     }
 }

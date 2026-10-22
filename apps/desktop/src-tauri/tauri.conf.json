@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Sevqo",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "identifier": "com.sevqo.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -47,6 +47,7 @@
   "plugins": {
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IENFRTlBM0IwRjEzNUE5M0YKUldRL3FUWHhzS1BwenZmQkVvWFZiazhsRFR5QmFZWjRkY3R0NHRlUW5qZldhdlR3RVQ3eDRLUloK",
+      "requireSignedVersion": true,
       "endpoints": [
         "https://github.com/misswell/Sevqo/releases/latest/download/latest.json"
       ]

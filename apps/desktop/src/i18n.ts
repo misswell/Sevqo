@@ -262,6 +262,7 @@ export const labels = {
   settings: {
     title: '设置',
     saved: '设置已保存',
+    indexingBlocked: '索引运行中，停止或取消后才能保存设置',
     groupContent: '索引内容',
     groupSemantic: '语义与性能',
     groupVideo: '视频切片',

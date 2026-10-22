@@ -370,6 +370,14 @@ fn scan_all(st: &Arc<AppState>, root_id: Option<i64>) -> Res<ScanReport> {
         elapsed_ms: 0.0,
     };
     for r in &roots {
+        // 一个根目录不可用（外置盘没插、目录被删）不能让整轮扫描失败：监听线程把
+        // 任何失败都当成「待重试」，会每 800ms 空转，其余目录也永远轮不到。
+        let path = expand(&r.path);
+        if !path.exists() {
+            tracing::warn!("跳过不可用的根目录 {}", path.display());
+            rep.errors += 1;
+            continue;
+        }
         let s = idx.scan_root(r.id, mode).map_err(es)?;
         rep.walked += s.walked;
         rep.candidates += s.indexed_candidates;
@@ -379,7 +387,7 @@ fn scan_all(st: &Arc<AppState>, root_id: Option<i64>) -> Res<ScanReport> {
         rep.unreadable += s.unreadable;
         rep.errors += s.errors;
     }
-    rep.queued = st.db.pending(usize::MAX, &idx.kinds_for(mode)).map_err(es)?.len() as i64;
+    rep.queued = st.db.pending_count(&idx.kinds_for(mode)).map_err(es)? as i64;
     rep.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
     Ok(rep)
 }
@@ -1143,4 +1151,29 @@ pub fn bootstrap_paths(model_home: Option<&str>) -> Res<(Paths, Settings, Arc<Db
     let settings = Settings::load(&paths.settings_path);
     let db = Arc::new(Db::open(&paths.db_path).map_err(es)?);
     Ok((paths, settings, db))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A root on an unmounted disk used to abort the whole pass; the watcher then treated
+    /// every retry as another failure and spun forever without scanning the healthy root.
+    #[test]
+    fn scan_all_skips_a_vanished_root() {
+        let (_dir, st) = crate::state::test_state();
+        let good = st.paths.data_dir.join("good");
+        let gone = st.paths.data_dir.join("gone");
+        std::fs::create_dir_all(&good).unwrap();
+        std::fs::create_dir_all(&gone).unwrap();
+        std::fs::write(good.join("a.md"), "# hello").unwrap();
+        st.db.add_root(&good.to_string_lossy(), "good").unwrap();
+        st.db.add_root(&gone.to_string_lossy(), "gone").unwrap();
+        std::fs::remove_dir_all(&gone).unwrap();
+
+        let rep = scan_all(&st, None).expect("missing root must not fail the scan");
+        assert_eq!(rep.roots, 2);
+        assert!(rep.walked >= 1);
+        assert!(rep.errors >= 1);
+    }
 }

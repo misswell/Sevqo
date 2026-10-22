@@ -248,6 +248,7 @@ export function SearchArea({
         case 'Escape':
           if (!query) return;
           e.preventDefault();
+          debouncedHybrid.cancel();
           setQuery('');
           void runText('', true);
           break;
@@ -255,7 +256,7 @@ export function SearchArea({
           break;
       }
     },
-    [activeIndex, moveActive, open, query, runText, hits],
+    [activeIndex, debouncedHybrid, moveActive, open, query, runText, hits],
   );
 
   const shown = hits.slice(0, limit);
@@ -310,6 +311,7 @@ export function SearchArea({
               className="search-input-clear"
               title={labels.common.clear}
               onClick={() => {
+                debouncedHybrid.cancel();
                 setQuery('');
                 void runText('', true);
                 inputRef.current?.focus();
