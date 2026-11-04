@@ -6,7 +6,38 @@ use rusqlite::{params, Connection, Row};
 
 use crate::{segment, EmbedRowKind, Error, FileRecord, FileState, Kind, Result, SearchRequest};
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
+
+/// Sequential migrations: `(target_version, SQL)`. Each entry upgrades a database from
+/// `target_version - 1` and runs exactly once, inside its own transaction, after a
+/// verified backup has been taken (P1-13). A database newer than this build refuses to
+/// open rather than guessing at unknown columns.
+const MIGRATIONS: &[(i64, &str)] = &[(
+    2,
+    // v2: chunk/clip gain per-unit index state (P0-03). Legacy rows were written under
+    // the old regime: a row with an *activated* vec_map entry really has bytes on disk,
+    // everything else (never reserved, or staged and never activated) needs re-embedding.
+    // Done files carrying non-persisted units go back to `stale` so the queue picks them
+    // up instead of silently keeping a partial index.
+    r#"
+    ALTER TABLE chunk ADD COLUMN status TEXT NOT NULL DEFAULT 'persisted';
+    ALTER TABLE chunk ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE chunk ADD COLUMN error TEXT;
+    ALTER TABLE clip ADD COLUMN status TEXT NOT NULL DEFAULT 'persisted';
+    ALTER TABLE clip ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE clip ADD COLUMN error TEXT;
+    UPDATE chunk SET status='pending' WHERE vec_row IS NULL
+      OR id IN (SELECT ref_id FROM vec_map WHERE target_kind='chunk' AND alive=0);
+    UPDATE clip SET status='pending' WHERE vec_row IS NULL
+      OR id IN (SELECT ref_id FROM vec_map WHERE target_kind='clip' AND alive=0);
+    UPDATE file SET state='stale' WHERE state='done' AND kind IN ('document','code')
+      AND id IN (SELECT file_id FROM chunk WHERE status!='persisted');
+    UPDATE file SET state='stale' WHERE state='done' AND kind='video'
+      AND id IN (SELECT file_id FROM clip WHERE status!='persisted');
+    CREATE INDEX IF NOT EXISTS chunk_status ON chunk(file_id, status);
+    CREATE INDEX IF NOT EXISTS clip_status ON clip(file_id, status);
+    "#,
+)];
 
 const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -57,9 +88,13 @@ CREATE TABLE IF NOT EXISTS chunk(
   file_id INTEGER NOT NULL REFERENCES file(id) ON DELETE CASCADE,
   ord INTEGER NOT NULL,
   text TEXT NOT NULL,
-  vec_row INTEGER
+  vec_row INTEGER,
+  status TEXT NOT NULL DEFAULT 'pending',
+  retry_count INTEGER NOT NULL DEFAULT 0,
+  error TEXT
 );
 CREATE INDEX IF NOT EXISTS chunk_file ON chunk(file_id, ord);
+CREATE INDEX IF NOT EXISTS chunk_status ON chunk(file_id, status);
 
 CREATE TABLE IF NOT EXISTS clip(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -68,9 +103,13 @@ CREATE TABLE IF NOT EXISTS clip(
   start_ms INTEGER NOT NULL,
   end_ms INTEGER NOT NULL,
   vec_row INTEGER,
-  thumb TEXT
+  thumb TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  retry_count INTEGER NOT NULL DEFAULT 0,
+  error TEXT
 );
 CREATE INDEX IF NOT EXISTS clip_file ON clip(file_id, start_ms);
+CREATE INDEX IF NOT EXISTS clip_status ON clip(file_id, status);
 
 CREATE TABLE IF NOT EXISTS vec_map(
   row_id INTEGER PRIMARY KEY,
@@ -101,6 +140,31 @@ fn open_conn(path: &Path) -> Result<Connection> {
     let c = Connection::open(path)?;
     c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=8000;")?;
     Ok(c)
+}
+
+/// Upgrade an old database one migration step at a time (P1-13). Before touching
+/// anything, `VACUUM INTO` writes a consistent snapshot next to the index; if the backup
+/// fails, the migration is refused and the old database stays exactly as it was. Each
+/// step runs in its own transaction together with its version bump, so a crash mid-step
+/// simply leaves the old version to be retried on next launch.
+fn migrate(c: &mut Connection, path: &Path, from: i64) -> Result<()> {
+    let bak = path.with_extension(format!("bak-v{from}.sqlite"));
+    let _ = std::fs::remove_file(&bak);
+    c.execute("VACUUM INTO ?1", params![bak.to_string_lossy().to_string()])?;
+    for (target, sql) in MIGRATIONS {
+        if *target <= from {
+            continue;
+        }
+        let tx = c.transaction()?;
+        tx.execute_batch(sql)?;
+        tx.execute(
+            "INSERT INTO meta(key,value) VALUES('schema_version',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![target.to_string()],
+        )?;
+        tx.commit()?;
+        tracing::info!("索引数据库已从 v{from} 迁移到 v{target}（备份: {}）", bak.display());
+    }
+    Ok(())
 }
 
 pub fn kind_str(k: Kind) -> &'static str {
@@ -152,28 +216,59 @@ fn read_file(r: &Row) -> rusqlite::Result<FileRecord> {
     })
 }
 
+/// Terminal-state roll-up of one file's embeddable units (chunk/clip rows; an image's
+/// unit lives at file level and never appears here).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnitSummary {
+    pub total: i64,
+    pub persisted: i64,
+    /// failures whose retry_count reached the cap
+    pub exhausted: i64,
+    /// failures still allowed to re-queue
+    pub retryable: i64,
+    pub error: Option<String>,
+}
+
 impl Db {
     pub fn open(path: &Path) -> Result<Db> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let c = open_conn(path)?;
-        c.execute_batch(DDL)?;
+        let mut c = open_conn(path)?;
+        // v2 的 DDL 会建引用新列的索引，因此必须先确定版本：全新库一次事务建表+记版本；
+        // 旧库先迁移补列，最后再跑一遍幂等 DDL 兜底。
         let stored: Option<String> = c
             .query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get(0))
             .ok();
-        match stored {
-            None => {
-                c.execute("INSERT INTO meta(key,value) VALUES('schema_version',?)", params![SCHEMA_VERSION.to_string()])?;
+        let known_tables: i64 = c
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('file','chunk')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let version = match stored {
+            None if known_tables == 0 => {
+                let tx = c.transaction()?;
+                tx.execute_batch(DDL)?;
+                tx.execute("INSERT INTO meta(key,value) VALUES('schema_version',?)", params![SCHEMA_VERSION.to_string()])?;
+                tx.commit()?;
+                SCHEMA_VERSION
             }
-            Some(v) if v.parse::<i64>().unwrap_or(0) != SCHEMA_VERSION => {
-                return Err(Error::Config(format!(
-                    "索引数据库版本 {v} 与当前程序要求的 {SCHEMA_VERSION} 不兼容，请删除该索引文件后重建：{}",
-                    path.display()
-                )));
-            }
-            Some(_) => {}
+            // 有表但没记版本：最老的 v1 库。
+            None => 1,
+            Some(v) => v.parse::<i64>().unwrap_or(0),
+        };
+        if version > SCHEMA_VERSION {
+            return Err(Error::Config(format!(
+                "索引数据库版本 {version} 比当前程序要求的 {SCHEMA_VERSION} 更新，请升级程序后打开：{}",
+                path.display()
+            )));
         }
+        if version < SCHEMA_VERSION {
+            migrate(&mut c, path, version)?;
+        }
+        c.execute_batch(DDL)?;
         // A crash mid-item must not leave rows stuck in `indexing` forever.
         c.execute("UPDATE file SET state='pending' WHERE state='indexing'", [])?;
         // Older builds only inserted FTS rows when a document had body text,
@@ -494,29 +589,86 @@ impl Db {
         g.query_row("SELECT title FROM doc WHERE file_id=?", params![file_id], |r| r.get(0)).ok().flatten()
     }
 
-    pub fn insert_chunks(&self, file_id: i64, chunks: &[String]) -> Result<Vec<(i64, usize)>> {
+    /// Insert the chunk set for a file, preserving rows whose text is unchanged so their
+    /// per-unit state — persisted vector, retry history — survives a re-queue (P0-03).
+    /// Changed or new chunks start `pending`; vanished ones are removed and their vector
+    /// rows tombstoned. Identity is `(ord, text)`: an edit that shifts chunk boundaries
+    /// re-embeds the shifted tail, which is acceptable until content fingerprints (P1-03)
+    /// refine the identity.
+    pub fn sync_chunks(&self, file_id: i64, chunks: &[String]) -> Result<Vec<(i64, usize)>> {
         let g = self.write.lock().unwrap();
-        g.execute("DELETE FROM chunk WHERE file_id=?", params![file_id])?;
-        g.execute("UPDATE vec_map SET alive=0 WHERE file_id=? AND target_kind='chunk'", params![file_id])?;
+        let old: Vec<(i64, i64, String)> = {
+            let mut st = g.prepare("SELECT id,ord,text FROM chunk WHERE file_id=? ORDER BY ord")?;
+            let rows = st.query_map(params![file_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            rows.filter_map(|x| x.ok()).collect()
+        };
         let mut out = Vec::with_capacity(chunks.len());
         for (ord, text) in chunks.iter().enumerate() {
-            g.execute("INSERT INTO chunk(file_id,ord,text) VALUES(?,?,?)", params![file_id, ord as i64, text])?;
-            out.push((g.last_insert_rowid(), ord));
+            let ord = ord as i64;
+            match old.iter().find(|(_, o, _)| *o == ord) {
+                Some((id, _, prev)) if prev == text => out.push((*id, ord as usize)),
+                Some((id, _, _)) => {
+                    g.execute("UPDATE vec_map SET alive=0 WHERE target_kind='chunk' AND ref_id=?", params![id])?;
+                    g.execute(
+                        "UPDATE chunk SET text=?,status='pending',retry_count=0,error=NULL,vec_row=NULL WHERE id=?",
+                        params![text, id],
+                    )?;
+                    out.push((*id, ord as usize));
+                }
+                None => {
+                    g.execute(
+                        "INSERT INTO chunk(file_id,ord,text) VALUES(?,?,?)",
+                        params![file_id, ord, text],
+                    )?;
+                    out.push((g.last_insert_rowid(), ord as usize));
+                }
+            }
+        }
+        for (id, _ord, _) in old.iter().filter(|(_, o, _)| *o >= chunks.len() as i64) {
+            g.execute("UPDATE vec_map SET alive=0 WHERE target_kind='chunk' AND ref_id=?", params![id])?;
+            g.execute("DELETE FROM chunk WHERE id=?", params![id])?;
         }
         Ok(out)
     }
 
-    pub fn insert_clips(&self, file_id: i64, clips: &[(f64, f64)]) -> Result<Vec<(i64, usize)>> {
+    /// Same preservation contract as [`Self::sync_chunks`], keyed by the clip's time
+    /// range: unchanged windows keep their units, moved or resized windows re-embed.
+    pub fn sync_clips(&self, file_id: i64, clips: &[(f64, f64)]) -> Result<Vec<(i64, usize)>> {
         let g = self.write.lock().unwrap();
-        g.execute("DELETE FROM clip WHERE file_id=?", params![file_id])?;
-        g.execute("UPDATE vec_map SET alive=0 WHERE file_id=? AND target_kind='clip'", params![file_id])?;
+        let old: Vec<(i64, i64, i64, i64)> = {
+            let mut st = g.prepare("SELECT id,ord,start_ms,end_ms FROM clip WHERE file_id=? ORDER BY ord")?;
+            let rows = st.query_map(params![file_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+            rows.filter_map(|x| x.ok()).collect()
+        };
         let mut out = Vec::with_capacity(clips.len());
         for (ord, (start, end)) in clips.iter().enumerate() {
-            g.execute(
-                "INSERT INTO clip(file_id,ord,start_ms,end_ms) VALUES(?,?,?,?)",
-                params![file_id, ord as i64, (start * 1000.0).round() as i64, (end * 1000.0).round() as i64],
-            )?;
-            out.push((g.last_insert_rowid(), ord));
+            let ord = ord as i64;
+            let start_ms = (start * 1000.0).round() as i64;
+            let end_ms = (end * 1000.0).round() as i64;
+            let existing = old.iter().find(|(_, o, _, _)| *o == ord);
+            match existing {
+                // Same slot, same window: keep unit state untouched.
+                Some((id, _, s, e)) if *s == start_ms && *e == end_ms => out.push((*id, ord as usize)),
+                Some((id, _, _, _)) => {
+                    g.execute("UPDATE vec_map SET alive=0 WHERE target_kind='clip' AND ref_id=?", params![id])?;
+                    g.execute(
+                        "UPDATE clip SET start_ms=?,end_ms=?,status='pending',retry_count=0,error=NULL,vec_row=NULL WHERE id=?",
+                        params![start_ms, end_ms, id],
+                    )?;
+                    out.push((*id, ord as usize));
+                }
+                None => {
+                    g.execute(
+                        "INSERT INTO clip(file_id,ord,start_ms,end_ms) VALUES(?,?,?,?)",
+                        params![file_id, ord, start_ms, end_ms],
+                    )?;
+                    out.push((g.last_insert_rowid(), ord as usize));
+                }
+            }
+        }
+        for (id, _ord, _, _) in old.iter().filter(|(_, o, _, _)| *o >= clips.len() as i64) {
+            g.execute("UPDATE vec_map SET alive=0 WHERE target_kind='clip' AND ref_id=?", params![id])?;
+            g.execute("DELETE FROM clip WHERE id=?", params![id])?;
         }
         Ok(out)
     }
@@ -533,6 +685,123 @@ impl Db {
         let mut st = g.prepare("SELECT id,text FROM chunk WHERE file_id=? ORDER BY ord")?;
         let rows = st.query_map(params![file_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.filter_map(|x| x.ok()).collect())
+    }
+
+    // ------------------------------------------------- unit-level index state (P0-03)
+
+    /// Chunks still missing a persisted vector, in order. This is what makes per-unit
+    /// retry possible: a pass embeds exactly these, never the units already done.
+    pub fn chunks_needing_embed(&self, file_id: i64) -> Result<Vec<(i64, String)>> {
+        let g = self.write.lock().unwrap();
+        let mut st = g.prepare(
+            "SELECT id,text FROM chunk WHERE file_id=? AND status!='persisted' ORDER BY ord",
+        )?;
+        let rows = st.query_map(params![file_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.filter_map(|x| x.ok()).collect())
+    }
+
+    /// Clips still missing a persisted vector, as `(id, start_s, end_s)` in order.
+    pub fn clips_needing_embed(&self, file_id: i64) -> Result<Vec<(i64, f64, f64)>> {
+        let g = self.write.lock().unwrap();
+        let mut st = g.prepare(
+            "SELECT id,start_ms,end_ms FROM clip WHERE file_id=? AND status!='persisted' ORDER BY ord",
+        )?;
+        let rows = st.query_map(params![file_id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as f64 / 1000.0, r.get::<_, i64>(2)? as f64 / 1000.0))
+        })?;
+        Ok(rows.filter_map(|x| x.ok()).collect())
+    }
+
+    /// Whether an embeddable unit already owns an activated (searchable) vector row.
+    /// Images use this to skip re-encoding an unchanged picture.
+    pub fn has_active_vector(&self, target: EmbedRowKind, ref_id: i64) -> Result<bool> {
+        let g = self.write.lock().unwrap();
+        let hit: Option<i64> = g
+            .query_row(
+                "SELECT 1 FROM vec_map WHERE target_kind=? AND ref_id=? AND alive=1",
+                params![target.as_str(), ref_id],
+                |r| r.get(0),
+            )
+            .ok();
+        Ok(hit.is_some())
+    }
+
+    /// Publish successful units: their vector bytes are durable, so flip the unit state
+    /// to `persisted`. Image units live at file level and need no row here.
+    pub fn mark_units_persisted(&self, units: &[(EmbedRowKind, i64)]) -> Result<()> {
+        let g = self.write.lock().unwrap();
+        for (target, ref_id) in units {
+            match target {
+                EmbedRowKind::Chunk => {
+                    g.execute(
+                        "UPDATE chunk SET status='persisted',error=NULL WHERE id=?",
+                        params![ref_id],
+                    )?;
+                }
+                EmbedRowKind::Clip => {
+                    g.execute(
+                        "UPDATE clip SET status='persisted',error=NULL WHERE id=?",
+                        params![ref_id],
+                    )?;
+                }
+                EmbedRowKind::Image => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Record a failed embed attempt per unit: keeps the reason, counts the retry. The
+    /// caller aggregates file state from these (see [`Self::unit_summary`]).
+    pub fn mark_units_failed(&self, units: &[(EmbedRowKind, i64)], err: &str) -> Result<()> {
+        let g = self.write.lock().unwrap();
+        for (target, ref_id) in units {
+            match target {
+                EmbedRowKind::Chunk => {
+                    g.execute(
+                        "UPDATE chunk SET status='failed',retry_count=retry_count+1,error=? WHERE id=?",
+                        params![err, ref_id],
+                    )?;
+                }
+                EmbedRowKind::Clip => {
+                    g.execute(
+                        "UPDATE clip SET status='failed',retry_count=retry_count+1,error=? WHERE id=?",
+                        params![err, ref_id],
+                    )?;
+                }
+                EmbedRowKind::Image => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Terminal-state roll-up of a file's units. A file is only `done` when every unit
+    /// is persisted; retryable failures re-queue the file, exhausted ones surface as a
+    /// diagnosable failure.
+    pub fn unit_summary(&self, file_id: i64, retry_max: i64) -> Result<UnitSummary> {
+        let g = self.write.lock().unwrap();
+        let sum = g.query_row(
+            "SELECT count(*),
+                    COALESCE(SUM(status='persisted'),0),
+                    COALESCE(SUM(status='failed' AND retry_count>=?2),0),
+                    COALESCE(SUM(status='failed' AND retry_count<?2),0),
+                    (SELECT error FROM chunk WHERE file_id=?1 AND status='failed'
+                     UNION ALL
+                     SELECT error FROM clip WHERE file_id=?1 AND status='failed' LIMIT 1)
+             FROM (SELECT status,retry_count FROM chunk WHERE file_id=?1
+                   UNION ALL
+                   SELECT status,retry_count FROM clip WHERE file_id=?1)",
+            params![file_id, retry_max],
+            |r| {
+                Ok(UnitSummary {
+                    total: r.get(0)?,
+                    persisted: r.get(1)?,
+                    exhausted: r.get(2)?,
+                    retryable: r.get(3)?,
+                    error: r.get(4)?,
+                })
+            },
+        )?;
+        Ok(sum)
     }
 
     // -------------------------------------------------------------- vectors
@@ -732,8 +1001,9 @@ impl Db {
     pub fn reset_vectors(&self) -> Result<()> {
         let g = self.write.lock().unwrap();
         g.execute("DELETE FROM vec_map", [])?;
-        g.execute("UPDATE chunk SET vec_row=NULL", [])?;
-        g.execute("UPDATE clip SET vec_row=NULL", [])?;
+        for t in ["chunk", "clip"] {
+            g.execute(&format!("UPDATE {t} SET vec_row=NULL,status='pending',retry_count=0,error=NULL"), [])?;
+        }
         Ok(())
     }
 
@@ -741,8 +1011,9 @@ impl Db {
         let g = self.write.lock().unwrap();
         let n = g.execute("UPDATE file SET state='pending',error=NULL", [])?;
         g.execute("DELETE FROM vec_map", [])?;
-        g.execute("UPDATE chunk SET vec_row=NULL", [])?;
-        g.execute("UPDATE clip SET vec_row=NULL", [])?;
+        for t in ["chunk", "clip"] {
+            g.execute(&format!("UPDATE {t} SET vec_row=NULL,status='pending',retry_count=0,error=NULL"), [])?;
+        }
         Ok(n)
     }
 
@@ -1004,7 +1275,7 @@ mod tests {
         let file_thumb = dir.path().join("t.jpg");
         std::fs::write(&file_thumb, b"thumb").unwrap();
         db.set_file_meta(id, None, None, None, Some(&file_thumb.to_string_lossy())).unwrap();
-        let clips = db.insert_clips(id, &[(0.0, 2.0)]).unwrap();
+        let clips = db.sync_clips(id, &[(0.0, 2.0)]).unwrap();
         let clip_thumb = dir.path().join("clip-0.jpg");
         std::fs::write(&clip_thumb, b"clip").unwrap();
         db.set_clip_thumb(clips[0].0, &clip_thumb.to_string_lossy()).unwrap();
@@ -1014,5 +1285,141 @@ mod tests {
         assert!(db.file(id).is_none());
         assert!(!file_thumb.exists(), "文件缩略图应随行删除");
         assert!(!clip_thumb.exists(), "clip 缩略图应随行删除");
+    }
+
+    // -------------------------------------- P0-03: 单元状态 + migration（schema v2）
+
+    /// v1 形态的建表语句，用于构造迁移 fixture。
+    const V1_DDL: &str = r#"
+    CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    CREATE TABLE root(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL UNIQUE, label TEXT NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1, last_scan_ns INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE file(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, root_id INTEGER REFERENCES root(id) ON DELETE CASCADE,
+      path TEXT NOT NULL UNIQUE, name TEXT NOT NULL, ext TEXT NOT NULL, kind TEXT NOT NULL,
+      size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, duration_ms INTEGER, width INTEGER,
+      height INTEGER, state TEXT NOT NULL DEFAULT 'pending', error TEXT,
+      indexed_ns INTEGER NOT NULL DEFAULT 0, thumb TEXT);
+    CREATE TABLE chunk(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, file_id INTEGER NOT NULL REFERENCES file(id) ON DELETE CASCADE,
+      ord INTEGER NOT NULL, text TEXT NOT NULL, vec_row INTEGER);
+    CREATE TABLE clip(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, file_id INTEGER NOT NULL REFERENCES file(id) ON DELETE CASCADE,
+      ord INTEGER NOT NULL, start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL,
+      vec_row INTEGER, thumb TEXT);
+    CREATE TABLE vec_map(
+      row_id INTEGER PRIMARY KEY, target_kind TEXT NOT NULL, ref_id INTEGER NOT NULL,
+      file_id INTEGER NOT NULL, alive INTEGER NOT NULL DEFAULT 1);
+    "#;
+
+    /// v1 → v2 迁移：已激活向量的单元保持 persisted；只预留/未预留的回 pending；
+    /// 带未完成单元的 done 文件回 stale；迁移前生成备份；数据原样保留。
+    #[test]
+    fn v1_database_migrates_to_v2_with_unit_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("i.sqlite");
+        {
+            let c = rusqlite::Connection::open(&path).unwrap();
+            c.execute_batch(V1_DDL).unwrap();
+            c.execute_batch(r#"
+                INSERT INTO meta VALUES('schema_version','1');
+                INSERT INTO root(path,label) VALUES('/tmp/d','目录');
+                INSERT INTO file(id,root_id,path,name,ext,kind,size,mtime_ns,state) VALUES
+                  (1,1,'/tmp/d/a.md','a.md','md','document',10,1,'done'),
+                  (2,1,'/tmp/d/b.mp4','b.mp4','mp4','video',10,1,'done');
+                -- 文件 1：chunk 1 已激活；chunk 2 只预留（旧协议的半成品）；chunk 3 从未预留
+                INSERT INTO chunk(id,file_id,ord,text,vec_row) VALUES
+                  (1,1,0,'已编码片段',0),(2,1,1,'只有预留的片段',1),(3,1,2,'从没预留过的片段',NULL);
+                INSERT INTO vec_map(row_id,target_kind,ref_id,file_id,alive) VALUES
+                  (0,'chunk',1,1,1),(1,'chunk',2,1,0);
+                -- 文件 2：一个从未预留的 clip
+                INSERT INTO clip(id,file_id,ord,start_ms,end_ms) VALUES (5,2,0,0,12000);
+            "#).unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+
+        assert!(dir.path().join("i.bak-v1.sqlite").exists(), "迁移前必须生成备份");
+        assert_eq!(db.get_meta("schema_version").as_deref(), Some("2"));
+        let c = db.read().unwrap();
+        let status = |id: i64| -> String {
+            c.query_row("SELECT status FROM chunk WHERE id=?", params![id], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(status(1), "persisted", "已激活的向量保持 persisted");
+        assert_eq!(status(2), "pending", "只预留不落盘的片段要重新嵌入");
+        assert_eq!(status(3), "pending", "从未预留的片段要重新嵌入");
+        let clip_status: String = c.query_row("SELECT status FROM clip WHERE id=5", [], |r| r.get(0)).unwrap();
+        assert_eq!(clip_status, "pending");
+        let text: String = c.query_row("SELECT text FROM chunk WHERE id=2", [], |r| r.get(0)).unwrap();
+        assert_eq!(text, "只有预留的片段", "迁移不得丢数据");
+        assert_eq!(db.file(1).unwrap().state, FileState::Stale, "带未完成单元的 done 文件回队列");
+        assert_eq!(db.file(2).unwrap().state, FileState::Stale);
+        assert_eq!(db.pending(10, &[]).unwrap().len(), 2, "两个文件都要能被重新拾起");
+    }
+
+    /// sync 保留未变单元的状态：文本没变的 chunk 连同它的持久化向量一起保留；
+    /// 变了的单元回 pending 并作废旧向量行；消失的单元连带回收。
+    #[test]
+    fn sync_chunks_preserves_unchanged_units() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("i.sqlite")).unwrap();
+        let root = db.add_root("/tmp/d", "目录").unwrap();
+        let id = upsert(&db, root, "/tmp/d/a.md", Kind::Document);
+        let first = db.sync_chunks(id, &["甲".into(), "乙".into(), "丙".into()]).unwrap();
+        let (a, b, c3) = (first[0].0, first[1].0, first[2].0);
+        // 模拟乙、丙已持久化
+        let rb = db.reserve_vec_row(EmbedRowKind::Chunk, b, id).unwrap();
+        db.activate_vec_rows(&[rb]).unwrap();
+        db.mark_units_persisted(&[(EmbedRowKind::Chunk, b)]).unwrap();
+
+        let second = db.sync_chunks(id, &["甲".into(), "乙改".into(), "丙".into(), "丁".into()]).unwrap();
+
+        assert_eq!(second.len(), 4);
+        assert_eq!(second[0].0, a, "未变的单元保留原 id");
+        assert_eq!(second[2].0, c3, "未变的单元保留原 id");
+        let st = |cid: i64| -> String {
+            db.read().unwrap().query_row("SELECT status FROM chunk WHERE id=?", params![cid], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(st(b), "pending", "内容变化的单元回到待嵌入");
+        assert_eq!(db.alive_vec_rows().unwrap(), 0, "变化单元的向量行已作废");
+        assert_eq!(st(second[3].0), "pending");
+        assert_eq!(db.unit_summary(id, 3).unwrap(), UnitSummary { total: 4, persisted: 0, exhausted: 0, retryable: 0, error: None });
+    }
+
+    /// 失败计数与聚合：可重试的失败让文件回 stale，重试耗尽则判 failed，
+    /// 全部持久化才是 done。
+    #[test]
+    fn unit_retry_and_aggregation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("i.sqlite")).unwrap();
+        let root = db.add_root("/tmp/d", "目录").unwrap();
+        let id = upsert(&db, root, "/tmp/d/a.md", Kind::Document);
+        let chunks = db.sync_chunks(id, &["甲".into(), "乙".into()]).unwrap();
+        let (a, b) = (chunks[0].0, chunks[1].0);
+
+        db.mark_units_failed(&[(EmbedRowKind::Chunk, b)], "超时").unwrap();
+        let sum = db.unit_summary(id, 3).unwrap();
+        assert_eq!((sum.total, sum.persisted, sum.exhausted, sum.retryable), (2, 0, 0, 1), "一个单元失败且可重试");
+        assert_eq!(sum.error.as_deref(), Some("超时"));
+
+        // 剩余单元成功后整份文件聚合为 done。
+        let ra = db.reserve_vec_row(EmbedRowKind::Chunk, a, id).unwrap();
+        db.activate_vec_rows(&[ra]).unwrap();
+        db.mark_units_persisted(&[(EmbedRowKind::Chunk, a)]).unwrap();
+        let rb = db.reserve_vec_row(EmbedRowKind::Chunk, b, id).unwrap();
+        db.activate_vec_rows(&[rb]).unwrap();
+        db.mark_units_persisted(&[(EmbedRowKind::Chunk, b)]).unwrap();
+        let sum = db.unit_summary(id, 3).unwrap();
+        assert_eq!((sum.total, sum.persisted, sum.exhausted), (2, 2, 0), "全部持久化");
+        assert!(sum.error.is_none(), "成功要清掉旧错误");
+
+        // 重试计数到上限即视为耗尽。
+        for _ in 0..3 {
+            db.mark_units_failed(&[(EmbedRowKind::Chunk, a)], "持续失败").unwrap();
+        }
+        let sum = db.unit_summary(id, 3).unwrap();
+        assert_eq!((sum.exhausted, sum.retryable), (1, 0));
+        assert_eq!(sum.error.as_deref(), Some("持续失败"));
     }
 }

@@ -122,18 +122,20 @@ fn parse_key(k: &str) -> Option<(EmbedRowKind, i64, i64)> {
 /// `(row, bytes)` pairs destined for the vector file, in response order.
 type VectorWrites = Vec<(usize, Vec<f32>)>;
 
-/// One file's share of an embed response: how many of its units produced a usable
-/// vector, and the first failure reason if any unit did not.
+/// One file's share of an embed response, resolved to concrete units: which units
+/// produced a usable vector (`ok_units`: target, ref_id, row) and which did not
+/// (`failed_units`: target, ref_id), plus the first failure reason.
 #[derive(Debug, PartialEq)]
 struct FileOutcome {
     file_id: i64,
-    ok: usize,
+    ok_units: Vec<(EmbedRowKind, i64, i64)>,
+    failed_units: Vec<(EmbedRowKind, i64)>,
     total: usize,
     err: Option<String>,
 }
 
 /// Validate an embed response against the reserved keys and split it into rows to
-/// persist and rows to publish. Pure, so the whole failure matrix — malformed key,
+/// persist and units to publish. Pure, so the whole failure matrix — malformed key,
 /// duplicate row, wrong dimension, NaN/Inf, missing key — is testable without a sidecar
 /// (P0-02). A rejected unit keeps only its staged row: the mapping is never activated,
 /// so search can never see a mapping that points at bytes nobody wrote.
@@ -148,15 +150,18 @@ fn place_vectors(
     let mut outcomes = Vec::with_capacity(per_file.len());
     let mut claimed: std::collections::HashSet<i64> = std::collections::HashSet::new();
     for (file_id, keys) in per_file {
-        let mut ok = 0usize;
+        let mut ok_units: Vec<(EmbedRowKind, i64, i64)> = Vec::new();
+        let mut failed_units: Vec<(EmbedRowKind, i64)> = Vec::new();
         let mut err: Option<String> = None;
         for k in keys {
-            let Some((_target, row, _ref)) = parse_key(k) else {
+            let Some((target, row, ref_id)) = parse_key(k) else {
                 err = err.or_else(|| Some(format!("向量键格式错误 {k}")));
+                failed_units.push((target_of(k), ref_of(k)));
                 continue;
             };
             if row < 0 {
                 err = err.or_else(|| Some(format!("向量行号 {row} 非法")));
+                failed_units.push((target, ref_id));
                 continue;
             }
             // Two keys addressing one row is a sidecar protocol bug: the later one would
@@ -165,29 +170,43 @@ fn place_vectors(
             // whether the first claim carried usable bytes.
             if !claimed.insert(row) {
                 err = err.or_else(|| Some(format!("向量行 {row} 被多个键占用")));
+                failed_units.push((target, ref_id));
                 continue;
             }
             let Some(v) = vectors.get(k) else {
                 err = err.or_else(|| Some(errors.get(k).cloned().unwrap_or_else(|| "模型未返回向量".into())));
+                failed_units.push((target, ref_id));
                 continue;
             };
             let mut v = v.clone();
             if v.len() != dim {
                 err = err.or_else(|| Some(format!("向量维度 {} 不符", v.len())));
+                failed_units.push((target, ref_id));
                 continue;
             }
             if !v.iter().all(|x| x.is_finite()) {
                 err = err.or_else(|| Some("向量包含 NaN/Inf".into()));
+                failed_units.push((target, ref_id));
                 continue;
             }
             normalize(&mut v);
             writes.push((row as usize, v));
             rows.push(row);
-            ok += 1;
+            ok_units.push((target, ref_id, row));
         }
-        outcomes.push(FileOutcome { file_id: *file_id, ok, total: keys.len(), err });
+        outcomes.push(FileOutcome { file_id: *file_id, ok_units, failed_units, total: keys.len(), err });
     }
     (writes, rows, outcomes)
+}
+
+/// Best-effort (target, ref) recovery from a malformed key, so the failure still lands
+/// on some unit instead of being silently dropped.
+fn target_of(key: &str) -> EmbedRowKind {
+    key.split(':').next().map(EmbedRowKind::parse).unwrap_or(EmbedRowKind::Image)
+}
+
+fn ref_of(key: &str) -> i64 {
+    key.split(':').nth(2).and_then(|s| s.parse().ok()).unwrap_or(-1)
 }
 
 impl Indexer {
@@ -502,16 +521,9 @@ impl Indexer {
             place_vectors(&resp.vectors, &resp.errors, &per_file, self.settings.vector_dim);
         let mut states = Vec::new();
         for fo in &outcomes {
-            if fo.ok > 0 {
-                let note = fo.err.clone().filter(|_| fo.ok < fo.total);
-                states.push((fo.file_id, FileState::Done, note));
-                out.done += 1;
-                out.vectors += fo.ok as u64;
-            } else {
-                let msg = fo.err.clone().unwrap_or_else(|| "模型未返回向量".into());
-                states.push((fo.file_id, FileState::Failed, Some(msg)));
-                out.failed += 1;
-            }
+            out.vectors += fo.ok_units.len() as u64;
+            let msg = fo.err.clone().unwrap_or_else(|| "模型未返回向量".into());
+            states.push((fo.file_id, msg, fo));
         }
 
         if !writes.is_empty() {
@@ -522,11 +534,23 @@ impl Indexer {
                 store.flush()?;
             }
         }
-        // Bytes are durable — publish rows, then file states. Both sit behind the
-        // search-visibility gate (alive=1 AND state='done'), so a crash between these
-        // steps can expose neither a staged row nor a vector-less done file.
+        // Bytes are durable — publish rows, then unit states, then file states. All sit
+        // behind the search-visibility gate (alive=1 AND state='done'), so a crash
+        // between these steps can expose neither a staged row nor a vector-less done
+        // file. Failed units keep their state and get retried individually (P0-03).
         self.db.activate_vec_rows(&rows)?;
-        for (file_id, state, note) in states {
+        for (file_id, msg, fo) in states {
+            let ok_units: Vec<(EmbedRowKind, i64)> = fo.ok_units.iter().map(|(t, r, _)| (*t, *r)).collect();
+            self.db.mark_units_persisted(&ok_units)?;
+            if !fo.failed_units.is_empty() {
+                self.db.mark_units_failed(&fo.failed_units, &msg)?;
+            }
+            let (state, note) = aggregate_file_state(&self.db, file_id, fo)?;
+            match state {
+                FileState::Done => out.done += 1,
+                FileState::Failed => out.failed += 1,
+                _ => {}
+            }
             self.db.set_file_state(file_id, state, note.as_deref())?;
         }
         for (k, thumb) in &resp.thumbs {
@@ -554,6 +578,11 @@ impl Indexer {
         if !want_vectors {
             // an image without a model carries only metadata, so nothing is searchable
             return Err(Error::Unsupported("未启用图片语义索引".into()));
+        }
+        // The image's single unit is the file itself: an activated vector row means this
+        // unit is already persisted — do not re-encode an unchanged picture (P0-03).
+        if self.db.has_active_vector(EmbedRowKind::Image, f.id)? {
+            return Ok(Prepared::Indexed);
         }
         let row = self.db.reserve_vec_row(EmbedRowKind::Image, f.id, f.id)?;
         let k = key(row, EmbedRowKind::Image, f.id);
@@ -587,14 +616,18 @@ impl Indexer {
         if clips.is_empty() {
             return Ok(Prepared::Skip("时长过短".into()));
         }
-        let rows = self.db.insert_clips(f.id, &clips)?;
-        let mut items = Vec::with_capacity(rows.len());
-        let mut keys = Vec::with_capacity(rows.len());
-        for (clip_id, ord) in &rows {
-            let (start, end) = clips[*ord];
-            let row = self.db.reserve_vec_row(EmbedRowKind::Clip, *clip_id, f.id)?;
-            let k = key(row, EmbedRowKind::Clip, *clip_id);
-            let thumb = self.paths.clip_thumb_path(f.id, *clip_id);
+        self.db.sync_clips(f.id, &clips)?;
+        // Per-unit retry: only clips without a persisted vector are embedded this pass.
+        let todo = self.db.clips_needing_embed(f.id)?;
+        if todo.is_empty() {
+            return Ok(Prepared::Indexed);
+        }
+        let mut items = Vec::with_capacity(todo.len());
+        let mut keys = Vec::with_capacity(todo.len());
+        for (clip_id, start, end) in todo {
+            let row = self.db.reserve_vec_row(EmbedRowKind::Clip, clip_id, f.id)?;
+            let k = key(row, EmbedRowKind::Clip, clip_id);
+            let thumb = self.paths.clip_thumb_path(f.id, clip_id);
             items.push(EmbedItem::Video {
                 key: k.clone(),
                 path: f.path.clone(),
@@ -635,15 +668,20 @@ impl Indexer {
         if chunks.is_empty() {
             return Ok(Prepared::Indexed);
         }
-        let rows = self.db.insert_chunks(f.id, &chunks)?;
-        let mut items = Vec::with_capacity(rows.len());
-        let mut keys = Vec::with_capacity(rows.len());
-        for ((chunk_id, _ord), body) in rows.iter().zip(chunks.iter()) {
-            let row = self.db.reserve_vec_row(EmbedRowKind::Chunk, *chunk_id, f.id)?;
-            let k = key(row, EmbedRowKind::Chunk, *chunk_id);
+        self.db.sync_chunks(f.id, &chunks)?;
+        // Per-unit retry: chunks already persisted are not re-embedded (P0-03).
+        let todo = self.db.chunks_needing_embed(f.id)?;
+        if todo.is_empty() {
+            return Ok(Prepared::Indexed);
+        }
+        let mut items = Vec::with_capacity(todo.len());
+        let mut keys = Vec::with_capacity(todo.len());
+        for (chunk_id, body) in todo {
+            let row = self.db.reserve_vec_row(EmbedRowKind::Chunk, chunk_id, f.id)?;
+            let k = key(row, EmbedRowKind::Chunk, chunk_id);
             items.push(EmbedItem::Text {
                 key: k.clone(),
-                text: body.clone(),
+                text: body,
                 title: title.clone().or_else(|| Some(f.name.clone())),
                 role: "document".into(),
             });
@@ -655,6 +693,43 @@ impl Indexer {
 
 fn path_str(p: &Path) -> String {
     p.to_string_lossy().to_string()
+}
+
+/// How many attempts a unit gets before its file stops re-queueing and reports the
+/// failure with the recorded reason. A manual re-index resets the counters.
+const UNIT_RETRY_MAX: i64 = 3;
+
+/// Fold unit states into the file-level state (P0-03). A file is `done` only when every
+/// unit is persisted; retryable failures re-queue it as `stale` with an explanatory
+/// note, exhausted failures surface as a diagnosable `failed`. Image files have no unit
+/// rows — their single unit is the file itself, decided by whether this pass produced
+/// its vector.
+fn aggregate_file_state(db: &Db, file_id: i64, fo: &FileOutcome) -> Result<(FileState, Option<String>)> {
+    let sum = db.unit_summary(file_id, UNIT_RETRY_MAX)?;
+    let total = sum.total;
+    let persisted = sum.persisted;
+    let exhausted = sum.exhausted;
+    let unit_err = sum.error;
+    if total == 0 {
+        return Ok(if fo.ok_units.is_empty() {
+            (FileState::Failed, Some(fo.err.clone().unwrap_or_else(|| "模型未返回向量".into())))
+        } else {
+            (FileState::Done, None)
+        });
+    }
+    if exhausted > 0 {
+        let detail = unit_err.unwrap_or_else(|| "嵌入失败".into());
+        return Ok((
+            FileState::Failed,
+            Some(format!("{exhausted}/{total} 个片段重复失败（已重试 {UNIT_RETRY_MAX} 次）：{detail}")),
+        ));
+    }
+    if persisted == total {
+        return Ok((FileState::Done, None));
+    }
+    let waiting = total - persisted;
+    let detail = fo.err.clone().or(unit_err).unwrap_or_else(|| "嵌入失败".into());
+    Ok((FileState::Stale, Some(format!("{persisted}/{total} 个片段已索引，{waiting} 个待重试：{detail}"))))
 }
 
 /// Re-pack the vector file, dropping rows of deleted or re-indexed files (P0-01).
@@ -973,9 +1048,9 @@ mod tests {
         let h = harness();
         h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
         let video = add_doc(&h, "clip.mp4", "placeholder");
-        let clips = h.db.insert_clips(video.id, &[(0.0, 1.0)]).unwrap();
+        let clips = h.db.sync_clips(video.id, &[(0.0, 1.0)]).unwrap();
         let old = h.db.reserve_vec_row(EmbedRowKind::Clip, clips[0].0, video.id).unwrap();
-        let replacement = h.db.insert_clips(video.id, &[(0.0, 2.0)]).unwrap();
+        let replacement = h.db.sync_clips(video.id, &[(0.0, 2.0)]).unwrap();
         let next = h.db.reserve_vec_row(EmbedRowKind::Clip, replacement[0].0, video.id).unwrap();
         assert!(next > old);
         // 预留即 staging（alive=0）：旧行作废 + 新行未激活，两行都还不可搜索。
@@ -1169,8 +1244,8 @@ mod tests {
 
         assert_eq!(writes, vec![(0, vec![1.0, 0.0])]);
         assert_eq!(rows, vec![0]);
-        assert_eq!(outcomes[0], FileOutcome { file_id: 11, ok: 1, total: 2, err: Some("解码失败".into()) });
-        assert_eq!(outcomes[1], FileOutcome { file_id: 12, ok: 0, total: 1, err: Some("模型未返回向量".into()) });
+        assert_eq!(outcomes[0], FileOutcome { file_id: 11, ok_units: vec![(EmbedRowKind::Image, 1, 0)], failed_units: vec![(EmbedRowKind::Image, 2)], total: 2, err: Some("解码失败".into()) });
+        assert_eq!(outcomes[1], FileOutcome { file_id: 12, ok_units: vec![], failed_units: vec![(EmbedRowKind::Image, 3)], total: 1, err: Some("模型未返回向量".into()) });
     }
 
     #[test]
@@ -1193,10 +1268,10 @@ mod tests {
         // 22 与 23 的正常向量被接受；21 维度/NaN 被拒；24 抢行失败。
         assert_eq!(writes.len(), 3);
         assert_eq!(rows, vec![2, 3, 4]);
-        assert_eq!(outcomes[0].ok, 0);
+        assert!(outcomes[0].ok_units.is_empty());
         assert_eq!(outcomes[0].err, Some("向量维度 3 不符".into()));
-        assert_eq!(outcomes[1].ok, 1);
-        assert_eq!(outcomes[2].ok, 2, "正常文件不受别的键影响");
+        assert_eq!(outcomes[1].ok_units.len(), 1);
+        assert_eq!(outcomes[2].ok_units.len(), 2, "正常文件不受别的键影响");
         assert_eq!(outcomes[3].err.as_deref(), Some("向量行 2 被多个键占用"));
     }
 
@@ -1220,5 +1295,102 @@ mod tests {
 
     fn errors_empty() -> std::collections::HashMap<String, String> {
         std::collections::HashMap::new()
+    }
+
+    // ------------------------------------------ P0-03: 单元级状态与文件级聚合
+
+    /// prepare 只把「还没有持久化向量」的片段交给推理：已持久化的不重复编码，
+    /// 失败过的独立重试。
+    #[test]
+    fn prepare_text_queues_only_unpersisted_chunks() {
+        let h = harness();
+        h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
+        let doc = add_doc(&h, "big.md", &"海边的日落。".repeat(300));
+        let (idx, _rx) = indexer(&h, text_settings());
+        let rec = h.db.file(doc.id).unwrap();
+
+        let Prepared::Embed { items, .. } = idx.prepare_text(&rec, true).unwrap() else {
+            panic!("首次应该产出嵌入任务");
+        };
+        let first_count = items.len();
+        assert!(first_count > 1, "{first_count} 个片段");
+
+        // 全部持久化后再 prepare：无事可做。
+        let units: Vec<(EmbedRowKind, i64)> =
+            h.db.chunk_rows(doc.id).unwrap().into_iter().map(|(id, _)| (EmbedRowKind::Chunk, id)).collect();
+        h.db.mark_units_persisted(&units).unwrap();
+        assert!(matches!(idx.prepare_text(&rec, true).unwrap(), Prepared::Indexed));
+
+        // 只让一个片段失败：下一次 prepare 只包含它。
+        h.db.mark_units_failed(&[(EmbedRowKind::Chunk, units[0].1)], "超时").unwrap();
+        let Prepared::Embed { items, keys } = idx.prepare_text(&rec, true).unwrap() else {
+            panic!("有失败片段时应该产出嵌入任务");
+        };
+        assert_eq!(items.len(), 1, "只重试失败的片段");
+        assert_eq!(keys.len(), 1);
+    }
+
+    /// 文件级状态由单元终态聚合：全持久化=done，可重试失败=stale（带解释），
+    /// 重试耗尽=failed（带原因），图片（无单元行）按本轮结果判定。
+    #[test]
+    fn file_state_aggregates_from_units() {
+        let h = harness();
+        h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
+        let doc = add_doc(&h, "agg.md", &"山间的雾。".repeat(80));
+        let chunks = h.db.sync_chunks(doc.id, &["一".into(), "二".into(), "三".into()]).unwrap();
+        let ids: Vec<i64> = chunks.iter().map(|(id, _)| *id).collect();
+        let outcome = |ok: usize| FileOutcome {
+            file_id: doc.id,
+            ok_units: ids[..ok].iter().map(|id| (EmbedRowKind::Chunk, *id, *id)).collect(),
+            failed_units: ids[ok..].iter().map(|id| (EmbedRowKind::Chunk, *id)).collect(),
+            total: ids.len(),
+            err: Some("解码失败".into()),
+        };
+
+        // 0 成功 + 全部可重试 → stale，note 说明进度与原因
+        h.db
+            .mark_units_failed(&[(EmbedRowKind::Chunk, ids[0]), (EmbedRowKind::Chunk, ids[1]), (EmbedRowKind::Chunk, ids[2])], "解码失败")
+            .unwrap();
+        let (state, note) = aggregate_file_state(&h.db, doc.id, &outcome(0)).unwrap();
+        assert_eq!(state, FileState::Stale);
+        assert!(note.as_deref().unwrap_or_default().contains("0/3"), "{note:?}");
+
+        // 全部持久化 → done
+        h.db
+            .mark_units_persisted(&[(EmbedRowKind::Chunk, ids[0]), (EmbedRowKind::Chunk, ids[1]), (EmbedRowKind::Chunk, ids[2])])
+            .unwrap();
+        let (state, note) = aggregate_file_state(&h.db, doc.id, &outcome(3)).unwrap();
+        assert_eq!(state, FileState::Done);
+        assert!(note.is_none());
+
+        // 重试耗尽 → failed，带稳定原因
+        for _ in 0..UNIT_RETRY_MAX {
+            h.db.mark_units_failed(&[(EmbedRowKind::Chunk, ids[0])], "持续超时").unwrap();
+        }
+        let (state, note) = aggregate_file_state(&h.db, doc.id, &outcome(2)).unwrap();
+        assert_eq!(state, FileState::Failed);
+        let note = note.unwrap_or_default();
+        assert!(note.contains("重复失败") && note.contains("持续超时"), "{note}");
+
+        // 图片：没有单元行，本轮产出向量即 done，否则 failed。
+        let img = add_doc(&h, "p.jpg", "placeholder");
+        let ok_img = FileOutcome {
+            file_id: img.id,
+            ok_units: vec![(EmbedRowKind::Image, img.id, 99)],
+            failed_units: vec![],
+            total: 1,
+            err: None,
+        };
+        assert_eq!(aggregate_file_state(&h.db, img.id, &ok_img).unwrap().0, FileState::Done);
+        let bad_img = FileOutcome {
+            file_id: img.id,
+            ok_units: vec![],
+            failed_units: vec![(EmbedRowKind::Image, img.id)],
+            total: 1,
+            err: Some("解码失败".into()),
+        };
+        let (state, note) = aggregate_file_state(&h.db, img.id, &bad_img).unwrap();
+        assert_eq!(state, FileState::Failed);
+        assert_eq!(note.as_deref(), Some("解码失败"));
     }
 }

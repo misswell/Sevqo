@@ -382,7 +382,7 @@ mod tests {
         }
         db.store_text(beach, Some("海边日落"), "照片记录了一次海边日落，天空很红", false).unwrap();
         db.store_text(code, Some("parser.rs"), "Rust parser for the search index", false).unwrap();
-        db.insert_clips(vid, &[(0.0, 12.0), (12.0, 24.0)]).unwrap();
+        db.sync_clips(vid, &[(0.0, 12.0), (12.0, 24.0)]).unwrap();
         let clips = db.clip_rows(vid).unwrap();
         let mut reserved: Vec<i64> = Vec::new();
         let clip_rows: Vec<(i64, usize)> = clips
@@ -397,7 +397,7 @@ mod tests {
         let img_row = db.reserve_vec_row(EmbedRowKind::Image, beach, beach).unwrap();
         reserved.push(img_row);
         let chunk_row = {
-            let cs = db.insert_chunks(code, &["Rust parser for the search index".into()]).unwrap();
+            let cs = db.sync_chunks(code, &["Rust parser for the search index".into()]).unwrap();
             let r = db.reserve_vec_row(EmbedRowKind::Chunk, cs[0].0, code).unwrap();
             reserved.push(r);
             r
