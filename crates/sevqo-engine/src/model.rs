@@ -10,30 +10,37 @@ use crate::{Error, Result};
 pub const MODEL_REPO: &str = "google/embeddinggemma-2";
 pub const MODEL_ID: &str = "embeddinggemma-2";
 
+/// 不可变模型版本（P0-04）：下载一律走 `/resolve/<revision>/`，上游不再能用 main
+/// 悄悄替换内容。固定前经 HF API 核对过该 commit 的文件树。
+pub const MODEL_REVISION: &str = "f9972ac22e696a105c482202646979e33e4b5a1e";
+
 #[derive(Debug, Clone, Copy)]
 pub struct ModelFile {
     pub path: &'static str,
     pub size: u64,
+    /// 来自上游的可信 SHA256（P0-04）：三个 LFS 大文件取自 HF tree API 在该 revision
+    /// 下登记的 LFS oid；其余小文件在 2026-11-05 从 `/resolve/<revision>/` 全量下载后
+    /// 计算并逐一复核。本地首次下载生成的哈希只作变化检测，从不当作信任依据。
+    pub sha256: &'static str,
 }
 
-/// Files required to load `SentenceTransformer(dir)` locally. Sizes come from the
-/// repository tree at pin time; the model is Apache-2.0 and ungated, so no token is
-/// ever needed.
+/// Files required to load `SentenceTransformer(dir)` locally. The model is Apache-2.0
+/// and ungated, so no token is ever needed.
 pub const FILES: &[ModelFile] = &[
-    ModelFile { path: "1_Pooling/config.json", size: 90 },
-    ModelFile { path: "2_Normalize/config.json", size: 97 },
-    ModelFile { path: "README.md", size: 21730 },
-    ModelFile { path: "chat_template.jinja", size: 1016 },
-    ModelFile { path: "config.json", size: 4455 },
-    ModelFile { path: "config_sentence_transformers.json", size: 1565 },
-    ModelFile { path: "modules.json", size: 413 },
-    ModelFile { path: "preprocessor_config.json", size: 511 },
-    ModelFile { path: "processor_config.json", size: 1788 },
-    ModelFile { path: "sentence_bert_config.json", size: 747 },
-    ModelFile { path: "tokenizer_config.json", size: 1599 },
-    ModelFile { path: "tokenizer.model", size: 4_689_013 },
-    ModelFile { path: "tokenizer.json", size: 32_170_510 },
-    ModelFile { path: "model.safetensors", size: 1_488_915_288 },
+    ModelFile { path: "1_Pooling/config.json", size: 90, sha256: "8759bdf7c77efc7df7723f64856a593c8943b71ee38baf2a88771fbaf78438f9" },
+    ModelFile { path: "2_Normalize/config.json", size: 97, sha256: "cdb09dfca347a56aa2d691744e38d5ad3c7cbc2834e7181272b9a15328b82524" },
+    ModelFile { path: "README.md", size: 22_234, sha256: "2c058c304c68221f1de80979594036eff3972b2bce686bb7b0f43621a6b0b011" },
+    ModelFile { path: "chat_template.jinja", size: 1016, sha256: "4b852efc0b9960283e735363331e6f325b33bc74bdbaa076f595bc4e9b94d85e" },
+    ModelFile { path: "config.json", size: 4455, sha256: "b8f1e9931b57fbc054acdb445c41765d55b0074c58d145fa82839941ad1b5bb3" },
+    ModelFile { path: "config_sentence_transformers.json", size: 1565, sha256: "031e56a498d33c349ab489a21885bcfe25b4fcba841149dc99e1e90d4a7c28f5" },
+    ModelFile { path: "modules.json", size: 413, sha256: "3d02572a0455b832de67fb8e63a54981bc7e8b46e337c95e917bd8122a533bfd" },
+    ModelFile { path: "preprocessor_config.json", size: 511, sha256: "ea2ae257e901064abdd98dceb19f2b0da06af600bed15e0f99f5c85c37ee9d78" },
+    ModelFile { path: "processor_config.json", size: 1788, sha256: "168f6a08522f3ce5dea596d94d003af2fd691742d4f41fe1f9d8cce76bfbf69c" },
+    ModelFile { path: "sentence_bert_config.json", size: 747, sha256: "b1bcd9f2dce3ae863b359e87d0710b5dbc3314a59ecb4e2f97c7778fc8e4b228" },
+    ModelFile { path: "tokenizer_config.json", size: 1599, sha256: "17bd5d6e9364ca49a534e1502076593317c298d4a663623091ed45388f004874" },
+    ModelFile { path: "tokenizer.model", size: 4_689_013, sha256: "e594c8a90eb08d8bda498ff4747977dc827ae0c3c56b5c0d41a605a22d02ef03" },
+    ModelFile { path: "tokenizer.json", size: 32_170_510, sha256: "4d777ef5bdc1aa36227abdfb77c3e49e7b9c892d16e1b6bda41c393504828be4" },
+    ModelFile { path: "model.safetensors", size: 1_488_915_288, sha256: "197a32965d4b1105faf060417baa899e193fb73cd401f42ec9295234d5553d79" },
 ];
 
 pub fn total_bytes() -> u64 {
@@ -44,6 +51,8 @@ pub fn total_bytes() -> u64 {
 #[serde(rename_all = "camelCase")]
 pub struct ModelStatus {
     pub dir: String,
+    /// 本构建信任的 manifest 版本；status 里带出来供界面/诊断对照。
+    pub revision: &'static str,
     pub present: usize,
     pub total_files: usize,
     pub complete: bool,
@@ -84,6 +93,7 @@ pub fn status(dir: &Path) -> ModelStatus {
     }
     ModelStatus {
         dir: dir.display().to_string(),
+        revision: MODEL_REVISION,
         present,
         total_files: FILES.len(),
         complete: missing.is_empty(),
@@ -111,7 +121,13 @@ pub struct DownloadProgress {
 }
 
 fn url(endpoint: &str, path: &str) -> String {
-    format!("{}/{}/resolve/main/{}?download=true", endpoint.trim_end_matches('/'), MODEL_REPO, path)
+    format!(
+        "{}/{}/resolve/{}/{}?download=true",
+        endpoint.trim_end_matches('/'),
+        MODEL_REPO,
+        MODEL_REVISION,
+        path
+    )
 }
 
 fn sha256_of(path: &Path) -> Result<String> {
@@ -148,11 +164,15 @@ struct Fetch<'a> {
 }
 
 impl<'a> Fetch<'a> {
-    /// Range-resume one file. Returns Err only after exhausting `attempts`.
+    /// Range-resume one file. Returns Err only after exhausting `attempts`. The download
+    /// only replaces the target file after its SHA256 matches the trusted manifest
+    /// (P0-04): a mismatch deletes the `.part` and retries from scratch, and any existing
+    /// file is left untouched until a verified replacement exists.
     fn one(
         &self,
         rel: &str,
         size: u64,
+        expected_sha: &str,
         attempts: usize,
         cancel: &AtomicBool,
         on_progress: &mut dyn FnMut(DownloadProgress),
@@ -189,11 +209,24 @@ impl<'a> Fetch<'a> {
                     note: None,
                 })
             }) {
-                Ok(digest) => {
-                    std::fs::rename(&part_path, &final_path)?;
-                    remember_checksum(self.dir, rel, &digest);
-                    return Ok(());
-                }
+                Ok(digest) => match commit_verified(&part_path, &final_path, &digest, expected_sha) {
+                    Ok(()) => {
+                        remember_checksum(self.dir, rel, &digest);
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        last_err = e.to_string();
+                        let wait = (3 * (attempt as u64 + 1)).min(45);
+                        tracing::warn!("model fetch {rel} attempt {attempt} failed: {last_err}; retrying in {wait}s");
+                        let until = Instant::now() + Duration::from_secs(wait);
+                        while Instant::now() < until {
+                            if cancel.load(Ordering::Relaxed) {
+                                return Err(Error::Cancelled);
+                            }
+                            std::thread::sleep(Duration::from_millis(250));
+                        }
+                    }
+                },
                 Err(err) => {
                     last_err = err.to_string();
                     let wait = (3 * (attempt as u64 + 1)).min(45);
@@ -302,22 +335,20 @@ pub fn ensure(
         proxy.map(|s| s.trim()).filter(|s| !s.is_empty()),
     )?;
     let fetch = Fetch { client: &client, dir, endpoints: &endpoints };
-    let recorded = recorded_checksums(dir);
 
     let mut overall = 0u64;
     for (i, f) in FILES.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             return Err(Error::Cancelled);
         }
+        // 尺寸达标还不够：必须与 manifest 里的可信 SHA256 一致才算「已有」。
+        // 同尺寸损坏文件在这里被识别并触发重新下载——这就是一键修复的入口。
         let p = dir.join(f.path);
-        let size_ok = std::fs::metadata(&p).map(|m| m.len() == f.size).unwrap_or(false);
-        let checksum_ok = if size_ok {
-            match recorded.get(f.path).and_then(|v| v.as_str()) {
-                Some(want) => sha256_of(&p)? == want,
-                None => true,
-            }
-        } else { false };
-        if checksum_ok {
+        let cached = std::fs::metadata(&p)
+            .map(|m| m.len() == f.size)
+            .unwrap_or(false)
+            && sha256_of(&p).map(|got| got == f.sha256).unwrap_or(false);
+        if cached {
             overall += f.size;
             on_progress(DownloadProgress {
                 file: f.path.to_string(),
@@ -334,64 +365,96 @@ pub fn ensure(
             continue;
         }
         let base = overall;
-        fetch.one(f.path, f.size, 24, cancel, &mut |mut pr| {
+        fetch.one(f.path, f.size, f.sha256, 24, cancel, &mut |mut pr| {
             pr.overall_bytes = base + pr.done_bytes;
             on_progress(pr)
         }, i, base)?;
         overall += f.size;
     }
-    verify(dir)?;
+    // 每个文件都已单独通过 manifest 校验（缓存哈希比对、下载提交前比对），
+    // 不再对整个目录重复整轮哈希；需要全量复验时走 [`verify`]。
     Ok(())
 }
 
-/// Size check for everything, plus recorded checksums when we have them.
-fn recorded_checksums(dir: &Path) -> serde_json::Map<String, serde_json::Value> {
-    let idx = dir.join("checksums.json");
-    std::fs::read_to_string(&idx)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| v.as_object().cloned())
-        .unwrap_or_default()
+/// A download becomes the real file only when its digest matches the trusted manifest.
+/// On mismatch the `.part` is discarded (a resumed prefix can be corrupt) and the
+/// existing file — if any — is never touched (P0-04).
+fn commit_verified(part: &Path, final_path: &Path, digest: &str, expected_sha: &str) -> Result<()> {
+    if !digest.eq_ignore_ascii_case(expected_sha) {
+        let _ = std::fs::remove_file(part);
+        return Err(Error::Download(format!("SHA256 校验失败：期望 {expected_sha}，实际 {digest}")));
+    }
+    std::fs::rename(part, final_path)?;
+    Ok(())
 }
 
+/// Deep check against the trusted manifest: sizes *and* SHA256 for every file. This is
+/// what the manual "校验/修复模型" action and the startup background check run.
 pub fn verify(dir: &Path) -> Result<()> {
-    let recorded = recorded_checksums(dir);
     for f in FILES {
         let p = dir.join(f.path);
         let m = std::fs::metadata(&p).map_err(|_| Error::Download(format!("缺少 {}", f.path)))?;
         if m.len() != f.size {
-            return Err(Error::Download(format!("{} 大小不符", f.path)));
+            return Err(Error::Download(format!("{} 大小不符（期望 {} 字节，实际 {}）", f.path, f.size, m.len())));
         }
-        if let Some(serde_json::Value::String(want)) = recorded.get(f.path) {
-            let got = sha256_of(&p)?;
-            if &got != want {
-                return Err(Error::Download(format!("{} 校验失败，请重新下载模型", f.path)));
-            }
+        let got = sha256_of(&p)?;
+        if got != f.sha256 {
+            return Err(Error::Download(format!("{} 校验失败，内容与可信清单不符，请修复模型", f.path)));
         }
     }
     Ok(())
-}
-
-pub fn model_dir_marker(dir: &Path) -> PathBuf {
-    dir.join("checksums.json")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// 同尺寸损坏必须被识破：本地没有、也不需要任何「首次下载记录」——manifest 里的
+    /// 可信 SHA256 就是唯一依据；校验失败绝不删除用户文件。
     #[test]
-    fn verification_never_deletes_a_corrupt_user_model_file() {
+    fn verification_detects_same_size_corruption_and_keeps_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let first = &FILES[0];
         let path = dir.path().join(first.path);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let bytes = vec![b'x'; first.size as usize];
         std::fs::write(&path, &bytes).unwrap();
-        let recorded = std::collections::HashMap::from([(first.path, "incorrect")]);
-        std::fs::write(dir.path().join("checksums.json"), serde_json::to_vec(&recorded).unwrap()).unwrap();
         assert!(verify(dir.path()).unwrap_err().to_string().contains("校验失败"));
-        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        assert_eq!(std::fs::read(path).unwrap(), bytes, "校验失败不得删文件");
+    }
+
+    /// manifest 本身的健全性：每个文件都有 64 位十六进制哈希，revision 是 40 位
+    /// 十六进制。写错一格就会让所有下载永远失败，所以钉在这里。
+    #[test]
+    fn manifest_entries_are_well_formed() {
+        assert_eq!(MODEL_REVISION.len(), 40);
+        assert!(MODEL_REVISION.bytes().all(|b| b.is_ascii_hexdigit()));
+        for f in FILES {
+            assert!(f.size > 0, "{}", f.path);
+            assert_eq!(f.sha256.len(), 64, "{}", f.path);
+            assert!(f.sha256.bytes().all(|b| b.is_ascii_hexdigit()), "{}", f.path);
+        }
+    }
+
+    /// 下载只在哈希与可信清单一致时才替换目标文件；不一致时丢弃 .part、
+    /// 保留原文件。
+    #[test]
+    fn a_download_commits_only_after_the_digest_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let part = dir.path().join("f.part");
+        let final_path = dir.path().join("f.bin");
+        std::fs::write(&part, b"corrupt bytes").unwrap();
+        std::fs::write(&final_path, b"original").unwrap();
+
+        let err = commit_verified(&part, &final_path, "deadbeef", "cafebabe").unwrap_err();
+        assert!(err.to_string().contains("校验失败"), "{err}");
+        assert!(!part.exists(), "校验失败的 .part 必须丢弃");
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"original", "原文件不得被动过");
+
+        std::fs::write(&part, b"good bytes").unwrap();
+        commit_verified(&part, &final_path, "cafebabe", "CAFEBABE").unwrap();
+        assert!(!part.exists());
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"good bytes");
     }
 
     fn placeholder(dir: &Path, rel: &str, len: u64) {
@@ -401,11 +464,12 @@ mod tests {
     }
 
     #[test]
-    fn url_survives_a_trailing_slash_in_the_endpoint() {
+    fn url_pins_the_revision_not_main() {
         assert_eq!(
             url("https://hf-mirror.com/", "1_Pooling/config.json"),
-            "https://hf-mirror.com/google/embeddinggemma-2/resolve/main/1_Pooling/config.json?download=true"
+            format!("https://hf-mirror.com/google/embeddinggemma-2/resolve/{MODEL_REVISION}/1_Pooling/config.json?download=true")
         );
+        assert!(!url("https://huggingface.co", "x").contains("/resolve/main/"), "绝不追着 main 下载");
     }
 
     #[test]

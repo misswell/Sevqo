@@ -835,8 +835,9 @@ pub fn model_download_start(app: AppHandle) -> Res<()> {
 /// dead-ending silently, while the launch path stays quiet.
 pub fn spawn_model_download(st: Arc<AppState>, app: AppHandle, announce: bool) -> Res<()> {
     // 拉权重只是按镜像端点下文件，跟 Python 没关系；只有推理才需要解释器。
-    if model::status(&st.paths.model_dir).complete {
-        st.set_model_ready(true);
+    // 短路条件是「本轮已通过完整性校验」，不是尺寸齐了——同尺寸损坏文件正是
+    // 要靠这一步的哈希比对发现并修复（P0-04）。
+    if st.model_ready() && model::status(&st.paths.model_dir).complete {
         if announce {
             let note = if st.has_python() {
                 "模型已就绪，可以开始语义检索"
@@ -853,6 +854,8 @@ pub fn spawn_model_download(st: Arc<AppState>, app: AppHandle, announce: bool) -
     if !st.try_begin_download() {
         return Err("模型已在下载中".to_string());
     }
+    // 注意：这里不再直接 set_model_ready(true)。完整性校验在 ensure() 内逐文件做，
+    // 全部通过后由下载线程置位。
     st.download_cancel.store(false, Ordering::SeqCst);
     let cancel = st.download_cancel.clone();
     let endpoints = st.settings().model_endpoints.clone();

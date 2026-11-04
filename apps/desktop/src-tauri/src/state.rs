@@ -45,16 +45,14 @@ impl AppState {
         let has_python = sevqo_engine::infer::python_binary(&settings, None).is_some();
         let need_vision = settings.index_images || settings.index_video;
         let client = Client::new(&paths, &settings);
-        let status = sevqo_engine::model::status(&paths.model_dir);
-        // 按字段注释的含义来：model_ready 只说「权重齐了」，能不能推理由 can_infer 加上 Python 判断。
-        // 之前在这里混入 has_python，会和 reseed() 的口径不一致，导致没配 Python 时误判成「权重还缺」。
-        let ready = status.complete;
+        // P0-04：model_ready 不再由文件尺寸决定——启动后台完整性校验（哈希比对可信
+        // manifest）通过后才会置位；在那之前推理入口保持关闭，避免对损坏权重发起推理。
         let vector_path = paths.vector_path.clone();
         AppState {
             client: Mutex::new(Arc::new(client)),
             has_python: AtomicBool::new(has_python),
-            model_ready: AtomicBool::new(ready),
-            vision_ready: AtomicBool::new(ready && need_vision),
+            model_ready: AtomicBool::new(false),
+            vision_ready: AtomicBool::new(false),
             paths,
             settings: Mutex::new(settings),
             db,
@@ -89,7 +87,7 @@ impl AppState {
         let old = std::mem::replace(&mut *self.client.lock().expect("推理配置锁已中毒"), next);
         old.shutdown();
         self.has_python.store(sevqo_engine::infer::python_binary(cfg, None).is_some(), Ordering::Relaxed);
-        self.set_model_ready(sevqo_engine::model::status(&self.paths.model_dir).complete);
+        // model_ready 不在这里按尺寸翻转：它只由完整性校验或下载成功置位（P0-04）。
     }
 
     pub fn set_model_ready(&self, v: bool) {
