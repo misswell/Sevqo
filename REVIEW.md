@@ -88,3 +88,46 @@
 | 补丁格式 `git diff --check` | 通过 |
 
 被忽略的测试仍需正式发布脚本产出的签名更新包。Python sidecar 本轮零改动，`inference/.venv` 不在本 checkout，视频采样回归未重跑。本轮改动未发版；发版走既有 `v*` 标签流水线。
+
+## 2026-11-05 Sprint A：索引数据正确性与崩溃恢复（P0 全项）
+
+按《Sevqo 完整实施任务书》（2026-11-04，基线 `e8bdbc1`）的 Sprint A 执行。五个 P0 任务全部实施并各自独立提交。
+
+### 本轮修复
+
+| 任务 | 内容 | 提交 |
+| --- | --- | --- |
+| P0-05 | mmap 边界保护：头信息/行号全部 checked 运算，溢出头与半截头、坏 magic 显式报错不再静默当作空库；`MmapView::row` 先验证 `row < header 行数` 再进入 unsafe；`Store::put_many/row/compact` 拒绝异常行号 | `f4f49b8` |
+| P0-02 | 向量行三步协议：reserve 只建 staging 行（alive=0），`put_many + fsync` 后 `activate_vec_rows` 发布映射；嵌入响应校验抽成纯函数 place_vectors（坏键/负行号/跨键抢行/维度不符/NaN/Inf/缺 key 全部拦下）；激活幂等 | `9d0696f` |
+| P0-01 | 向量压缩 generation 协议：活动文件带 `vectors.gNNNNNN.f32` 编号，SQLite meta 记录活动 generation/行数/维度/压缩时 SHA256；压缩流式写新代文件→fsync→原子 rename→单事务提交行号重映射+代翻转→清理旧代。提交前崩溃=旧代有效+孤儿清理；提交后崩溃=新代有效。启动一致性检查（缺失/截断/维度/SHA256 不符显式报错）。旧 `vectors.f32` 首次解析收编为 generation 1。无可回收行时压缩跳过 | `3ee9081` |
+| P0-03 | chunk/clip 级索引状态 + migration：正式迁移框架（逐版本、迁移前 `VACUUM INTO` 备份、每步独立事务、高版本拒绝打开）；v1→v2 给 chunk/clip 加 status/retry_count/error，已激活向量=persisted、其余回 pending，带未完成单元的 done 文件回 stale；sync_chunks/sync_clips 保留未变单元的状态；prepare 只取未持久化单元；文件状态由单元终态聚合（全持久化=done，可重试失败=stale 带「N/M 片段」解释，重试 3 次耗尽=failed 带原因）；响应按单元记账 | `ede653c` |
+| P0-04 | 模型可信 manifest：固定 revision `f9972ac2`（下载 URL 不再追 main）；每个文件内置上游可信 SHA256（3 个 LFS 大文件取自 HF tree API 的 LFS oid，其余从 pinned revision 下载复核）；下载先验后换（SHA 一致才原子替换，不一致丢 .part 重试、绝不删旧文件）；verify 按 manifest 全量校验，本地 checksums.json 降级为诊断；model_ready 不再由尺寸置位——启动后台完整性校验通过才 Ready；ModelStatus 暴露 revision | `374a14c` |
+
+### 兼容性说明
+
+- **数据库**：v1 索引首次打开自动迁移到 v2，迁移前在同目录生成 `index.bak-v1.sqlite` 一致性备份；带未完成单元的 done 文件会回队列补嵌入。更高版本数据库拒绝打开并提示升级程序。
+- **向量文件**：旧 `vectors.f32` 首次解析改名为 `vectors.g000001.f32`，内容不变；此后压缩产出新代文件，旧代在提交后清理。
+- **模型目录**：README.md 等小文件若与 pinned revision 不符会在下次启动自动重新下载（本机已验证：13/14 一致，README 按修复路径替换后 14/14 一致）。
+- 升级不需要删除任何索引、向量或模型文件。
+
+### 验证
+
+新增 30 条回归测试（迁移/代协议/单元状态/边界/manifest 等）。
+
+| 验证 | 结果 |
+| --- | --- |
+| Rust 引擎 `cargo test -p sevqo-engine --lib` | 122 通过，0 失败 |
+| 桌面壳 `cargo test -p sevqo-desktop --release` | 13 通过，0 失败，1 忽略 |
+| examples（smoke.rs）编译 | 通过 |
+| 前端 `npm run typecheck` 与 `npm run build` | 通过 |
+| manifest 对真实权重复验 | 14/14 SHA256 一致（model.safetensors 1.49GB 含内） |
+| `cargo clippy -p sevqo-engine --lib` | 本轮改动零新增警告（存量 13 条未动） |
+
+**未运行**：真实模型端到端 smoke（`inference/.venv` 不在本 checkout，Python sidecar 本轮零改动）；磁盘写满注入（协议上由 staging 保证「写失败不留有效映射」，未做真实盘满模拟）。
+
+### 已知限制与剩余任务
+
+- `cargo fmt` 全仓存在存量偏差（含本轮未触碰的文件），按任务书「不做无关重构」未统一格式化；建议引入 PR CI（P1-14）时做一次性 normalize 提交。
+- 部分索引文件的已持久化片段在文件级 done 之前不参与语义搜索（保守语义，沿用 v0.1.x 行为）。
+- 单元重试上限 3 次为代码内常量（`UNIT_RETRY_MAX`），尚未暴露为设置。
+- 任务书 Sprint B–F 未开始：启动对账、外置盘恢复、隐藏文件策略、RAM Budget 生效、视频有界流水线、FormatRegistry、PR CI 等。
