@@ -12,26 +12,30 @@ use std::time::Instant;
 
 use crate::db::Db;
 use crate::segment;
-use crate::vectors::MmapView;
+use crate::vectors::{active_vector_path, MmapView};
 use crate::{Channel, EmbedItem, Error, FileRecord, Hit, Moment, Result, SearchRequest, SearchResponse};
 
 const RRF_K: f64 = 60.0;
 
 pub struct Searcher {
     db: Arc<Db>,
-    vector_path: PathBuf,
+    /// The store's base path (`vectors.f32`); the file actually mapped is the active
+    /// generation resolved through the DB meta row (P0-01).
+    base: PathBuf,
     view: Option<MmapView>,
 }
 
 impl Searcher {
-    pub fn new(db: Arc<Db>, vector_path: &Path) -> Result<Searcher> {
-        let view = MmapView::open(vector_path)?;
-        Ok(Searcher { db, vector_path: vector_path.to_path_buf(), view })
+    pub fn new(db: Arc<Db>, vector_base: &Path) -> Result<Searcher> {
+        let path = active_vector_path(vector_base, &db)?;
+        let view = MmapView::open(&path)?;
+        Ok(Searcher { db, base: vector_base.to_path_buf(), view })
     }
 
-    /// Called after indexing so a search sees freshly appended rows.
+    /// Re-resolve the active generation (a compaction may have switched files) and remap.
     pub fn refresh(&mut self) -> Result<()> {
-        self.view = MmapView::open(&self.vector_path)?;
+        let path = active_vector_path(&self.base, &self.db)?;
+        self.view = MmapView::open(&path)?;
         Ok(())
     }
 

@@ -5,12 +5,300 @@
 //! extra dependency, and deletion is a flag in SQLite rather than a graph repair.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
+use crate::db::Db;
 use crate::{Error, Result, VecRow};
 
 const HEADER: &[u8; 8] = b"SEVQOVC1";
+
+// ------------------------------------------------------------------ generations
+//
+// The vector file and SQLite are two separate persistent objects, so no single
+// transaction can commit both. Compaction therefore never overwrites the live file: it
+// streams a new generation file, fsyncs it, atomically renames it, and only then flips
+// the `vec_generation` meta row inside one SQLite transaction together with the row-id
+// remap (P0-01). That commit is the switch point:
+//
+//   * crash before the commit  → old generation is still authoritative, the new file is
+//     an orphan a startup cleanup deletes;
+//   * crash after the commit   → the new file is authoritative and complete, older
+//     generations are cleaned up at startup.
+
+/// SQLite meta key holding the active generation number.
+pub const GEN_META: &str = "vec_generation";
+
+/// Path of generation `gen` for a store based at `base` (`…/vectors.f32` →
+/// `…/vectors.g000001.f32`). The legacy name is only used before adoption.
+pub fn gen_path(base: &Path, gen: u64) -> PathBuf {
+    let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("vectors");
+    base.with_file_name(format!("{stem}.g{gen:06}.f32"))
+}
+
+/// Generation number encoded in a sibling file name, if any (`vectors.g000007.f32` → 7).
+fn parse_gen_name(base: &Path, name: &str) -> Option<u64> {
+    let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("vectors");
+    let rest = name.strip_prefix(stem)?.strip_prefix(".g")?;
+    let digits = rest.strip_suffix(".f32")?;
+    if digits.len() != 6 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+fn gen_meta(db: &Db) -> Option<u64> {
+    db.get_meta(GEN_META).and_then(|v| v.parse().ok())
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut f = File::open(path)?;
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = std::io::Read::read(&mut f, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+fn sync_dir(dir: &Path) -> Result<()> {
+    File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+/// Resolve the authoritative vector file for reading and appending. The DB meta row
+/// decides which generation is active; an index without the meta row (pre-generation
+/// build) adopts its legacy file as generation 1 once. The active file's existence,
+/// header and recorded rows/dim are validated on every resolve — a corrupt or missing
+/// active file with live rows is a hard, diagnosable error, never a silent empty store
+/// (P0-01.10). Content hashing is deep-check only (see [`check_active`]).
+pub fn active_vector_path(base: &Path, db: &Db) -> Result<PathBuf> {
+    let gen = match gen_meta(db) {
+        Some(g) => g,
+        None => return adopt_legacy(base, db),
+    };
+    let active = gen_path(base, gen);
+    check_active(&active, db, false)?;
+    Ok(active)
+}
+
+/// Active generation number (1 when the meta row is somehow absent after adoption).
+pub fn active_generation(db: &Db) -> u64 {
+    gen_meta(db).unwrap_or(1)
+}
+
+/// Temp path a compaction writes before its atomic rename: `vectors.g000002.f32.tmp`.
+pub fn gen_tmp_path(base: &Path, gen: u64) -> PathBuf {
+    let mut p = gen_path(base, gen).into_os_string();
+    p.push(".tmp");
+    PathBuf::from(p)
+}
+
+/// Delete every generation file other than `active`, plus compaction `.tmp` leftovers.
+/// Safe while old mmaps are still open (unix unlink keeps mapped pages valid) and while
+/// nothing may append to a superseded generation.
+pub fn cleanup_generations(base: &Path, active: u64) -> Result<()> {
+    let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("vectors").to_string();
+    if let Some(dir) = base.parent() {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return Ok(()),
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if let Some(other) = parse_gen_name(base, name) {
+                if other != active {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            } else if name.ends_with(".tmp") && name.starts_with(&stem) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One-time migration of a pre-generation index: rename the legacy file to generation 1
+/// and record the meta row. Idempotent and race-tolerant (rename of a moved source fails
+/// harmlessly when a concurrent adoption won): rename first, meta second — if the crash
+/// lands between them, the next adopt finds the renamed file and just records the meta.
+fn adopt_legacy(base: &Path, db: &Db) -> Result<PathBuf> {
+    let gen1 = gen_path(base, 1);
+    if base.exists() && !gen1.exists() {
+        std::fs::rename(base, &gen1)?;
+        if let Some(dir) = gen1.parent() {
+            let _ = sync_dir(dir);
+        }
+    }
+    db.set_meta(GEN_META, "1")?;
+    check_active(&gen1, db, false)?;
+    Ok(gen1)
+}
+
+/// Startup consistency pass: adopt a legacy store, deep-validate the active generation
+/// (including the recorded SHA256 when nothing appended since compaction), and delete
+/// files a crashed compaction left behind — generations other than the active one and
+/// `.tmp` write-outs. Call this once at startup before watchers, the indexer and
+/// searchers exist; a running compaction must never be cleaned up from underneath.
+pub fn ensure_generation_store(base: &Path, db: &Db) -> Result<PathBuf> {
+    let active = active_vector_path(base, db)?;
+    check_active(&active, db, true)?;
+    let gen = gen_meta(db).unwrap_or(1);
+    cleanup_generations(base, gen)?;
+    Ok(active)
+}
+
+/// Validate the active generation file against its header and the recorded metadata.
+/// `deep` adds the SHA256 re-check, which is only meaningful when nothing has appended
+/// since the compaction that recorded it (row count unchanged) — hashing a large file on
+/// every resolve would be prohibitive.
+fn check_active(active: &Path, db: &Db, deep: bool) -> Result<()> {
+    if !active.exists() {
+        if db.alive_vec_rows()? > 0 {
+            return Err(Error::Config(format!(
+                "活动向量文件缺失: {}。索引数据库仍有 {} 条有效向量映射，文件可能被删除或移动。",
+                active.display(),
+                db.alive_vec_rows().unwrap_or(0)
+            )));
+        }
+        return Ok(());
+    }
+    let len = active.metadata()?.len() as usize;
+    if len == 0 {
+        return Ok(());
+    }
+    if len < 16 {
+        return Err(Error::Config(format!("向量文件已损坏: {}", active.display())));
+    }
+    let mut head = [0u8; 16];
+    {
+        let mut f = File::open(active)?;
+        std::io::Read::read_exact(&mut f, &mut head)?;
+    }
+    let (dim, rows) = parse_header(&head, len, active)?;
+    let rec_dim = db.get_meta("vec_dim").and_then(|v| v.parse::<usize>().ok());
+    if let Some(d) = rec_dim {
+        if d != dim {
+            return Err(Error::Config(format!(
+                "向量文件维度 {dim} 与记录 {d} 不符: {}",
+                active.display()
+            )));
+        }
+    }
+    let rec_rows = db.get_meta("vec_row_count").and_then(|v| v.parse::<usize>().ok());
+    if let Some(r) = rec_rows {
+        if rows < r {
+            return Err(Error::Config(format!(
+                "向量文件行数 {rows} 少于记录的 {r}，文件被截断: {}",
+                active.display()
+            )));
+        }
+        // 校验值只在压缩时记录；此后追加会改变内容，所以仅在「没有追加过」时复验。
+        if deep && rows == r {
+            if let Some(sha) = db.get_meta("vec_sha256") {
+                if sha256_file(active)? != sha {
+                    return Err(Error::Config(format!(
+                        "向量文件校验不符，内容已损坏: {}",
+                        active.display()
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Throw away every generation file plus the legacy base and the generation meta.
+/// Used by the explicit rebuild/dimension-change paths, which already hold the run slot
+/// and the vector write lock.
+pub fn wipe(base: &Path, db: &Db) -> Result<()> {
+    let _ = std::fs::remove_file(base);
+    if let Some(dir) = base.parent() {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if let Some(n) = name.to_str() {
+                    if parse_gen_name(base, n).is_some()
+                        || (n.ends_with(".tmp") && n.starts_with(base.file_stem().and_then(|s| s.to_str()).unwrap_or("vectors")))
+                    {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
+        }
+    }
+    db.set_meta(GEN_META, "1")?;
+    // 维度可能刚刚改变：记录不匹配的活动维度会让下一次启动校验误报损坏。
+    db.delete_meta("vec_dim")?;
+    db.delete_meta("vec_row_count")?;
+    db.delete_meta("vec_sha256")?;
+    Ok(())
+}
+
+/// Stream a new generation file containing exactly the mapped rows (P0-01): read the old
+/// file through an mmap in row order (bounded RAM, sequential pages), write buffered,
+/// hash on the fly, fsync the temp file, then atomically rename and fsync the directory.
+/// Returns the SHA256 of the complete new file.
+pub fn write_generation(src: &Path, dst: &Path, dim: usize, live: &[(i64, i64)]) -> Result<String> {
+    if live.len() > u32::MAX as usize {
+        return Err(Error::Config(format!("压缩结果 {} 行超出格式上限", live.len())));
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let view = MmapView::open(src)?;
+    if view.is_none() && !live.is_empty() {
+        return Err(Error::Config(format!(
+            "源向量文件缺失但仍有 {} 条有效向量: {}",
+            live.len(),
+            src.display()
+        )));
+    }
+    let tmp = File::create(dst)?;
+    let mut w = BufWriter::new(tmp);
+    let mut hash = Sha256::new();
+    fn put(w: &mut BufWriter<File>, hash: &mut Sha256, bytes: &[u8]) -> Result<()> {
+        w.write_all(bytes)?;
+        hash.update(bytes);
+        Ok(())
+    }
+    put(&mut w, &mut hash, HEADER)?;
+    put(&mut w, &mut hash, &(dim as u32).to_le_bytes())?;
+    put(&mut w, &mut hash, &(live.len() as u32).to_le_bytes())?;
+    for (old, _) in live {
+        if *old < 0 {
+            continue;
+        }
+        let v = view.as_ref().map(|s| s.row(*old as usize)).unwrap_or(&[]);
+        if v.len() != dim {
+            return Err(Error::Config(format!("向量行 {old} 越界，无法压缩")));
+        }
+        for x in v {
+            put(&mut w, &mut hash, &x.to_le_bytes())?;
+        }
+    }
+    w.flush()?;
+    w.get_ref().sync_all()?;
+    drop(w);
+    std::fs::rename(dst, gen_final_of(dst))?;
+    if let Some(dir) = dst.parent() {
+        sync_dir(dir)?;
+    }
+    Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// `dst` is the `.tmp` path; the final name is the same minus the tmp suffix.
+fn gen_final_of(tmp: &Path) -> PathBuf {
+    let s = tmp.to_string_lossy();
+    PathBuf::from(s.trim_end_matches(".tmp"))
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct Scored {
@@ -536,5 +824,134 @@ mod tests {
         s.put(0, &[1.0, 0.0]).unwrap();
         s.flush().unwrap();
         assert_eq!(s.rows(), 1);
+    }
+
+    // -------------------------------------------- P0-01: generation 与恢复协议
+
+    use crate::db::Db;
+
+    /// 在 base 上造一个两行的 store；直接写 legacy 名，走一次 adoption 得到 gen1。
+    fn seeded_store(dir: &tempfile::TempDir, name: &str) -> (PathBuf, Db) {
+        let base = dir.path().join(name);
+        let mut s = Store::open(&base, 2).unwrap();
+        s.put(0, &[1.0, 0.0]).unwrap();
+        s.put(1, &[0.0, 1.0]).unwrap();
+        s.flush().unwrap();
+        drop(s);
+        let db = Db::open(&dir.path().join("i.sqlite")).unwrap();
+        let active = active_vector_path(&base, &db).unwrap();
+        assert_eq!(active, gen_path(&base, 1), "legacy 文件应被收编为 generation 1");
+        (base, db)
+    }
+
+    #[test]
+    fn legacy_file_is_adopted_as_generation_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, db) = seeded_store(&dir, "vectors.f32");
+        assert!(!base.exists(), "收编后旧名不再存在");
+        assert_eq!(db.get_meta(GEN_META).as_deref(), Some("1"));
+        // 再解析一次是幂等的：不会再次改名，也不会丢数据。
+        let again = active_vector_path(&base, &db).unwrap();
+        assert_eq!(again, gen_path(&base, 1));
+        let mut s = Store::open(&again, 2).unwrap();
+        assert_eq!(s.rows(), 2);
+    }
+
+    /// 压缩在写完新文件、还没提交 SQLite 事务时崩溃：旧 generation 仍是权威，
+    /// 新文件是孤儿，启动清理把它删掉。
+    #[test]
+    fn crash_before_the_commit_leaves_the_old_generation_authoritative() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, db) = seeded_store(&dir, "vectors.f32");
+        let gen1 = gen_path(&base, 1);
+        // 模拟：write_generation 已完成（文件已就位），但 commit_compaction 没有执行。
+        let gen2_tmp = gen_tmp_path(&base, 2);
+        write_generation(&gen1, &gen2_tmp, 2, &[(1, 0)]).unwrap();
+        assert!(gen_path(&base, 2).exists());
+
+        let active = ensure_generation_store(&base, &db).unwrap();
+
+        assert_eq!(active, gen1, "数据库仍指向 generation 1");
+        assert!(gen1.exists());
+        assert!(!gen_path(&base, 2).exists(), "孤儿 generation 必须被清理");
+        assert!(!gen2_tmp.exists(), "残留 .tmp 也必须被清理");
+    }
+
+    /// 压缩在提交之后、清理旧文件之前崩溃：新 generation 已是权威，旧文件被清掉。
+    #[test]
+    fn crash_after_the_commit_promotes_the_new_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, db) = seeded_store(&dir, "vectors.f32");
+        let gen1 = gen_path(&base, 1);
+        let gen2_tmp = gen_tmp_path(&base, 2);
+        write_generation(&gen1, &gen2_tmp, 2, &[(0, 0)]).unwrap();
+        // 模拟 commit_compaction 已完成（这里只关心 meta 翻转对路径解析的影响）。
+        db.set_meta(GEN_META, "2").unwrap();
+
+        let active = ensure_generation_store(&base, &db).unwrap();
+
+        assert_eq!(active, gen_path(&base, 2), "新 generation 已是权威");
+        assert!(gen_path(&base, 2).exists());
+        assert!(!gen1.exists(), "被取代的旧 generation 必须被清理");
+        // 数据仍在：新文件里是 (0→0) 映射后的内容。
+        let mut s = Store::open(&active, 2).unwrap();
+        assert_eq!(s.rows(), 1);
+        assert_eq!(s.row(0).unwrap(), vec![1.0, 0.0]);
+    }
+
+    /// 数据库还有有效向量映射、活动文件却不在了：这是索引损坏，必须显式报错，
+    /// 绝不能静默当作空索引继续搜。
+    #[test]
+    fn missing_active_file_with_live_rows_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("vectors.f32");
+        let db = Db::open(&dir.path().join("i.sqlite")).unwrap();
+        db.set_meta(GEN_META, "1").unwrap();
+        let row = db.reserve_vec_row(EmbedRowKind::Image, 1, 1).unwrap();
+        db.activate_vec_rows(&[row]).unwrap();
+
+        let err = active_vector_path(&base, &db).unwrap_err();
+        assert!(err.to_string().contains("活动向量文件缺失"), "{err}");
+    }
+
+    #[test]
+    fn truncated_active_file_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, db) = seeded_store(&dir, "vectors.f32");
+        let gen1 = gen_path(&base, 1);
+        std::fs::write(&gen1, [0u8; 10]).unwrap();
+        let err = active_vector_path(&base, &db).unwrap_err();
+        assert!(err.to_string().contains("已损坏"), "{err}");
+    }
+
+    /// 没有可回收的行时压缩是空操作：不翻 generation、不造新文件。
+    #[test]
+    fn compaction_with_nothing_dead_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, db) = seeded_store(&dir, "vectors.f32");
+        db.set_meta("vec_row_count", "2").unwrap();
+        db.set_meta("vec_dim", "2").unwrap();
+
+        let dropped = crate::jobs::compact(&db, &base, 2).unwrap();
+
+        assert_eq!(dropped, 0);
+        assert_eq!(active_generation(&db), 1, "generation 不应翻转");
+        assert!(!gen_path(&base, 2).exists(), "没有可回收内容就不该产出新文件");
+    }
+
+    /// write_generation 产出完整可读的新文件：头、行数、内容与哈希一致。
+    #[test]
+    fn written_generation_roundtrips_and_deletes_no_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, db) = seeded_store(&dir, "vectors.f32");
+        let gen1 = gen_path(&base, 1);
+        let sha = write_generation(&gen1, &gen_tmp_path(&base, 2), 2, &[(1, 0)]).unwrap();
+        assert_eq!(sha.len(), 64);
+        assert!(gen1.exists(), "源文件在提交前必须原样保留");
+        let mut s = Store::open(&gen_path(&base, 2), 2).unwrap();
+        assert_eq!(s.rows(), 1);
+        assert_eq!(s.row(0).unwrap(), vec![0.0, 1.0]);
+        // 记录的哈希能独立复验。
+        assert_eq!(sha256_file(&gen_path(&base, 2)).unwrap(), sha);
     }
 }

@@ -211,6 +211,12 @@ impl Db {
         Ok(())
     }
 
+    pub fn delete_meta(&self, key: &str) -> Result<()> {
+        let g = self.write.lock().unwrap();
+        g.execute("DELETE FROM meta WHERE key=?", params![key])?;
+        Ok(())
+    }
+
     // ---------------------------------------------------------------- roots
 
     pub fn add_root(&self, path: &str, label: &str) -> Result<i64> {
@@ -608,9 +614,19 @@ impl Db {
         Ok(olds.into_iter().enumerate().map(|(i, old)| (old, i as i64)).collect())
     }
 
-    /// After compaction, rewrite row ids and every `vec_row` pointer. `mapping` must be
-    /// ascending by old row id, as `live_rows_for_compaction` returns.
-    pub fn apply_compaction(&self, mapping: &[(i64, i64)]) -> Result<usize> {
+    /// After compaction, rewrite row ids and every `vec_row` pointer *and* flip the
+    /// active vector generation — all inside one transaction (P0-01). This commit is the
+    /// switch point between generations: before it the new file is an orphan, after it
+    /// the new file is authoritative. `mapping` must be ascending by old row id, as
+    /// `live_rows_for_compaction` returns.
+    pub fn commit_compaction(
+        &self,
+        mapping: &[(i64, i64)],
+        generation: u64,
+        rows: usize,
+        dim: usize,
+        sha256: &str,
+    ) -> Result<usize> {
         let mut g = self.write.lock().unwrap();
         let tx = g.transaction()?;
         tx.execute("UPDATE chunk SET vec_row=NULL WHERE vec_row IN (SELECT row_id FROM vec_map WHERE alive=0)", [])?;
@@ -624,6 +640,22 @@ impl Db {
             tx.execute("UPDATE chunk SET vec_row=? WHERE vec_row=?", params![new, old])?;
             tx.execute("UPDATE clip SET vec_row=? WHERE vec_row=?", params![new, old])?;
         }
+        tx.execute(
+            "INSERT INTO meta(key,value) VALUES('vec_generation',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![generation.to_string()],
+        )?;
+        tx.execute(
+            "INSERT INTO meta(key,value) VALUES('vec_row_count',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![rows.to_string()],
+        )?;
+        tx.execute(
+            "INSERT INTO meta(key,value) VALUES('vec_dim',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![dim.to_string()],
+        )?;
+        tx.execute(
+            "INSERT INTO meta(key,value) VALUES('vec_sha256',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![sha256],
+        )?;
         tx.commit()?;
         Ok(dropped)
     }

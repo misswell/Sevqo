@@ -18,7 +18,7 @@ use sevqo_engine::jobs::{compact, Indexer, Mode};
 use sevqo_engine::model::{self, ModelStatus};
 use sevqo_engine::scan::dir_label;
 use sevqo_engine::search::Searcher;
-use sevqo_engine::vectors::Store;
+use sevqo_engine::vectors::{self, Store};
 use sevqo_engine::watch::{apply_change_with_options, Applied, Change, WatcherHandle};
 use sevqo_engine::{
     FileRecord, Filters, Hit, Kind, Moment, Paths, Phase, Progress, Root, SearchRequest, SearchResponse, Settings,
@@ -178,7 +178,12 @@ fn overview(st: &AppState) -> Res<Overview> {
         sidecar_running: st.client().is_running(),
         vector_dim: st.vector_dim(),
         watched_roots: st.watched_roots(),
-        vector_bytes: std::fs::metadata(&st.vector_path).map(|m| m.len() as i64).unwrap_or(0),
+        // 当前活动 generation 的体积；旧路径名只是 base，不一定再是真实文件。
+        vector_bytes: vectors::active_vector_path(&st.vector_path, &st.db)
+            .ok()
+            .and_then(|p| std::fs::metadata(&p).ok())
+            .map(|m| m.len() as i64)
+            .unwrap_or(0),
     })
 }
 
@@ -228,7 +233,7 @@ pub async fn set_settings(app: AppHandle, next: Settings) -> Res<Settings> {
             return Err("修改向量维度需要重建索引：确认后会清空现有向量并重新编码全部文件。".to_string());
         }
         if dim_changed {
-            Store::delete_all(&st.vector_path).map_err(es)?;
+            vectors::wipe(&st.vector_path, &st.db).map_err(es)?;
             st.db.reset_vectors().map_err(es)?;
         }
         let shortcut_changed = old.global_shortcut != cfg.global_shortcut;
@@ -539,7 +544,7 @@ pub async fn rebuild_index(app: AppHandle, clear_vectors: bool) -> Res<usize> {
         let _vectors = st.vector_access.write().map_err(es)?;
         let n = st.db.reindex_all().map_err(es)?;
         if clear_vectors {
-            Store::delete_all(&st.vector_path).map_err(es)?;
+            vectors::wipe(&st.vector_path, &st.db).map_err(es)?;
         }
         Ok(n)
     })

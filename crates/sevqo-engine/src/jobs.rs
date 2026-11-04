@@ -17,7 +17,7 @@ use crate::extract;
 use crate::infer::Client;
 use crate::paths::Paths;
 use crate::scan::{self, ScanOptions, ScanStats};
-use crate::vectors::{normalize, Store};
+use crate::vectors::{active_generation, active_vector_path, gen_tmp_path, normalize, Store};
 use crate::video::plan_clips;
 use crate::{EmbedItem, EmbedRowKind, Error, FileRecord, FileState, Kind, Phase, Progress, Result};
 
@@ -228,14 +228,17 @@ impl Indexer {
         &self.db
     }
 
-    /// Open (or create) the vector file on first use.
+    /// Open (or create) the vector file on first use. Appends always target the *active*
+    /// generation (P0-01); compaction holds the same run slot, so the generation cannot
+    /// switch underneath an open handle.
     fn store(&self) -> Result<std::sync::MutexGuard<'_, Option<Store>>> {
         let mut g = self
             .store
             .lock()
             .map_err(|_| Error::Infer("向量存储锁中毒".into()))?;
         if g.is_none() {
-            *g = Some(Store::open(&self.paths.vector_path, self.settings.vector_dim)?);
+            let path = active_vector_path(&self.paths.vector_path, &self.db)?;
+            *g = Some(Store::open(&path, self.settings.vector_dim)?);
         }
         Ok(g)
     }
@@ -654,23 +657,36 @@ fn path_str(p: &Path) -> String {
     p.to_string_lossy().to_string()
 }
 
-/// Re-pack the vector file, dropping rows of deleted or re-indexed files.
+/// Re-pack the vector file, dropping rows of deleted or re-indexed files (P0-01).
+///
+/// Compaction never touches the live file: it streams a new generation from the old one,
+/// fsyncs it, then commits the row remap and the generation flip in one SQLite
+/// transaction — that commit is the switch point. Old generations are unlinked after the
+/// commit (compaction holds the run slot and the vector write lock, so nothing is
+/// reading or appending).
 pub fn compact(db: &Db, store_path: &PathBuf, dim: usize) -> Result<usize> {
     // A failed or interrupted embed reserves rows that never received bytes. Left alive,
     // they are copied as zero rows forever, and a reservation past the end of the vector
-    // file makes `Store::compact` abort with 越界. Tombstone them first — compaction holds
-    // the run slot and the vector write lock, so nothing is mid-embed here.
+    // file makes compaction abort with 越界. Tombstone them first — nothing is mid-embed
+    // here because compaction holds the run slot.
     let freed = db.invalidate_stale_rows()?;
     if freed > 0 {
         tracing::info!("压缩前回收 {freed} 行失效向量");
     }
+    let dead = db.dead_rows()?;
     let mapping = db.live_rows_for_compaction()?;
-    let mut store = Store::open(store_path, dim)?;
+    if dead == 0 {
+        // 没有可回收的行：不制造新 generation，避免反复点击压缩徒增文件翻转。
+        return Ok(0);
+    }
+    let active = active_vector_path(store_path, db)?;
+    let next = active_generation(db) + 1;
+    let tmp = gen_tmp_path(store_path, next);
     let kept = mapping.len() as i64;
-    store.compact(&mapping)?;
-    store.flush()?;
-    let dropped = db.apply_compaction(&mapping)?;
-    tracing::info!("向量压缩：保留 {kept} 行，回收 {dropped} 行");
+    let sha = crate::vectors::write_generation(&active, &tmp, dim, &mapping)?;
+    let dropped = db.commit_compaction(&mapping, next, mapping.len(), dim, &sha)?;
+    crate::vectors::cleanup_generations(store_path, next)?;
+    tracing::info!("向量压缩：generation {next}，保留 {kept} 行，回收 {dropped} 行");
     Ok(dropped)
 }
 
@@ -1013,12 +1029,14 @@ mod tests {
         h.db.delete_by_path("/tmp/one.jpg").unwrap();
         let n = compact(&h.db, &h.paths.vector_path, 2).unwrap();
         assert_eq!(n, 1, "one dead row reclaimed");
-        let store = Store::open(&h.paths.vector_path, 2).unwrap();
+        // 压缩产出新 generation 文件；通过解析出的活动路径重开，而不是旧 base 名。
+        let active = crate::vectors::active_vector_path(&h.paths.vector_path, &h.db).unwrap();
+        let store = Store::open(&active, 2).unwrap();
         assert_eq!(store.rows(), 1);
         let rows = h.db.vec_candidates(&[]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].file_id, b);
-        let view = crate::vectors::MmapView::open(&h.paths.vector_path).unwrap().unwrap();
+        let view = crate::vectors::MmapView::open(&active).unwrap().unwrap();
         let hits = view.search(&[0.0, 1.0], &rows, 4);
         assert!((hits[0].1 - 1.0).abs() < 1e-6, "row pointers must follow compaction");
     }

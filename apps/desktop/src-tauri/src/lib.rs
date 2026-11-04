@@ -29,6 +29,12 @@ pub fn run() {
     let wants_media = settings.index_images || settings.index_video;
     let resume = settings.resume_on_launch;
     let update_check = settings.update_check;
+    // P0-01：启动时对向量库做一次一致性检查与孤儿 generation 清理。失败只记录并继续：
+    // 之后每次搜索都会以同样的错误显式失败并给出原因，不会静默用错向量。
+    if let Err(e) = sevqo_engine::vectors::ensure_generation_store(&paths.vector_path, &db) {
+        tracing::error!("向量库启动检查失败: {e}");
+    }
+
     let state = Arc::new(AppState::new(paths, settings, db));
     let managed = state.clone();
 
