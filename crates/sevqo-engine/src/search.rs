@@ -252,7 +252,6 @@ impl Searcher {
         }
         resp.hits = hits;
         resp.total = resp.hits.len();
-        resp.keyword_ms += started.elapsed().as_secs_f64() * 0.0;
         Ok(resp)
     }
 

@@ -121,7 +121,8 @@ export function shortenPath(path: string, head = 10, tail = 26): string {
 }
 
 const IMAGE_EXTS = ['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp', 'tif', 'tiff', 'heic', 'heif', 'avif', 'dng'];
-const VIDEO_EXTS = ['mp4', 'mov', 'm4v', 'mkv', 'avi', 'webm', 'wmv', 'flv', 'mpg', 'mpeg', '3gp'];
+// 不含 "ts"：那是 TypeScript 源码，拖入框里不该按媒体查询处理；MPEG-TS 用 .mts/.m2ts。
+const VIDEO_EXTS = ['mp4', 'mov', 'm4v', 'mkv', 'avi', 'webm', 'wmv', 'flv', 'mpg', 'mpeg', '3gp', 'mts', 'm2ts'];
 
 export type MediaQuery = { path: string; kind: Extract<Kind, 'image' | 'video'> };
 

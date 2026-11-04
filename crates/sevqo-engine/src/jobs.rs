@@ -597,6 +597,14 @@ fn path_str(p: &Path) -> String {
 
 /// Re-pack the vector file, dropping rows of deleted or re-indexed files.
 pub fn compact(db: &Db, store_path: &PathBuf, dim: usize) -> Result<usize> {
+    // A failed or interrupted embed reserves rows that never received bytes. Left alive,
+    // they are copied as zero rows forever, and a reservation past the end of the vector
+    // file makes `Store::compact` abort with 越界. Tombstone them first — compaction holds
+    // the run slot and the vector write lock, so nothing is mid-embed here.
+    let freed = db.invalidate_stale_rows()?;
+    if freed > 0 {
+        tracing::info!("压缩前回收 {freed} 行失效向量");
+    }
     let mapping = db.live_rows_for_compaction()?;
     let mut store = Store::open(store_path, dim)?;
     let kept = mapping.len() as i64;
@@ -950,5 +958,72 @@ mod tests {
         let view = crate::vectors::MmapView::open(&h.paths.vector_path).unwrap().unwrap();
         let hits = view.search(&[0.0, 1.0], &rows, 4);
         assert!((hits[0].1 - 1.0).abs() < 1e-6, "row pointers must follow compaction");
+    }
+
+    /// 嵌入失败只预留了行、字节没落盘：这些行必须被压缩回收。修复前它们被当作
+    /// 活行拷贝成零向量；若向量文件还没建立，`Store::compact` 更会因行越界整体失败。
+    #[test]
+    fn compact_reclaims_rows_reserved_by_failed_embeds() {
+        let h = harness();
+        h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
+        let seen = crate::db::now_ns();
+        let mk = |path: &str| Scanned {
+            root_id: 1,
+            path: path.into(),
+            name: path.rsplit('/').next().unwrap_or(path).into(),
+            ext: "jpg".into(),
+            kind: Kind::Image,
+            size: 1,
+            mtime_ns: seen,
+        };
+        let ok = h.db.upsert_file(&mk("/tmp/ok.jpg"), seen).unwrap().0;
+        let bad = h.db.upsert_file(&mk("/tmp/bad.jpg"), seen).unwrap().0;
+        h.db.set_file_state(ok, FileState::Done, None).unwrap();
+        h.db.set_file_state(bad, FileState::Done, None).unwrap();
+        let r_ok = h.db.reserve_vec_row(EmbedRowKind::Image, ok, ok).unwrap();
+        let r_bad = h.db.reserve_vec_row(EmbedRowKind::Image, bad, bad).unwrap();
+        assert!(r_bad > r_ok);
+        // bad 的行只预留不落盘（文件长度恰好盖住 ok 的行）
+        let mut store = Store::open(&h.paths.vector_path, 2).unwrap();
+        store.put(r_ok as usize, &[1.0, 0.0]).unwrap();
+        store.flush().unwrap();
+        drop(store);
+        h.db.set_file_state(bad, FileState::Failed, Some("嵌入失败")).unwrap();
+
+        let dropped = compact(&h.db, &h.paths.vector_path, 2).unwrap();
+
+        assert_eq!(dropped, 1, "失败文件占的行要被回收");
+        assert_eq!(h.db.alive_vec_rows().unwrap(), 1);
+        let rows = h.db.vec_candidates(&[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].file_id, ok);
+    }
+
+    /// 只有失败预留、向量文件一个字节都还没有：压缩必须成功而不是报「越界」。
+    #[test]
+    fn compact_survives_reservations_beyond_the_vector_file() {
+        let h = harness();
+        h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
+        let seen = crate::db::now_ns();
+        let s = Scanned {
+            root_id: 1,
+            path: "/tmp/only.jpg".into(),
+            name: "only.jpg".into(),
+            ext: "jpg".into(),
+            kind: Kind::Image,
+            size: 1,
+            mtime_ns: seen,
+        };
+        let id = h.db.upsert_file(&s, seen).unwrap().0;
+        h.db.set_file_state(id, FileState::Done, None).unwrap();
+        h.db.reserve_vec_row(EmbedRowKind::Image, id, id).unwrap();
+        h.db.set_file_state(id, FileState::Failed, Some("嵌入失败")).unwrap();
+        assert!(!h.paths.vector_path.exists(), "该场景下向量文件尚未建立");
+
+        let dropped = compact(&h.db, &h.paths.vector_path, 2).unwrap();
+
+        assert_eq!(dropped, 1);
+        assert_eq!(h.db.vec_rows().unwrap(), 0, "没有任何活行");
+        assert_eq!(h.db.vec_candidates(&[]).unwrap().len(), 0);
     }
 }

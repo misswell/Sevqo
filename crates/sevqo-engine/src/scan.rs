@@ -216,6 +216,11 @@ mod tests {
         assert_eq!(Kind::from_ext("md"), Kind::Document);
         assert_eq!(Kind::from_ext("rs"), Kind::Code);
         assert_eq!(Kind::from_ext("bin"), Kind::Other);
+        // media.rs 早就有这几类的 MIME；漏在类型表里它们就成了「其他」，永不索引。
+        // .ts 是 TypeScript，不跟 MPEG-TS 抢。
+        assert_eq!(Kind::from_ext("mts"), Kind::Video);
+        assert_eq!(Kind::from_ext("m2ts"), Kind::Video);
+        assert_eq!(Kind::from_ext("ts"), Kind::Code);
         assert!(!wanted("bin", &[]));
         assert!(wanted("pdf", &[]));
         assert!(!wanted("pdf", &[Kind::Image]));

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type RefObject } from 'react';
 
 import { getCurrentWindow } from '@tauri-apps/api/window';
 
@@ -63,6 +63,28 @@ export function useDebounced<A>(action: (arg: A) => void, wait: number): Debounc
 const thumbCache = new Map<string, string | null>();
 const inflight = new Map<string, Promise<string | null>>();
 
+/**
+ * Bumped whenever the caches are invalidated. Mounted rows subscribe to it, otherwise a
+ * re-indexed file would keep showing its old data URL until it scrolls out of view —
+ * clearing the Map alone only helps rows that fetch afterwards.
+ */
+let cacheVersion = 0;
+const cacheListeners = new Set<() => void>();
+
+function bumpCacheVersion(): void {
+  cacheVersion += 1;
+  for (const l of cacheListeners) l();
+}
+
+function subscribeCache(listener: () => void): () => void {
+  cacheListeners.add(listener);
+  return () => cacheListeners.delete(listener);
+}
+
+function useCacheVersion(): number {
+  return useSyncExternalStore(subscribeCache, () => cacheVersion);
+}
+
 function cached(key: string): string | null | undefined {
   return thumbCache.has(key) ? (thumbCache.get(key) ?? null) : undefined;
 }
@@ -104,17 +126,20 @@ export function invalidateFileCache(fileId?: number): void {
   if (fileId == null) {
     thumbCache.clear();
     momentCache.clear();
+    bumpCacheVersion();
     return;
   }
   for (const key of [...thumbCache.keys()]) {
     if (key === `f:${fileId}` || key.startsWith(`c:${fileId}:`)) thumbCache.delete(key);
   }
   momentCache.delete(fileId);
+  bumpCacheVersion();
 }
 
 /** Lazy data-URL thumbnail; only fetched once `enabled` (row in view). */
 export function useThumb(fileId: number | null, enabled: boolean): string | null {
   const [url, setUrl] = useState<string | null>(null);
+  const version = useCacheVersion();
   useEffect(() => {
     if (fileId == null || !enabled) {
       setUrl(null);
@@ -133,12 +158,13 @@ export function useThumb(fileId: number | null, enabled: boolean): string | null
     return () => {
       alive = false;
     };
-  }, [fileId, enabled]);
+  }, [fileId, enabled, version]);
   return url;
 }
 
 export function useClipThumb(fileId: number | null, clipId: number | null): string | null {
   const [url, setUrl] = useState<string | null>(null);
+  const version = useCacheVersion();
   useEffect(() => {
     if (fileId == null || clipId == null) {
       setUrl(null);
@@ -157,7 +183,7 @@ export function useClipThumb(fileId: number | null, clipId: number | null): stri
     return () => {
       alive = false;
     };
-  }, [fileId, clipId]);
+  }, [fileId, clipId, version]);
   return url;
 }
 
@@ -194,6 +220,7 @@ export function useMoments(fileId: number | null): Moment[] | null {
   const [moments, setMoments] = useState<Moment[] | null>(
     fileId != null ? (momentCache.get(fileId) ?? null) : null,
   );
+  const version = useCacheVersion();
   useEffect(() => {
     if (fileId == null) {
       setMoments(null);
@@ -218,7 +245,7 @@ export function useMoments(fileId: number | null): Moment[] | null {
     return () => {
       alive = false;
     };
-  }, [fileId]);
+  }, [fileId, version]);
   return moments;
 }
 

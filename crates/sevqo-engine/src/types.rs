@@ -19,7 +19,10 @@ impl Kind {
             "jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp" | "tif" | "tiff" | "heic" | "heif" | "avif" | "dng" => {
                 Kind::Image
             }
-            "mp4" | "mov" | "m4v" | "mkv" | "avi" | "webm" | "wmv" | "flv" | "mpg" | "mpeg" | "3gp" => Kind::Video,
+            "mp4" | "mov" | "m4v" | "mkv" | "avi" | "webm" | "wmv" | "flv" | "mpg" | "mpeg" | "3gp" | "mts"
+            | "m2ts" => Kind::Video,
+            // 注意 ".ts" 不能加进视频表：它是 TypeScript 源码的主流扩展名，归成视频会让
+            // probe 失败、正文丢失。MPEG-TS 素材一般用 .mts/.m2ts。
             "pdf" | "doc" | "docx" | "rtf" | "odt" | "txt" | "md" | "markdown" | "mdx" | "epub" | "pptx" | "xlsx"
             | "csv" | "tsv" | "org" | "rst" | "log" => Kind::Document,
             "rs" | "go" | "py" | "ts" | "tsx" | "js" | "jsx" | "java" | "kt" | "swift" | "c" | "h" | "cpp" | "hpp"

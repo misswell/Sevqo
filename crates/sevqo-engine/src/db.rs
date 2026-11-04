@@ -220,7 +220,6 @@ impl Db {
             params![path, label],
         )?;
         let id: i64 = g.query_row("SELECT id FROM root WHERE path=?", params![path], |r| r.get(0))?;
-        g.execute("UPDATE file SET state='pending' WHERE root_id=? AND state IN ('done','skipped','failed')", params![id])?;
         Ok(id)
     }
 
@@ -239,11 +238,24 @@ impl Db {
         Ok(rows.filter_map(|x| x.ok()).collect())
     }
 
+    /// Disabling only hides a root; re-enabling must not throw away work. A file that
+    /// is `done` and still owns a live vector row is unchanged evidence — resetting it to
+    /// `pending` would re-embed the whole root for nothing. Failed files get one retry,
+    /// `done` files without vectors (text-only era) queue for the semantic backfill the
+    /// same way [`Self::mark_missing_vectors`] would.
     pub fn set_root_enabled(&self, id: i64, enabled: bool) -> Result<()> {
         let g = self.write.lock().unwrap();
         g.execute("UPDATE root SET enabled=? WHERE id=?", params![enabled as i64, id])?;
         if enabled {
-            g.execute("UPDATE file SET state='pending' WHERE root_id=? AND state IN ('done','skipped','failed')", params![id])?;
+            g.execute(
+                "UPDATE file SET state='stale',error=NULL WHERE root_id=? AND state='failed'",
+                params![id],
+            )?;
+            g.execute(
+                "UPDATE file SET state='stale' WHERE root_id=? AND state='done' \
+                 AND id NOT IN (SELECT file_id FROM vec_map WHERE alive=1)",
+                params![id],
+            )?;
         }
         Ok(())
     }
@@ -681,11 +693,13 @@ impl Db {
     }
 
     /// Files indexed for text only: queue them for the semantic pass once the model is
-    /// available. Skipped kinds are left alone.
+    /// available. Skipped kinds are left alone, and disabled roots stay untouched — their
+    /// files cannot be processed, so queueing them only inflates the progress readout.
     pub fn mark_missing_vectors(&self) -> Result<usize> {
         let g = self.write.lock().unwrap();
         let n = g.execute(
             "UPDATE file SET state='stale' WHERE state='done' AND kind IN ('image','video','document','code') \
+             AND root_id IN (SELECT id FROM root WHERE enabled=1) \
              AND id NOT IN (SELECT file_id FROM vec_map WHERE alive=1)",
             [],
         )?;
@@ -781,14 +795,31 @@ fn ensure_filename_row(g: &Connection, id: i64, name: &str, path: &str) -> Resul
     Ok(())
 }
 
-/// Remove every derived artefact of these files, including the rows themselves.
+/// Remove every derived artefact of these files, including the rows themselves and the
+/// thumbnail files their records point at. Thumbnails are derived artefacts too: without
+/// this the cache directories grow without bound on a library that churns.
 fn purge_files(g: &Connection, ids: &[i64]) -> Result<()> {
+    let mut thumbs: Vec<String> = Vec::new();
     for id in ids {
+        if let Ok(Some(t)) = g.query_row("SELECT thumb FROM file WHERE id=?", params![*id], |r| {
+            r.get::<_, Option<String>>(0)
+        }) {
+            thumbs.push(t);
+        }
+        {
+            let mut st = g.prepare("SELECT thumb FROM clip WHERE file_id=?")?;
+            let rows = st.query_map(params![*id], |r| r.get::<_, Option<String>>(0))?;
+            thumbs.extend(rows.flatten().flatten());
+        }
         purge_derived(g, *id)?;
         g.execute("DELETE FROM fts WHERE rowid=?", params![*id])?;
         g.execute("DELETE FROM text_store WHERE file_id=?", params![*id])?;
         g.execute("DELETE FROM doc WHERE file_id=?", params![*id])?;
         g.execute("DELETE FROM file WHERE id=?", params![*id])?;
+    }
+    for t in thumbs {
+        // Best effort: an already-missing thumbnail is not a reason to fail the purge.
+        let _ = std::fs::remove_file(&t);
     }
     Ok(())
 }
@@ -840,4 +871,93 @@ pub fn stats(db: &Db) -> Result<HashMap<String, i64>> {
         out.insert(format!("kind_{}", row.0), row.1);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scan::Scanned;
+    use crate::{EmbedRowKind, FileState, Kind};
+
+    fn upsert(db: &Db, root_id: i64, path: &str, kind: Kind) -> i64 {
+        let seen = now_ns();
+        let s = Scanned {
+            root_id,
+            path: path.into(),
+            name: path.rsplit('/').next().unwrap_or(path).into(),
+            ext: path.rsplit('.').next().unwrap_or("").to_lowercase(),
+            kind,
+            size: 1,
+            mtime_ns: seen,
+        };
+        db.upsert_file(&s, seen).unwrap().0
+    }
+
+    /// 停用再启用不该把整个目录的向量作废：有效的 done 记录要原样保留，
+    /// 只重试失败文件、补齐缺向量的文件。
+    #[test]
+    fn reenabling_a_root_keeps_valid_embeddings() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("i.sqlite")).unwrap();
+        let root = db.add_root("/tmp/photos", "照片").unwrap();
+        let with_vec = upsert(&db, root, "/tmp/photos/kept.jpg", Kind::Image);
+        let no_vec = upsert(&db, root, "/tmp/photos/plain.md", Kind::Document);
+        let failed = upsert(&db, root, "/tmp/photos/broken.jpg", Kind::Image);
+        db.set_file_state(with_vec, FileState::Done, None).unwrap();
+        db.reserve_vec_row(EmbedRowKind::Image, with_vec, with_vec).unwrap();
+        db.set_file_state(no_vec, FileState::Done, None).unwrap();
+        db.set_file_state(failed, FileState::Failed, Some("嵌入失败")).unwrap();
+
+        db.set_root_enabled(root, false).unwrap();
+        db.set_root_enabled(root, true).unwrap();
+
+        assert_eq!(db.file(with_vec).unwrap().state, FileState::Done, "size/mtime 未变且向量有效，不该重嵌入");
+        assert_eq!(db.file(no_vec).unwrap().state, FileState::Stale, "缺向量的 done 文件应排队补齐");
+        assert_eq!(db.file(failed).unwrap().state, FileState::Stale, "失败文件应重试");
+        assert!(db.file(failed).unwrap().error.is_none(), "重试要清掉旧错误");
+        assert_eq!(db.alive_vec_rows().unwrap(), 1, "启用不清除向量");
+        assert_eq!(db.pending(10, &[]).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn mark_missing_vectors_leaves_disabled_roots_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("i.sqlite")).unwrap();
+        let on = db.add_root("/tmp/on", "启用").unwrap();
+        let off = db.add_root("/tmp/off", "停用").unwrap();
+        let a = upsert(&db, on, "/tmp/on/a.md", Kind::Document);
+        let b = upsert(&db, off, "/tmp/off/b.md", Kind::Document);
+        db.set_file_state(a, FileState::Done, None).unwrap();
+        db.set_file_state(b, FileState::Done, None).unwrap();
+        db.set_root_enabled(off, false).unwrap();
+
+        let n = db.mark_missing_vectors().unwrap();
+
+        assert_eq!(n, 1, "停用目录的文件不该被排队");
+        assert_eq!(db.file(a).unwrap().state, FileState::Stale);
+        assert_eq!(db.file(b).unwrap().state, FileState::Done);
+    }
+
+    /// 删除索引行必须连带删除缩略图文件，否则缓存目录随着库的增删只增不减。
+    #[test]
+    fn purging_a_file_removes_its_thumbnail_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("i.sqlite")).unwrap();
+        let root = db.add_root("/tmp/photos", "照片").unwrap();
+        let id = upsert(&db, root, "/tmp/photos/a.mp4", Kind::Video);
+        db.set_file_state(id, FileState::Done, None).unwrap();
+        let file_thumb = dir.path().join("t.jpg");
+        std::fs::write(&file_thumb, b"thumb").unwrap();
+        db.set_file_meta(id, None, None, None, Some(&file_thumb.to_string_lossy())).unwrap();
+        let clips = db.insert_clips(id, &[(0.0, 2.0)]).unwrap();
+        let clip_thumb = dir.path().join("clip-0.jpg");
+        std::fs::write(&clip_thumb, b"clip").unwrap();
+        db.set_clip_thumb(clips[0].0, &clip_thumb.to_string_lossy()).unwrap();
+
+        db.delete_by_path("/tmp/photos/a.mp4").unwrap();
+
+        assert!(db.file(id).is_none());
+        assert!(!file_thumb.exists(), "文件缩略图应随行删除");
+        assert!(!clip_thumb.exists(), "clip 缩略图应随行删除");
+    }
 }

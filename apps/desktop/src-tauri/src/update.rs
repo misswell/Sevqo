@@ -210,18 +210,23 @@ pub async fn install(app: AppHandle) -> Res<()> {
         }
     };
 
-    state.end_update();
     // The stream itself has no abort handle, so a cancel means "fetch finished, bundle untouched".
     if state.update_generation() != generation {
+        state.end_update();
         let _ = app.emit(EV_UPDATE, UpdateEvent::new("available"));
         return Err("已取消，不会安装".to_string());
     }
     if let Err(e) = update.install(bytes) {
+        state.end_update();
         let e = e.to_string();
         let _ = app.emit(EV_UPDATE, UpdateEvent::failed(e.clone()));
         return Err(e);
     }
     state.set_pending_update(None);
+    // Keep the slot held across `install`: releasing it earlier lets a second install
+    // race the bundle swap. Success ends in `restart()`, but release anyway in case the
+    // process lingers long enough for another command to land.
+    state.end_update();
     let _ = app.emit(EV_UPDATE, UpdateEvent::new("installed"));
     tracing::info!("更新已写入，重新启动");
     // Never returns: restart() tears down the process, so we don't resolve the command.

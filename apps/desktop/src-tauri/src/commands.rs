@@ -284,7 +284,7 @@ pub async fn list_roots(app: AppHandle) -> Res<Vec<Root>> {
 pub async fn add_root(app: AppHandle, path: String, label: Option<String>) -> Res<Root> {
     let st = app_state(&app);
     let handle = app.clone();
-    block(move || {
+    let root = block(move || {
         let _permit = st.try_begin_index().ok_or("请先停止正在运行的索引或扫描")?;
         let expanded = expand(&path);
         if !expanded.exists() {
@@ -303,7 +303,14 @@ pub async fn add_root(app: AppHandle, path: String, label: Option<String>) -> Re
         let _ = restart_watcher(&st, &handle);
         Ok(root)
     })
-    .await
+    .await?;
+    // 目录里既有文件只有扫描后才会出现：加完直接开跑一轮，不必让人去找「开始索引」。
+    // 许可已被上面的 block 释放；拿不到（监听增量正好在跑）也不算失败，队列稍后会补。
+    let st = app_state(&app);
+    if let Err(e) = spawn_index_thread(&app, &st, auto_mode(&st), None, true) {
+        tracing::warn!("新目录的自动索引未启动：{e}");
+    }
+    Ok(root)
 }
 
 #[tauri::command]
@@ -329,7 +336,15 @@ pub async fn set_root_enabled(app: AppHandle, id: i64, enabled: bool) -> Res<()>
         let _ = restart_watcher(&st, &handle);
         Ok(())
     })
-    .await
+    .await?;
+    if enabled {
+        // 重新启用就该重新纳入索引：跑一轮扫描清掉停用期间的增删，队列里只补真正缺的。
+        let st = app_state(&app);
+        if let Err(e) = spawn_index_thread(&app, &st, auto_mode(&st), None, true) {
+            tracing::warn!("重新启用目录的自动索引未启动：{e}");
+        }
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------------ scanning
@@ -397,19 +412,25 @@ fn scan_all(st: &Arc<AppState>, root_id: Option<i64>) -> Res<ScanReport> {
 #[tauri::command]
 pub fn index_start(app: AppHandle, mode: Option<String>, max_files: Option<usize>, scan: Option<bool>) -> Res<()> {
     let st = app_state(&app);
-    let permit = st.try_begin_index().ok_or("索引正在运行中")?;
-    st.control.reset();
     let m = match mode.as_deref() {
         Some("text") | Some("textOnly") | Some("text_only") => Mode::TextOnly,
         _ => auto_mode(&st),
     };
-    let scan_first = scan.unwrap_or(true);
+    spawn_index_thread(&app, &st, m, max_files, scan.unwrap_or(true))
+}
+
+/// Grab the run slot and hand one pass to the indexer thread. Shared by the explicit
+/// start command and the automatic pass after a root is added or re-enabled.
+fn spawn_index_thread(app: &AppHandle, st: &Arc<AppState>, mode: Mode, max_files: Option<usize>, scan_first: bool) -> Res<()> {
+    let permit = st.try_begin_index().ok_or("索引正在运行中")?;
+    st.control.reset();
     let app2 = app.clone();
+    let st2 = st.clone();
     std::thread::Builder::new()
         .name("sevqo-index".into())
         .spawn(move || {
             let _permit = permit;
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_index(&app2, &st, m, max_files, scan_first)));
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_index(&app2, &st2, mode, max_files, scan_first)));
             let failure: Option<String> = match outcome {
                 Err(_) => {
                     tracing::error!("索引线程异常终止");
@@ -420,8 +441,8 @@ pub fn index_start(app: AppHandle, mode: Option<String>, max_files: Option<usize
             };
             if let Some(message) = failure {
                 // 带上累计值：清零会让界面上的数字在这一帧凭空消失。
-                let last = st.progress_snapshot();
-                emit_progress(&st, &app2, Progress { phase: Phase::Failed, message: Some(message), ..last });
+                let last = st2.progress_snapshot();
+                emit_progress(&st2, &app2, Progress { phase: Phase::Failed, message: Some(message), ..last });
             }
         })
         .map_err(es)?;
