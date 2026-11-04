@@ -23,7 +23,9 @@ fn row_bytes(dim: usize) -> usize {
 }
 
 /// `head` is the first 16 bytes, `total_len` the whole file: the row count lives in the
-/// header, and a file shorter than that count claims is truncated.
+/// header, and a file shorter than that count claims is truncated. Overflow in the
+/// header's own arithmetic means the file claims more address space than exists — reject
+/// rather than carry a suspect header into pointer arithmetic (P0-05).
 fn parse_header(head: &[u8], total_len: usize, path: &Path) -> Result<(usize, usize)> {
     if head.len() < 16 {
         return Err(Error::Config(format!("向量文件已损坏: {}", path.display())));
@@ -33,10 +35,22 @@ fn parse_header(head: &[u8], total_len: usize, path: &Path) -> Result<(usize, us
     }
     let dim = u32::from_le_bytes([head[8], head[9], head[10], head[11]]) as usize;
     let rows = u32::from_le_bytes([head[12], head[13], head[14], head[15]]) as usize;
-    if dim == 0 || total_len < 16 + rows * row_bytes(dim) {
+    if dim == 0 {
+        return Err(Error::Config(format!("向量文件维度为 0: {}", path.display())));
+    }
+    let need = rows
+        .checked_mul(row_bytes(dim))
+        .and_then(|body| body.checked_add(16))
+        .ok_or_else(|| Error::Config(format!("向量文件头超出合法范围: {}", path.display())))?;
+    if total_len < need {
         return Err(Error::Config(format!("向量文件长度不合法: {}", path.display())));
     }
     Ok((dim, rows))
+}
+
+/// Offset of a row's first byte, with the same overflow discipline as `parse_header`.
+fn row_offset(row: usize, dim: usize) -> Option<usize> {
+    row.checked_mul(row_bytes(dim))?.checked_add(16)
 }
 
 /// Write side. Rows are addressed by `vec_map.row_id`, so sparse ids are normal: a
@@ -105,7 +119,11 @@ impl Store {
             }
         }
         let max_row = items.iter().map(|(r, _)| *r).max().unwrap_or(0);
-        let need = 16 + (max_row + 1) * row_bytes(self.dim);
+        let need = max_row
+            .checked_add(1)
+            .and_then(|rows| rows.checked_mul(row_bytes(self.dim)))
+            .and_then(|body| body.checked_add(16))
+            .ok_or_else(|| Error::Config(format!("向量行号 {max_row} 超出合法范围")))?;
         if need > self.file.seek(SeekFrom::End(0))? as usize {
             self.file.set_len(need as u64)?;
         }
@@ -128,8 +146,13 @@ impl Store {
 
     /// Read one row through a fresh mapping-free path (used by tests and compaction).
     pub fn row(&mut self, row: usize) -> Result<Vec<f32>> {
-        let off = 16 + row * row_bytes(self.dim);
-        if off + row_bytes(self.dim) > self.file.seek(SeekFrom::End(0))? as usize {
+        let Some(off) = row_offset(row, self.dim) else {
+            return Err(Error::Config(format!("向量行号 {row} 超出合法范围")));
+        };
+        let need = off
+            .checked_add(row_bytes(self.dim))
+            .ok_or_else(|| Error::Config(format!("向量行号 {row} 超出合法范围")))?;
+        if need > self.file.seek(SeekFrom::End(0))? as usize {
             return Ok(Vec::new());
         }
         let mut buf = vec![0u8; row_bytes(self.dim)];
@@ -144,7 +167,12 @@ impl Store {
     /// Drop dead rows and pack the survivors from row 0. `live` is (old_row, new_row).
     /// The caller must update `vec_map` with the same mapping.
     pub fn compact(&mut self, live: &[(i64, i64)]) -> Result<()> {
-        let mut out: Vec<u8> = Vec::with_capacity(16 + live.len() * row_bytes(self.dim));
+        let capacity = live
+            .len()
+            .checked_mul(row_bytes(self.dim))
+            .and_then(|body| body.checked_add(16))
+            .ok_or_else(|| Error::Config("压缩结果超出合法范围".into()))?;
+        let mut out: Vec<u8> = Vec::with_capacity(capacity);
         out.extend_from_slice(HEADER);
         out.extend_from_slice(&(self.dim as u32).to_le_bytes());
         out.extend_from_slice(&(live.len() as u32).to_le_bytes());
@@ -181,6 +209,7 @@ impl Store {
 }
 
 /// Read side for search: map the file once, scan without copying or holding RAM.
+#[derive(Debug)]
 pub struct MmapView {
     inner: memmap2::Mmap,
     dim: usize,
@@ -188,17 +217,21 @@ pub struct MmapView {
 }
 
 impl MmapView {
-    /// `None` when the store does not exist yet (first run, documents-only index).
+    /// `None` only when there is genuinely nothing to map: no file, or a zero-byte file
+    /// that a just-created store has not written yet. A file that *exists* but fails its
+    /// header check is corruption — report it, never pretend the store is absent and
+    /// silently search with wrong vectors (P0-05).
     pub fn open(path: &Path) -> Result<Option<MmapView>> {
-        if !path.exists() || path.metadata()?.len() < 16 {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let len = path.metadata()?.len() as usize;
+        if len == 0 {
             return Ok(None);
         }
         let file = File::open(path)?;
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        let (dim, rows) = match parse_header(&mmap[..16], mmap.len(), path) {
-            Ok(v) => v,
-            Err(_) => return Ok(None),
-        };
+        let (dim, rows) = parse_header(&mmap[..16.min(mmap.len())], mmap.len(), path)?;
         if rows == 0 {
             return Ok(None);
         }
@@ -212,9 +245,21 @@ impl MmapView {
         self.rows
     }
 
+    /// One row as f32s. Every bound is validated before the unsafe dereference: a row id
+    /// from a confused database can only degrade into an empty slice (which search scores
+    /// below zero), never into an out-of-bounds read. `parse_header` already guarantees
+    /// the file holds `rows` complete rows, so a valid id is always fully mapped.
     pub fn row(&self, row: usize) -> &[f32] {
-        let off = 16 + row * row_bytes(self.dim);
-        if off + row_bytes(self.dim) > self.inner.len() {
+        if row >= self.rows {
+            return &[];
+        }
+        let Some(off) = row_offset(row, self.dim) else {
+            return &[];
+        };
+        let Some(end) = off.checked_add(row_bytes(self.dim)) else {
+            return &[];
+        };
+        if end > self.inner.len() {
             return &[];
         }
         // The file is written as native-aligned f32 at a 4-byte multiple offset.
@@ -277,7 +322,7 @@ pub fn truncate_normalize(v: &[f32], dim: usize) -> Vec<f32> {
 }
 
 pub fn file_size_bytes(rows: usize, dim: usize) -> u64 {
-    (16 + rows * row_bytes(dim)) as u64
+    16u64 + (rows as u64).saturating_mul(row_bytes(dim) as u64)
 }
 
 #[cfg(test)]
@@ -412,5 +457,84 @@ mod tests {
         let hits = view.search(&[1.0, 0.0], &[row(0), row(77)], 5);
         assert_eq!(hits[0].0.row, 0);
         assert!(hits.iter().any(|h| h.1 < 0.0), "missing row must score below zero");
+    }
+
+    // ------------------------------------------------------ P0-05: 边界与溢出
+
+    fn header_bytes(dim: u32, rows: u32) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(HEADER);
+        v.extend_from_slice(&dim.to_le_bytes());
+        v.extend_from_slice(&rows.to_le_bytes());
+        v
+    }
+
+    #[test]
+    fn truncated_or_garbage_files_are_errors_not_silence() {
+        let dir = tempfile::tempdir().unwrap();
+        // 存在但只有半个头：损坏必须报出来，而不是被当成「还没有向量文件」。
+        let p = dir.path().join("truncated.f32");
+        std::fs::write(&p, [0u8; 10]).unwrap();
+        assert!(MmapView::open(&p).is_err(), "半截头必须报错");
+        // 头存在但 magic 不对。
+        let q = dir.path().join("garbage.f32");
+        std::fs::write(&q, [b'X'; 32]).unwrap();
+        assert!(MmapView::open(&q).is_err(), "magic 不符必须报错");
+        // 0 字节文件是合法的「尚未写入」。
+        let e = dir.path().join("empty.f32");
+        std::fs::write(&e, []).unwrap();
+        assert!(MmapView::open(&e).unwrap().is_none());
+    }
+
+    #[test]
+    fn header_claiming_more_rows_than_the_file_has_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("overclaim.f32");
+        let mut bytes = header_bytes(4, 1000);
+        bytes.extend_from_slice(&[0u8; 16]);
+        std::fs::write(&p, &bytes).unwrap();
+        let err = MmapView::open(&p).unwrap_err();
+        assert!(err.to_string().contains("长度不合法"), "{err}");
+    }
+
+    #[test]
+    fn header_that_overflows_the_address_space_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("overflow.f32");
+        let mut bytes = header_bytes(u32::MAX, u32::MAX);
+        bytes.extend_from_slice(&[0u8; 16]);
+        std::fs::write(&p, &bytes).unwrap();
+        let err = MmapView::open(&p).unwrap_err();
+        // 两个极端值相乘会溢出 usize：必须在进入指针运算前拒绝。
+        assert!(err.to_string().contains("超出合法范围"), "{err}");
+    }
+
+    #[test]
+    fn mmap_row_bounds_are_checked_before_the_unsafe_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("v.f32");
+        let mut s = Store::open(&p, 2).unwrap();
+        s.put(0, &[1.0, 0.0]).unwrap();
+        s.put(1, &[0.0, 1.0]).unwrap();
+        s.flush().unwrap();
+        let view = MmapView::open(&p).unwrap().unwrap();
+        assert_eq!(view.row(0), &[1.0, 0.0]);
+        assert!(view.row(2).is_empty(), "恰好等于行数的一行也是越界");
+        assert!(view.row(usize::MAX).is_empty(), "异常大行号不得 panic 或越界读");
+        assert!(view.row(usize::MAX - 5).is_empty());
+    }
+
+    #[test]
+    fn store_rejects_impossible_row_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("v.f32");
+        let mut s = Store::open(&p, 2).unwrap();
+        assert!(s.row(usize::MAX).is_err(), "读取端必须拒绝异常行号");
+        let err = s.put_many(&[(usize::MAX, vec![0.0, 0.0])]).unwrap_err();
+        assert!(err.to_string().contains("超出合法范围"), "{err}");
+        // 失败后文件仍然是干净的：没有留下巨大空洞。
+        s.put(0, &[1.0, 0.0]).unwrap();
+        s.flush().unwrap();
+        assert_eq!(s.rows(), 1);
     }
 }
