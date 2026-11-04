@@ -119,6 +119,77 @@ fn parse_key(k: &str) -> Option<(EmbedRowKind, i64, i64)> {
     Some((EmbedRowKind::parse(t), row.parse().ok()?, ref_id.parse().ok()?))
 }
 
+/// `(row, bytes)` pairs destined for the vector file, in response order.
+type VectorWrites = Vec<(usize, Vec<f32>)>;
+
+/// One file's share of an embed response: how many of its units produced a usable
+/// vector, and the first failure reason if any unit did not.
+#[derive(Debug, PartialEq)]
+struct FileOutcome {
+    file_id: i64,
+    ok: usize,
+    total: usize,
+    err: Option<String>,
+}
+
+/// Validate an embed response against the reserved keys and split it into rows to
+/// persist and rows to publish. Pure, so the whole failure matrix — malformed key,
+/// duplicate row, wrong dimension, NaN/Inf, missing key — is testable without a sidecar
+/// (P0-02). A rejected unit keeps only its staged row: the mapping is never activated,
+/// so search can never see a mapping that points at bytes nobody wrote.
+fn place_vectors(
+    vectors: &std::collections::HashMap<String, Vec<f32>>,
+    errors: &std::collections::HashMap<String, String>,
+    per_file: &[(i64, Vec<String>)],
+    dim: usize,
+) -> (VectorWrites, Vec<i64>, Vec<FileOutcome>) {
+    let mut writes: VectorWrites = Vec::new();
+    let mut rows: Vec<i64> = Vec::new();
+    let mut outcomes = Vec::with_capacity(per_file.len());
+    let mut claimed: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for (file_id, keys) in per_file {
+        let mut ok = 0usize;
+        let mut err: Option<String> = None;
+        for k in keys {
+            let Some((_target, row, _ref)) = parse_key(k) else {
+                err = err.or_else(|| Some(format!("向量键格式错误 {k}")));
+                continue;
+            };
+            if row < 0 {
+                err = err.or_else(|| Some(format!("向量行号 {row} 非法")));
+                continue;
+            }
+            // Two keys addressing one row is a sidecar protocol bug: the later one would
+            // silently overwrite the earlier unit's vector. Claim the row up front, even
+            // before looking up the vector, so a duplicate is caught regardless of
+            // whether the first claim carried usable bytes.
+            if !claimed.insert(row) {
+                err = err.or_else(|| Some(format!("向量行 {row} 被多个键占用")));
+                continue;
+            }
+            let Some(v) = vectors.get(k) else {
+                err = err.or_else(|| Some(errors.get(k).cloned().unwrap_or_else(|| "模型未返回向量".into())));
+                continue;
+            };
+            let mut v = v.clone();
+            if v.len() != dim {
+                err = err.or_else(|| Some(format!("向量维度 {} 不符", v.len())));
+                continue;
+            }
+            if !v.iter().all(|x| x.is_finite()) {
+                err = err.or_else(|| Some("向量包含 NaN/Inf".into()));
+                continue;
+            }
+            normalize(&mut v);
+            writes.push((row as usize, v));
+            rows.push(row);
+            ok += 1;
+        }
+        outcomes.push(FileOutcome { file_id: *file_id, ok, total: keys.len(), err });
+    }
+    (writes, rows, outcomes)
+}
+
 impl Indexer {
     pub fn new(
         db: Arc<Db>,
@@ -424,34 +495,18 @@ impl Indexer {
         let timeout = Duration::from_secs(180 + 60 * (items.len() / batch) as u64);
         let resp = client.embed(&items, batch, timeout)?;
 
-        let mut writes: Vec<(usize, Vec<f32>)> = Vec::new();
+        let (writes, rows, outcomes) =
+            place_vectors(&resp.vectors, &resp.errors, &per_file, self.settings.vector_dim);
         let mut states = Vec::new();
-        for (file_id, keys) in per_file {
-            let mut ok = 0usize;
-            let mut err: Option<String> = None;
-            for k in &keys {
-                if let Some(v) = resp.vectors.get(k) {
-                    let (_target, row, _) = parse_key(k).ok_or_else(|| Error::Infer(format!("向量键格式错误 {k}")))?;
-                    let mut v = v.clone();
-                    if v.len() != self.settings.vector_dim {
-                        err = Some(format!("向量维度 {} 不符", v.len()));
-                        continue;
-                    }
-                    normalize(&mut v);
-                    writes.push((row.max(0) as usize, v));
-                    ok += 1;
-                } else if let Some(e) = resp.errors.get(k) {
-                    err = Some(e.clone());
-                }
-            }
-            if ok > 0 {
-                let note = err.filter(|_| ok < keys.len());
-                states.push((file_id, FileState::Done, note));
+        for fo in &outcomes {
+            if fo.ok > 0 {
+                let note = fo.err.clone().filter(|_| fo.ok < fo.total);
+                states.push((fo.file_id, FileState::Done, note));
                 out.done += 1;
-                out.vectors += ok as u64;
+                out.vectors += fo.ok as u64;
             } else {
-                let msg = err.unwrap_or_else(|| "模型未返回向量".into());
-                states.push((file_id, FileState::Failed, Some(msg)));
+                let msg = fo.err.clone().unwrap_or_else(|| "模型未返回向量".into());
+                states.push((fo.file_id, FileState::Failed, Some(msg)));
                 out.failed += 1;
             }
         }
@@ -460,10 +515,14 @@ impl Indexer {
             let mut g = self.store()?;
             if let Some(store) = g.as_mut() {
                 store.put_many(&writes)?;
+                // fsync before publishing: a mapping must never commit ahead of its bytes.
                 store.flush()?;
             }
         }
-        // Publish rows to search only after their bytes are durably written.
+        // Bytes are durable — publish rows, then file states. Both sit behind the
+        // search-visibility gate (alive=1 AND state='done'), so a crash between these
+        // steps can expose neither a staged row nor a vector-less done file.
+        self.db.activate_vec_rows(&rows)?;
         for (file_id, state, note) in states {
             self.db.set_file_state(file_id, state, note.as_deref())?;
         }
@@ -869,7 +928,8 @@ mod tests {
         idx.scan_root(root, Mode::Full).unwrap();
         let photo = h.db.file_by_path(&path.to_string_lossy()).unwrap();
         h.db.set_file_state(photo.id, FileState::Done, None).unwrap();
-        h.db.reserve_vec_row(EmbedRowKind::Image, photo.id, photo.id).unwrap();
+        let row = h.db.reserve_vec_row(EmbedRowKind::Image, photo.id, photo.id).unwrap();
+        h.db.activate_vec_rows(&[row]).unwrap();
         idx.scan_root(root, Mode::TextOnly).unwrap();
         assert!(h.db.file(photo.id).is_some(), "a text-only pass must not sweep media");
         assert_eq!(h.db.alive_vec_rows().unwrap(), 1);
@@ -902,7 +962,9 @@ mod tests {
         let replacement = h.db.insert_clips(video.id, &[(0.0, 2.0)]).unwrap();
         let next = h.db.reserve_vec_row(EmbedRowKind::Clip, replacement[0].0, video.id).unwrap();
         assert!(next > old);
-        assert_eq!(h.db.dead_rows().unwrap(), 1);
+        // 预留即 staging（alive=0）：旧行作废 + 新行未激活，两行都还不可搜索。
+        assert_eq!(h.db.alive_vec_rows().unwrap(), 0);
+        assert_eq!(h.db.dead_rows().unwrap(), 2);
     }
 
     #[test]
@@ -947,6 +1009,7 @@ mod tests {
         store.put(r1 as usize, &[0.0, 1.0]).unwrap();
         store.flush().unwrap();
         drop(store);
+        h.db.activate_vec_rows(&[r0, r1]).unwrap();
         h.db.delete_by_path("/tmp/one.jpg").unwrap();
         let n = compact(&h.db, &h.paths.vector_path, 2).unwrap();
         assert_eq!(n, 1, "one dead row reclaimed");
@@ -983,11 +1046,13 @@ mod tests {
         let r_ok = h.db.reserve_vec_row(EmbedRowKind::Image, ok, ok).unwrap();
         let r_bad = h.db.reserve_vec_row(EmbedRowKind::Image, bad, bad).unwrap();
         assert!(r_bad > r_ok);
-        // bad 的行只预留不落盘（文件长度恰好盖住 ok 的行）
+        // ok 的行落盘并激活；bad 的行只预留不落盘，也没有激活——这正是嵌入半途失败
+        // 留下的现场。
         let mut store = Store::open(&h.paths.vector_path, 2).unwrap();
         store.put(r_ok as usize, &[1.0, 0.0]).unwrap();
         store.flush().unwrap();
         drop(store);
+        h.db.activate_vec_rows(&[r_ok]).unwrap();
         h.db.set_file_state(bad, FileState::Failed, Some("嵌入失败")).unwrap();
 
         let dropped = compact(&h.db, &h.paths.vector_path, 2).unwrap();
@@ -1025,5 +1090,117 @@ mod tests {
         assert_eq!(dropped, 1);
         assert_eq!(h.db.vec_rows().unwrap(), 0, "没有任何活行");
         assert_eq!(h.db.vec_candidates(&[]).unwrap().len(), 0);
+    }
+
+    // ------------------------------------------------ P0-02: 持久化后才提交映射
+
+    /// 预留（staging）与激活是两步：字节没落盘激活前，映射对搜索不可见；
+    /// 落盘并激活后才可见。这就是「写入中断不产生可见的无效映射」的保证。
+    #[test]
+    fn staged_rows_stay_invisible_until_their_bytes_are_persisted() {
+        let h = harness();
+        h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
+        let seen = crate::db::now_ns();
+        let s = Scanned {
+            root_id: 1,
+            path: "/tmp/a.jpg".into(),
+            name: "a.jpg".into(),
+            ext: "jpg".into(),
+            kind: Kind::Image,
+            size: 1,
+            mtime_ns: seen,
+        };
+        let id = h.db.upsert_file(&s, seen).unwrap().0;
+        h.db.set_file_state(id, FileState::Done, None).unwrap();
+        let row = h.db.reserve_vec_row(EmbedRowKind::Image, id, id).unwrap();
+        let mut store = Store::open(&h.paths.vector_path, 2).unwrap();
+        store.put(row as usize, &[0.0, 1.0]).unwrap();
+        store.flush().unwrap();
+        drop(store);
+
+        // 只写盘、没提交映射：搜索必须看不到它。
+        assert_eq!(h.db.alive_vec_rows().unwrap(), 0);
+        assert!(h.db.vec_candidates(&[]).unwrap().is_empty());
+
+        h.db.activate_vec_rows(&[row]).unwrap();
+        assert_eq!(h.db.alive_vec_rows().unwrap(), 1);
+        let rows = h.db.vec_candidates(&[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].file_id, id);
+        // 激活是幂等的：重复提交不得产生第二条有效映射。
+        h.db.activate_vec_rows(&[row]).unwrap();
+        assert_eq!(h.db.alive_vec_rows().unwrap(), 1);
+    }
+
+    fn kf(row: i64, target: EmbedRowKind, ref_id: i64) -> String {
+        format!("{}:{}:{}", target.as_str(), row, ref_id)
+    }
+
+    #[test]
+    fn place_vectors_rejects_missing_keys_and_relayed_errors() {
+        let mut vectors = std::collections::HashMap::new();
+        vectors.insert(kf(0, EmbedRowKind::Image, 1), vec![1.0, 0.0]);
+        let mut errors = std::collections::HashMap::new();
+        errors.insert(kf(1, EmbedRowKind::Image, 2), "解码失败".to_string());
+        let per_file = vec![
+            (11, vec![kf(0, EmbedRowKind::Image, 1), kf(1, EmbedRowKind::Image, 2)]),
+            (12, vec![kf(2, EmbedRowKind::Image, 3)]),
+        ];
+
+        let (writes, rows, outcomes) = place_vectors(&vectors, &errors, &per_file, 2);
+
+        assert_eq!(writes, vec![(0, vec![1.0, 0.0])]);
+        assert_eq!(rows, vec![0]);
+        assert_eq!(outcomes[0], FileOutcome { file_id: 11, ok: 1, total: 2, err: Some("解码失败".into()) });
+        assert_eq!(outcomes[1], FileOutcome { file_id: 12, ok: 0, total: 1, err: Some("模型未返回向量".into()) });
+    }
+
+    #[test]
+    fn place_vectors_rejects_wrong_dimension_nan_and_duplicate_rows() {
+        let mut vectors = std::collections::HashMap::new();
+        vectors.insert(kf(0, EmbedRowKind::Image, 1), vec![1.0, 0.0, 9.0]); // 维度不符
+        vectors.insert(kf(1, EmbedRowKind::Image, 2), vec![0.0, f32::NAN]); // NaN
+        vectors.insert(kf(2, EmbedRowKind::Image, 3), vec![0.0, 1.0]);
+        vectors.insert(kf(3, EmbedRowKind::Image, 4), vec![1.0, 0.0]);
+        vectors.insert(kf(4, EmbedRowKind::Image, 5), vec![0.5, 0.5]);
+        let per_file = vec![
+            (21, vec![kf(0, EmbedRowKind::Image, 1), kf(1, EmbedRowKind::Image, 2)]),
+            (22, vec![kf(2, EmbedRowKind::Image, 3)]),
+            (23, vec![kf(3, EmbedRowKind::Image, 4), kf(4, EmbedRowKind::Image, 5)]),
+            (24, vec![kf(2, EmbedRowKind::Chunk, 3)]), // 与文件 22 抢同一行
+        ];
+
+        let (writes, rows, outcomes) = place_vectors(&vectors, &errors_empty(), &per_file, 2);
+
+        // 22 与 23 的正常向量被接受；21 维度/NaN 被拒；24 抢行失败。
+        assert_eq!(writes.len(), 3);
+        assert_eq!(rows, vec![2, 3, 4]);
+        assert_eq!(outcomes[0].ok, 0);
+        assert_eq!(outcomes[0].err, Some("向量维度 3 不符".into()));
+        assert_eq!(outcomes[1].ok, 1);
+        assert_eq!(outcomes[2].ok, 2, "正常文件不受别的键影响");
+        assert_eq!(outcomes[3].err.as_deref(), Some("向量行 2 被多个键占用"));
+    }
+
+    #[test]
+    fn place_vectors_rejects_malformed_and_negative_keys() {
+        let mut vectors = std::collections::HashMap::new();
+        vectors.insert("junk".to_string(), vec![1.0, 0.0]);
+        vectors.insert(kf(-7, EmbedRowKind::Image, 1), vec![1.0, 0.0]);
+        let per_file = vec![
+            (31, vec!["junk".to_string()]),
+            (32, vec![kf(-7, EmbedRowKind::Image, 1)]),
+        ];
+
+        let (writes, rows, outcomes) = place_vectors(&vectors, &errors_empty(), &per_file, 2);
+
+        assert!(writes.is_empty());
+        assert!(rows.is_empty());
+        assert_eq!(outcomes[0].err, Some("向量键格式错误 junk".into()));
+        assert_eq!(outcomes[1].err, Some("向量行号 -7 非法".into()));
+    }
+
+    fn errors_empty() -> std::collections::HashMap<String, String> {
+        std::collections::HashMap::new()
     }
 }

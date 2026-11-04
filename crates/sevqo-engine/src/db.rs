@@ -532,12 +532,18 @@ impl Db {
     // -------------------------------------------------------------- vectors
 
     /// Allocate the next physical row in the vector file for an embeddable unit.
+    ///
+    /// The row starts **staged** (`alive=0`): its bytes do not exist yet, so the mapping
+    /// must stay invisible to search. Only [`Self::activate_vec_rows`] — called after the
+    /// vector bytes are durably written and flushed — publishes it (P0-02). A crash in
+    /// between leaves orphaned staged rows that compaction reclaims; a staged row can
+    /// never surface as a valid mapping pointing at missing bytes.
     pub fn reserve_vec_row(&self, target: EmbedRowKind, ref_id: i64, file_id: i64) -> Result<i64> {
         let g = self.write.lock().unwrap();
         g.execute("UPDATE vec_map SET alive=0 WHERE target_kind=? AND ref_id=?", params![target.as_str(), ref_id])?;
         let next: i64 = g.query_row("SELECT COALESCE(MAX(row_id),-1)+1 FROM vec_map", [], |r| r.get(0))?;
         g.execute(
-            "INSERT INTO vec_map(row_id,target_kind,ref_id,file_id,alive) VALUES(?,?,?,?,1)",
+            "INSERT INTO vec_map(row_id,target_kind,ref_id,file_id,alive) VALUES(?,?,?,?,0)",
             params![next, target.as_str(), ref_id, file_id],
         )?;
         match target {
@@ -550,6 +556,22 @@ impl Db {
             EmbedRowKind::Image => {}
         }
         Ok(next)
+    }
+
+    /// Publish staged rows once their bytes are durably on disk. Idempotent: activating
+    /// twice is a no-op, and a unit never owns two live rows because re-reserving it
+    /// tombstones the previous one first.
+    pub fn activate_vec_rows(&self, rows: &[i64]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let g = self.write.lock().unwrap();
+        let placeholders = vec!["?"; rows.len()].join(",");
+        g.execute(
+            &format!("UPDATE vec_map SET alive=1 WHERE row_id IN ({placeholders})"),
+            rusqlite::params_from_iter(rows.iter()),
+        )?;
+        Ok(())
     }
 
     pub fn set_clip_thumb(&self, clip_id: i64, thumb: &str) -> Result<()> {
@@ -904,7 +926,8 @@ mod tests {
         let no_vec = upsert(&db, root, "/tmp/photos/plain.md", Kind::Document);
         let failed = upsert(&db, root, "/tmp/photos/broken.jpg", Kind::Image);
         db.set_file_state(with_vec, FileState::Done, None).unwrap();
-        db.reserve_vec_row(EmbedRowKind::Image, with_vec, with_vec).unwrap();
+        let row = db.reserve_vec_row(EmbedRowKind::Image, with_vec, with_vec).unwrap();
+        db.activate_vec_rows(&[row]).unwrap();
         db.set_file_state(no_vec, FileState::Done, None).unwrap();
         db.set_file_state(failed, FileState::Failed, Some("嵌入失败")).unwrap();
 

@@ -380,15 +380,23 @@ mod tests {
         db.store_text(code, Some("parser.rs"), "Rust parser for the search index", false).unwrap();
         db.insert_clips(vid, &[(0.0, 12.0), (12.0, 24.0)]).unwrap();
         let clips = db.clip_rows(vid).unwrap();
+        let mut reserved: Vec<i64> = Vec::new();
         let clip_rows: Vec<(i64, usize)> = clips
             .iter()
-            .map(|(cid, _, _, _, _)| (*cid, db.reserve_vec_row(EmbedRowKind::Clip, *cid, vid).unwrap() as usize))
+            .map(|(cid, _, _, _, _)| {
+                let r = db.reserve_vec_row(EmbedRowKind::Clip, *cid, vid).unwrap();
+                reserved.push(r);
+                (*cid, r as usize)
+            })
             .collect();
         // image + chunk vectors
         let img_row = db.reserve_vec_row(EmbedRowKind::Image, beach, beach).unwrap();
+        reserved.push(img_row);
         let chunk_row = {
             let cs = db.insert_chunks(code, &["Rust parser for the search index".into()]).unwrap();
-            db.reserve_vec_row(EmbedRowKind::Chunk, cs[0].0, code).unwrap()
+            let r = db.reserve_vec_row(EmbedRowKind::Chunk, cs[0].0, code).unwrap();
+            reserved.push(r);
+            r
         };
         let mut st = Store::open(&vec_path, dim).unwrap();
         // basis-ish vectors so cosine ordering is predictable
@@ -407,6 +415,9 @@ mod tests {
             st.put(*row, &e(idx, v)).unwrap();
         }
         st.flush().unwrap();
+        // Staged rows stay invisible until activated — the test writes the bytes first,
+        // then publishes the mappings, exactly like the indexer does.
+        db.activate_vec_rows(&reserved).unwrap();
         (dir, db, vec_path)
     }
 
