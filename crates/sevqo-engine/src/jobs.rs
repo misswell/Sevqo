@@ -199,6 +199,23 @@ fn place_vectors(
     (writes, rows, outcomes)
 }
 
+/// Re-group one bounded request's items by file, preserving response order. Pure so the
+/// splitting behavior is testable without a sidecar.
+fn regroup_keys(group: &[EmbedItem], file_of_key: &std::collections::HashMap<&str, i64>) -> Vec<(i64, Vec<String>)> {
+    let mut out: Vec<(i64, Vec<String>)> = Vec::new();
+    for it in group {
+        let key = match it {
+            EmbedItem::Text { key, .. } | EmbedItem::Image { key, .. } | EmbedItem::Video { key, .. } => key,
+        };
+        let fid = file_of_key.get(key.as_str()).copied().unwrap_or(-1);
+        match out.last_mut() {
+            Some((last_fid, keys)) if *last_fid == fid => keys.push(key.clone()),
+            _ => out.push((fid, vec![key.clone()])),
+        }
+    }
+    out
+}
+
 /// Best-effort (target, ref) recovery from a malformed key, so the failure still lands
 /// on some unit instead of being silently dropped.
 fn target_of(key: &str) -> EmbedRowKind {
@@ -512,53 +529,89 @@ impl Indexer {
             return Ok(out);
         }
 
+        // 单个请求有界（P1-06 的第一步）：长文档/长视频不再把几百个单元塞进一次
+        // 请求——JSON、Python 内存和取消等待都随之有界。每个子批独立落盘、独立
+        // 激活、独立记账单元状态：中途崩溃只损失未完成子批，已持久化的单元保留。
         let client = self.client.as_ref().ok_or_else(|| Error::Infer("推理进程未启动".into()))?;
         let batch = self.settings.infer_batch.max(1);
-        let timeout = Duration::from_secs(180 + 60 * (items.len() / batch) as u64);
-        let resp = client.embed(&items, batch, timeout)?;
+        let group_size = MAX_EMBED_ITEMS_PER_REQUEST.max(batch);
+        // key -> file：place_vectors 需要按文件归组，而分组会被子批切开。
+        let file_of_key: std::collections::HashMap<&str, i64> = per_file
+            .iter()
+            .flat_map(|(fid, keys)| keys.iter().map(move |k| (k.as_str(), *fid)))
+            .collect();
+        // 每个文件还有多少 key 未结算：最后一个子批结算完才聚合文件状态。
+        let mut remaining: std::collections::HashMap<i64, usize> =
+            per_file.iter().map(|(fid, keys)| (*fid, keys.len())).collect();
+        let mut first_error: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
 
-        let (writes, rows, outcomes) =
-            place_vectors(&resp.vectors, &resp.errors, &per_file, self.settings.vector_dim);
-        let mut states = Vec::new();
-        for fo in &outcomes {
-            out.vectors += fo.ok_units.len() as u64;
-            let msg = fo.err.clone().unwrap_or_else(|| "模型未返回向量".into());
-            states.push((fo.file_id, msg, fo));
-        }
+        for group in items.chunks(group_size) {
+            if self.control.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let timeout = Duration::from_secs(180 + 60 * (group.len() / batch) as u64);
+            let resp = client.embed(group, batch, timeout)?;
 
-        if !writes.is_empty() {
-            let mut g = self.store()?;
-            if let Some(store) = g.as_mut() {
-                store.put_many(&writes)?;
-                // fsync before publishing: a mapping must never commit ahead of its bytes.
-                store.flush()?;
+            let group_per_file = regroup_keys(group, &file_of_key);
+            let (writes, rows, outcomes) =
+                place_vectors(&resp.vectors, &resp.errors, &group_per_file, self.settings.vector_dim);
+            for fo in &outcomes {
+                out.vectors += fo.ok_units.len() as u64;
+                if let Some(err) = &fo.err {
+                    first_error.entry(fo.file_id).or_insert_with(|| err.clone());
+                }
             }
-        }
-        // Bytes are durable — publish rows, then unit states, then file states. All sit
-        // behind the search-visibility gate (alive=1 AND state='done'), so a crash
-        // between these steps can expose neither a staged row nor a vector-less done
-        // file. Failed units keep their state and get retried individually (P0-03).
-        self.db.activate_vec_rows(&rows)?;
-        for (file_id, msg, fo) in states {
-            let ok_units: Vec<(EmbedRowKind, i64)> = fo.ok_units.iter().map(|(t, r, _)| (*t, *r)).collect();
-            self.db.mark_units_persisted(&ok_units)?;
-            if !fo.failed_units.is_empty() {
-                self.db.mark_units_failed(&fo.failed_units, &msg)?;
+
+            if !writes.is_empty() {
+                let mut g = self.store()?;
+                if let Some(store) = g.as_mut() {
+                    store.put_many(&writes)?;
+                    // fsync before publishing: a mapping must never commit ahead of its bytes.
+                    store.flush()?;
+                }
             }
-            let (state, note) = aggregate_file_state(&self.db, file_id, fo)?;
-            match state {
-                FileState::Done => out.done += 1,
-                FileState::Failed => out.failed += 1,
-                _ => {}
+            // Bytes are durable — publish rows, then unit states. All sit behind the
+            // search-visibility gate (alive=1 AND state='done'), so a crash between
+            // these steps can expose neither a staged row nor a vector-less done file.
+            // Failed units keep their state and get retried individually (P0-03).
+            self.db.activate_vec_rows(&rows)?;
+            for fo in &outcomes {
+                let ok_units: Vec<(EmbedRowKind, i64)> = fo.ok_units.iter().map(|(t, r, _)| (*t, *r)).collect();
+                self.db.mark_units_persisted(&ok_units)?;
+                if !fo.failed_units.is_empty() {
+                    let msg = fo.err.clone().unwrap_or_else(|| "模型未返回向量".into());
+                    self.db.mark_units_failed(&fo.failed_units, &msg)?;
+                }
             }
-            self.db.set_file_state(file_id, state, note.as_deref())?;
-        }
-        for (k, thumb) in &resp.thumbs {
-            let Some((target, _row, ref_id)) = parse_key(k) else { continue };
-            match target {
-                EmbedRowKind::Clip => self.db.set_clip_thumb(ref_id, thumb)?,
-                EmbedRowKind::Image => self.db.set_file_meta(ref_id, None, None, None, Some(thumb))?,
-                EmbedRowKind::Chunk => {}
+            // 本文件的全部子批都结算完，才用单元终态聚合文件状态并计数。
+            for fo in &outcomes {
+                let entry = remaining.entry(fo.file_id).or_insert(0);
+                *entry = entry.saturating_sub(fo.total);
+                if *entry > 0 {
+                    continue;
+                }
+                let synthetic = FileOutcome {
+                    file_id: fo.file_id,
+                    ok_units: vec![],
+                    failed_units: vec![],
+                    total: 0,
+                    err: first_error.get(&fo.file_id).cloned(),
+                };
+                let (state, note) = aggregate_file_state(&self.db, fo.file_id, &synthetic)?;
+                match state {
+                    FileState::Done => out.done += 1,
+                    FileState::Failed => out.failed += 1,
+                    _ => {}
+                }
+                self.db.set_file_state(fo.file_id, state, note.as_deref())?;
+            }
+            for (k, thumb) in &resp.thumbs {
+                let Some((target, _row, ref_id)) = parse_key(k) else { continue };
+                match target {
+                    EmbedRowKind::Clip => self.db.set_clip_thumb(ref_id, thumb)?,
+                    EmbedRowKind::Image => self.db.set_file_meta(ref_id, None, None, None, Some(thumb))?,
+                    EmbedRowKind::Chunk => {}
+                }
             }
         }
         Ok(out)
@@ -664,7 +717,7 @@ impl Indexer {
         if !want_vectors || text.trim().is_empty() {
             return Ok(Prepared::Indexed);
         }
-        let chunks = extract::chunk_text(&text, 900, 24);
+        let chunks = extract::chunk_text(&text, 900, MAX_CHUNKS_PER_FILE);
         if chunks.is_empty() {
             return Ok(Prepared::Indexed);
         }
@@ -699,6 +752,15 @@ fn path_str(p: &Path) -> String {
 /// failure with the recorded reason. A manual re-index resets the counters.
 const UNIT_RETRY_MAX: i64 = 3;
 
+/// Upper bound of one inference request: keeps the JSON payload, the sidecar's memory
+/// and the cancel-wait bounded no matter how many chunks a long document produced.
+const MAX_EMBED_ITEMS_PER_REQUEST: usize = 256;
+
+/// 语义索引每份文档的最大片段数。超过后正文仍完整进入 FTS，但语义向量只覆盖前
+/// N 片——文件状态会带说明，绝不静默（审查 P1：原 24 片硬截断导致「关键词能搜到、
+/// 语义搜不到」且无人知晓）。
+const MAX_CHUNKS_PER_FILE: usize = 2048;
+
 /// Fold unit states into the file-level state (P0-03). A file is `done` only when every
 /// unit is persisted; retryable failures re-queue it as `stale` with an explanatory
 /// note, exhausted failures surface as a diagnosable `failed`. Image files have no unit
@@ -725,7 +787,14 @@ fn aggregate_file_state(db: &Db, file_id: i64, fo: &FileOutcome) -> Result<(File
         ));
     }
     if persisted == total {
-        return Ok((FileState::Done, None));
+        // 语义覆盖范围要诚实：正文超过片段预算时说明只覆盖了前 N 片，
+        // 全文仍可按关键词检索。doc.chars 是提取时的真实字符数，跨轮次稳定可推导。
+        let note = db
+            .doc_char_count(file_id)
+            .ok()
+            .filter(|chars| *chars > (MAX_CHUNKS_PER_FILE as i64).saturating_mul(900))
+            .map(|_| format!("正文过长，语义索引覆盖前 {MAX_CHUNKS_PER_FILE} 个片段；全文仍可按关键词检索"));
+        return Ok((FileState::Done, note));
     }
     let waiting = total - persisted;
     let detail = fo.err.clone().or(unit_err).unwrap_or_else(|| "嵌入失败".into());
@@ -1378,6 +1447,88 @@ mod tests {
         };
         assert_eq!(items.len(), 1, "只重试失败的片段");
         assert_eq!(keys.len(), 1);
+    }
+
+    #[test]
+    fn regroup_keys_keeps_files_together_in_response_order() {
+        let item = |key: &str| EmbedItem::Text { key: key.into(), text: "x".into(), title: None, role: "document".into() };
+        let mut map = std::collections::HashMap::new();
+        map.insert("chunk:1:11", 100i64);
+        map.insert("chunk:2:12", 100i64);
+        map.insert("chunk:3:13", 200i64);
+        map.insert("chunk:4:14", 200i64);
+        let group = vec![item("chunk:1:11"), item("chunk:2:12"), item("chunk:3:13"), item("chunk:4:14")];
+
+        let grouped = regroup_keys(&group, &map);
+
+        // 相邻同文件合并，跨文件边界不合并；未知 key 落到 -1 兜底。
+        assert_eq!(grouped, vec![(100, vec!["chunk:1:11".into(), "chunk:2:12".into()]), (200, vec!["chunk:3:13".into(), "chunk:4:14".into()])]);
+        let unknown = vec![item("bogus")];
+        assert_eq!(regroup_keys(&unknown, &map), vec![(-1, vec!["bogus".into()])]);
+    }
+
+    /// 长文档不再被 24 片静默截断：片段按上限同步并全部进入嵌入队列；
+    /// 全部持久化后文件为 done，但状态注明语义只覆盖前 N 片。
+    #[test]
+    fn long_document_gets_full_chunks_and_an_honest_truncation_note() {
+        let h = harness();
+        h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
+        let body = "x".repeat(MAX_CHUNKS_PER_FILE * 900 + 4096); // 超出片段预算
+        let doc = add_doc(&h, "huge.txt", &body);
+        let mut st = text_settings();
+        st.max_text_store_kb = 4096; // 放开 64KB 文本存储，才能看到截断
+        let (idx, _rx) = indexer(&h, st);
+        let rec = h.db.file(doc.id).unwrap();
+
+        let Prepared::Embed { items, keys } = idx.prepare_text(&rec, true).unwrap() else {
+            panic!("长文档应当产出嵌入任务");
+        };
+        assert_eq!(items.len(), MAX_CHUNKS_PER_FILE, "按片段预算截断，而不是 24");
+        assert_eq!(keys.len(), MAX_CHUNKS_PER_FILE);
+
+        // 全部持久化 → done + 截断说明
+        let rows: Vec<i64> = keys.iter().filter_map(|k| parse_key(k).map(|(_, r, _)| r)).collect();
+        h.db.activate_vec_rows(&rows).unwrap();
+        let units: Vec<(EmbedRowKind, i64)> =
+            h.db.chunk_rows(doc.id).unwrap().into_iter().map(|(id, _)| (EmbedRowKind::Chunk, id)).collect();
+        h.db.mark_units_persisted(&units).unwrap();
+        let outcome = FileOutcome {
+            file_id: doc.id,
+            ok_units: units.iter().map(|(_, id)| (EmbedRowKind::Chunk, *id, *id)).collect(),
+            failed_units: vec![],
+            total: units.len(),
+            err: None,
+        };
+        let (state, note) = aggregate_file_state(&h.db, doc.id, &outcome).unwrap();
+        assert_eq!(state, FileState::Done);
+        let note = note.unwrap_or_else(|| panic!("超长正文必须带语义覆盖说明"));
+        assert!(note.contains("2048") && note.contains("关键词"), "{note}");
+
+        // 正常长度文档：单片段持久化后 done 且无说明。
+        let small = add_doc(&h, "small.txt", "很短的内容");
+        let small_rec = h.db.file(small.id).unwrap();
+        let Prepared::Embed { keys: small_keys, .. } = idx.prepare_text(&small_rec, true).unwrap() else {
+            panic!("小文档也应产出嵌入任务");
+        };
+        let small_rows: Vec<i64> = small_keys.iter().filter_map(|k| parse_key(k).map(|(_, r, _)| r)).collect();
+        h.db.activate_vec_rows(&small_rows).unwrap();
+        let small_units: Vec<(EmbedRowKind, i64)> =
+            h.db.chunk_rows(small.id).unwrap().into_iter().map(|(id, _)| (EmbedRowKind::Chunk, id)).collect();
+        h.db.mark_units_persisted(&small_units).unwrap();
+        let (state, note) = aggregate_file_state(
+            &h.db,
+            small.id,
+            &FileOutcome {
+                file_id: small.id,
+                ok_units: small_units.iter().map(|(_, id)| (EmbedRowKind::Chunk, *id, *id)).collect(),
+                failed_units: vec![],
+                total: small_units.len(),
+                err: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(state, FileState::Done);
+        assert!(note.is_none(), "{note:?}");
     }
 
     /// 文件级状态由单元终态聚合：全持久化=done，可重试失败=stale（带解释），

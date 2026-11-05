@@ -605,6 +605,18 @@ impl Db {
         g.query_row("SELECT text FROM text_store WHERE file_id=?", params![file_id], |r| r.get(0)).ok()
     }
 
+    /// Extracted body character count (0 when the file has no doc row). Lets the
+    /// aggregator derive semantic-coverage notes without new schema.
+    pub fn doc_char_count(&self, file_id: i64) -> Result<i64> {
+        let g = self.write.lock().unwrap();
+        let n: i64 = g.query_row(
+            "SELECT COALESCE((SELECT chars FROM doc WHERE file_id=?1),0)",
+            params![file_id],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
     pub fn doc_title(&self, file_id: i64) -> Option<String> {
         let g = self.write.lock().ok()?;
         g.query_row("SELECT title FROM doc WHERE file_id=?", params![file_id], |r| r.get(0)).ok().flatten()

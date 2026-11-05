@@ -50,6 +50,8 @@ class Service:
         }
 
     def embed(self, items: list, batch_size: int = 8) -> dict:
+        # 首次调用在此触发模型加载（load() 幂等）；加载失败会沿各 try 块变成
+        # 逐 key 错误，不会让整个请求失去结构化响应。
         t0 = time.perf_counter()
         vectors: dict = {}
         errors: dict = {}
@@ -133,7 +135,10 @@ class Service:
         }
 
     def serve(self) -> int:
-        self.backend.load()
+        # 惰性加载（P1：PDF 解析脱离模型环境）：probe 与 text 命令不需要 torch 或
+        # 权重，TextOnly 模式因此只要 pypdf 就能用。模型推迟到首个 embed/info 请求
+        # 时加载（load() 幂等）；加载失败以结构化错误返回，embed 的逐 key 错误
+        # 通道保持不变。
         for line in sys.stdin:
             line = line.strip()
             if not line:
