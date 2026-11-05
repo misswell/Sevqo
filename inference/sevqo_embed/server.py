@@ -12,7 +12,7 @@ import sys
 import time
 import traceback
 
-from .config import BackendConfig, PROMPT_QUERY
+from .config import BackendConfig
 from .decode import load_image, probe_media, sample_video, write_thumb
 from .documents import extract_document_text
 from .model import EmbeddingBackend, format_document

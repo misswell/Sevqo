@@ -1,5 +1,4 @@
 import os
-import sys
 from dataclasses import dataclass, field
 
 MODEL_ID = "google/embeddinggemma-2"
