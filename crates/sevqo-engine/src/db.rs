@@ -540,6 +540,27 @@ impl Db {
         Ok(id)
     }
 
+    /// Delete a path and everything beneath it (P1-02): a removed *directory* usually
+    /// arrives as one event for the directory itself, so matching only the exact path
+    /// would orphan every child row — with its FTS text, clips and vector mappings —
+    /// until an unrelated full rescan. The prefix is dir-scoped (`dir/…`), so a file
+    /// whose name merely starts like the deleted path is never touched.
+    pub fn delete_tree(&self, path: &str) -> Result<usize> {
+        let g = self.write.lock().unwrap();
+        let ids: Vec<i64> = {
+            let mut st = g.prepare(
+                "SELECT id FROM file WHERE path=? OR substr(path,1,?)=?||'/'",
+            )?;
+            let rows = st.query_map(params![path, path.chars().count() as i64 + 1, path], |r| r.get(0))?;
+            rows.filter_map(|x| x.ok()).collect()
+        };
+        let n = ids.len();
+        if n > 0 {
+            purge_files(&g, &ids)?;
+        }
+        Ok(n)
+    }
+
     // ------------------------------------------------------------- full text
 
     /// Store extracted text plus the segmented FTS row. `fts` is contentless, so
@@ -1385,6 +1406,32 @@ mod tests {
         assert_eq!(db.alive_vec_rows().unwrap(), 0, "变化单元的向量行已作废");
         assert_eq!(st(second[3].0), "pending");
         assert_eq!(db.unit_summary(id, 3).unwrap(), UnitSummary { total: 4, persisted: 0, exhausted: 0, retryable: 0, error: None });
+    }
+
+    /// 目录被删除时按「本路径及子路径」清理：子文件的行、FTS、向量映射随目录
+    /// 一起走；名字恰好同前缀的文件不受影响。
+    #[test]
+    fn deleting_a_directory_clears_its_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("i.sqlite")).unwrap();
+        let root = db.add_root("/tmp/roots", "根").unwrap();
+        let child = upsert(&db, root, "/tmp/roots/会议记录/a.md", Kind::Document);
+        let deep = upsert(&db, root, "/tmp/roots/会议记录/2026/b.md", Kind::Document);
+        let sibling = upsert(&db, root, "/tmp/roots/会议纪要.md", Kind::Document);
+        for id in [child, deep, sibling] {
+            db.set_file_state(id, FileState::Done, None).unwrap();
+        }
+        let row = db.reserve_vec_row(EmbedRowKind::Image, child, child).unwrap();
+        db.activate_vec_rows(&[row]).unwrap();
+        assert_eq!(db.alive_vec_rows().unwrap(), 1);
+
+        let n = db.delete_tree("/tmp/roots/会议记录").unwrap();
+
+        assert_eq!(n, 2, "目录内两个文件被清理");
+        assert!(db.file(child).is_none());
+        assert!(db.file(deep).is_none());
+        assert_eq!(db.alive_vec_rows().unwrap(), 0, "子文件的向量映射一并回收");
+        assert!(db.file(sibling).is_some(), "同前缀不同名的文件不受影响");
     }
 
     /// 失败计数与聚合：可重试的失败让文件回 stale，重试耗尽则判 failed，

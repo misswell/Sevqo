@@ -1116,6 +1116,56 @@ mod tests {
         assert!((hits[0].1 - 1.0).abs() < 1e-6, "row pointers must follow compaction");
     }
 
+    /// 重建（不清空向量文件）不得让旧行字节冒充新向量：reindex_all 清掉映射后，
+    /// 新一轮预留同一行号，只有这一轮的字节落盘并激活后该行才可见；
+    /// 推理失败时旧行内容必须保持不可见（P0 数据污染回归）。
+    #[test]
+    fn rebuilding_without_wiping_never_serves_stale_row_bytes() {
+        let h = harness();
+        h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
+        let seen = crate::db::now_ns();
+        let mk = |path: &str| Scanned {
+            root_id: 1,
+            path: path.into(),
+            name: path.rsplit('/').next().unwrap_or(path).into(),
+            ext: "jpg".into(),
+            kind: Kind::Image,
+            size: 1,
+            mtime_ns: seen,
+        };
+        let a = h.db.upsert_file(&mk("/tmp/a.jpg"), seen).unwrap().0;
+        h.db.set_file_state(a, FileState::Done, None).unwrap();
+        let old_row = h.db.reserve_vec_row(EmbedRowKind::Image, a, a).unwrap();
+        let mut store = Store::open(&h.paths.vector_path, 2).unwrap();
+        store.put(old_row as usize, &[1.0, 0.0]).unwrap();
+        store.flush().unwrap();
+        drop(store);
+        h.db.activate_vec_rows(&[old_row]).unwrap();
+        assert_eq!(h.db.vec_candidates(&[]).unwrap().len(), 1);
+
+        // 保留向量文件重建：映射清空，文件回到队列，重新预留同一行号。
+        h.db.reindex_all().unwrap();
+        assert_eq!(h.db.vec_rows().unwrap(), 0, "映射已清空");
+        let row = h.db.reserve_vec_row(EmbedRowKind::Image, a, a).unwrap();
+        assert_eq!(row, old_row, "新一轮从同一行号重新分配");
+        // 这轮推理失败：字节没写、映射没激活。
+        assert!(h.db.vec_candidates(&[]).unwrap().is_empty(), "旧行字节不得冒充本轮向量");
+        assert_eq!(h.db.alive_vec_rows().unwrap(), 0);
+
+        // 推理成功：新字节落盘并激活后才可见。
+        let mut store = Store::open(&h.paths.vector_path, 2).unwrap();
+        store.put(row as usize, &[0.0, 1.0]).unwrap();
+        store.flush().unwrap();
+        drop(store);
+        h.db.activate_vec_rows(&[row]).unwrap();
+        h.db.set_file_state(a, FileState::Done, None).unwrap();
+        let rows = h.db.vec_candidates(&[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        let view = crate::vectors::MmapView::open(&h.paths.vector_path).unwrap().unwrap();
+        let hits = view.search(&[0.0, 1.0], &rows, 4);
+        assert!((hits[0].1 - 1.0).abs() < 1e-6, "可见的必须是本轮新向量，不是旧字节");
+    }
+
     /// 嵌入失败只预留了行、字节没落盘：这些行必须被压缩回收。修复前它们被当作
     /// 活行拷贝成零向量；若向量文件还没建立，`Store::compact` 更会因行越界整体失败。
     #[test]

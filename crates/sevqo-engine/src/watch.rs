@@ -296,9 +296,12 @@ pub fn apply_change_with_options(db: &crate::db::Db, change: &Change, opts: &cra
     }
 
     if matches!(change, Change::Removed(_)) || !path.exists() {
-        return match db.delete_by_path(&s)? {
-            Some(_) => Ok(Applied::Removed),
-            None => Ok(Applied::Ignored),
+        // 删除的可能是整个目录：按「本路径及子路径」清，而不是只删同名记录，
+        // 否则目录级删除事件会把子文件的行、FTS 和向量映射整体留在库里（P1-02）。
+        return if db.delete_tree(&s)? > 0 {
+            Ok(Applied::Removed)
+        } else {
+            Ok(Applied::Ignored)
         };
     }
 

@@ -853,7 +853,7 @@ mod tests {
         // 再解析一次是幂等的：不会再次改名，也不会丢数据。
         let again = active_vector_path(&base, &db).unwrap();
         assert_eq!(again, gen_path(&base, 1));
-        let mut s = Store::open(&again, 2).unwrap();
+        let s = Store::open(&again, 2).unwrap();
         assert_eq!(s.rows(), 2);
     }
 
@@ -943,7 +943,7 @@ mod tests {
     #[test]
     fn written_generation_roundtrips_and_deletes_no_source() {
         let dir = tempfile::tempdir().unwrap();
-        let (base, db) = seeded_store(&dir, "vectors.f32");
+        let (base, _db) = seeded_store(&dir, "vectors.f32");
         let gen1 = gen_path(&base, 1);
         let sha = write_generation(&gen1, &gen_tmp_path(&base, 2), 2, &[(1, 0)]).unwrap();
         assert_eq!(sha.len(), 64);
