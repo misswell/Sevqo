@@ -60,7 +60,67 @@ export function useDebounced<A>(action: (arg: A) => void, wait: number): Debounc
 
 // ---------------------------------------------------------------- thumbnails
 
-const thumbCache = new Map<string, string | null>();
+/**
+ * Bounded LRU (P2-03): browsing a large library used to grow these Maps without limit —
+ * data-URL thumbnails are megabytes of base64 each. The cache is now capped by *bytes*
+ * (UTF-16 code units, which is what a retained string costs) instead of entry count alone,
+ * and null results expire so a temporary failure does not stick forever.
+ */
+type CacheEntry<V> = { v: V; bytes: number; at: number };
+
+class Lru<V> {
+  private map = new Map<string, CacheEntry<V>>();
+  private total = 0;
+  constructor(
+    private maxBytes: number,
+    private maxEntries: number,
+  ) {}
+
+  get(key: string): CacheEntry<V> | undefined {
+    const e = this.map.get(key);
+    if (!e) return undefined;
+    // re-insert to mark as most recently used
+    this.map.delete(key);
+    this.map.set(key, e);
+    return e;
+  }
+
+  set(key: string, v: V, bytes: number): void {
+    const prev = this.map.get(key);
+    if (prev) {
+      this.total -= prev.bytes;
+      this.map.delete(key);
+    }
+    this.map.set(key, { v, bytes, at: Date.now() });
+    this.total += bytes;
+    while ((this.total > this.maxBytes || this.map.size > this.maxEntries) && this.map.size > 1) {
+      const oldest = this.map.keys().next().value as string;
+      const e = this.map.get(oldest);
+      if (e) this.total -= e.bytes;
+      this.map.delete(oldest);
+    }
+  }
+
+  delete(key: string): void {
+    const e = this.map.get(key);
+    if (e) this.total -= e.bytes;
+    this.map.delete(key);
+  }
+
+  clear(): void {
+    this.map.clear();
+    this.total = 0;
+  }
+
+  keys(): string[] {
+    return [...this.map.keys()];
+  }
+}
+
+/** A failed thumbnail is retried after this long instead of being cached forever. */
+const NEGATIVE_TTL_MS = 30_000;
+/** ~48 MiB of data URLs, or 400 entries, whichever comes first. */
+const thumbCache = new Lru<string | null>(48 * 1024 * 1024, 400);
 const inflight = new Map<string, Promise<string | null>>();
 
 /**
@@ -86,7 +146,16 @@ function useCacheVersion(): number {
 }
 
 function cached(key: string): string | null | undefined {
-  return thumbCache.has(key) ? (thumbCache.get(key) ?? null) : undefined;
+  const e = thumbCache.get(key);
+  if (!e) return undefined;
+  if (e.v === null) {
+    if (Date.now() - e.at > NEGATIVE_TTL_MS) {
+      thumbCache.delete(key);
+      return undefined;
+    }
+    return null;
+  }
+  return e.v;
 }
 
 function loadFileThumb(fileId: number): Promise<string | null> {
@@ -97,7 +166,7 @@ function loadFileThumb(fileId: number): Promise<string | null> {
     .thumb(fileId)
     .catch(() => null)
     .then((v) => {
-      thumbCache.set(key, v);
+      thumbCache.set(key, v, v ? v.length * 2 : 0);
       inflight.delete(key);
       return v;
     });
@@ -113,7 +182,7 @@ function loadClipThumb(fileId: number, clipId: number): Promise<string | null> {
     .clipThumb(fileId, clipId)
     .catch(() => null)
     .then((v) => {
-      thumbCache.set(key, v);
+      thumbCache.set(key, v, v ? v.length * 2 : 0);
       inflight.delete(key);
       return v;
     });
@@ -129,10 +198,10 @@ export function invalidateFileCache(fileId?: number): void {
     bumpCacheVersion();
     return;
   }
-  for (const key of [...thumbCache.keys()]) {
+  for (const key of thumbCache.keys()) {
     if (key === `f:${fileId}` || key.startsWith(`c:${fileId}:`)) thumbCache.delete(key);
   }
-  momentCache.delete(fileId);
+  momentCache.delete(momentsKey(fileId));
   bumpCacheVersion();
 }
 
@@ -214,11 +283,13 @@ export function useInView<T extends HTMLElement>(): [RefObject<T>, boolean] {
 }
 
 /** Moments for one file, fetched on demand and memoised per file id. */
-const momentCache = new Map<number, Moment[]>();
+/** Moments are small but there can be many files; cap by entry count and rough bytes. */
+const momentCache = new Lru<Moment[]>(8 * 1024 * 1024, 200);
+const momentsKey = (fileId: number): string => `m:${fileId}`;
 
 export function useMoments(fileId: number | null): Moment[] | null {
   const [moments, setMoments] = useState<Moment[] | null>(
-    fileId != null ? (momentCache.get(fileId) ?? null) : null,
+    fileId != null ? (momentCache.get(momentsKey(fileId))?.v ?? null) : null,
   );
   const version = useCacheVersion();
   useEffect(() => {
@@ -226,7 +297,7 @@ export function useMoments(fileId: number | null): Moment[] | null {
       setMoments(null);
       return;
     }
-    const cachedForFile = momentCache.get(fileId);
+    const cachedForFile = momentCache.get(momentsKey(fileId))?.v;
     if (cachedForFile) {
       setMoments(cachedForFile);
       return;
@@ -236,7 +307,7 @@ export function useMoments(fileId: number | null): Moment[] | null {
     void api
       .moments(fileId)
       .then((m) => {
-        momentCache.set(fileId, m);
+        momentCache.set(momentsKey(fileId), m, JSON.stringify(m).length * 2);
         if (alive) setMoments(m);
       })
       .catch(() => {

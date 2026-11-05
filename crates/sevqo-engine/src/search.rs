@@ -17,6 +17,10 @@ use crate::{Channel, EmbedItem, Error, FileRecord, Hit, Moment, Result, SearchRe
 
 const RRF_K: f64 = 60.0;
 
+/// How many of a file's own clips may appear in one result. Enough to show the shape of a
+/// match, bounded regardless of video length.
+const CLIPS_PER_FILE_IN_RESULT: usize = 4;
+
 pub struct Searcher {
     db: Arc<Db>,
     /// The store's base path (`vectors.f32`); the file actually mapped is the active
@@ -85,10 +89,14 @@ impl Searcher {
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
-        // over-fetch: several clips of one video can win, and they collapse into one file
-        let scored = view.search(query, &candidates, limit.saturating_mul(6).max(120));
+        // Score *every* candidate, then rank files by their best unit (P2-01). A fixed
+        // over-fetch used to decide the shortlist before collapsing clips into files, so a
+        // long video with dozens of strong clips could push other files out entirely.
+        // Scoring all candidates costs one sort we were already paying, and removes that
+        // bias: each file competes with its best unit only.
+        let scored = view.search(query, &candidates, candidates.len());
 
-        // (file_id, best_score) plus per-clip hits for videos
+        // (file_id, best_score) plus a bounded set of the file's best clips.
         let mut files: Vec<(i64, f32)> = Vec::new();
         let mut clips: std::collections::HashMap<i64, Vec<(i64, i64, i64, f32, Option<String>)>> =
             std::collections::HashMap::new();
@@ -109,10 +117,16 @@ impl Searcher {
                 }
             }
             if row.target == crate::EmbedRowKind::Clip {
-                clips
-                    .entry(row.file_id)
-                    .or_default()
-                    .push((row.ref_id, 0, 0, score, None));
+                // Bounded per file: a 1-hour video must not hand the UI hundreds of
+                // moments, and per-file ranking is what matters, not raw clip count.
+                let list = clips.entry(row.file_id).or_default();
+                if list.len() < CLIPS_PER_FILE_IN_RESULT {
+                    list.push((row.ref_id, 0, 0, score, None));
+                    list.sort_by(|a, b| b.3.total_cmp(&a.3));
+                } else if score > list[CLIPS_PER_FILE_IN_RESULT - 1].3 {
+                    list[CLIPS_PER_FILE_IN_RESULT - 1] = (row.ref_id, 0, 0, score, None);
+                    list.sort_by(|a, b| b.3.total_cmp(&a.3));
+                }
             }
         }
         files.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -604,6 +618,69 @@ mod tests {
         let a = 1.0 / (RRF_K + 1.0);
         let b = 1.0 / (RRF_K + 2.0);
         assert!(a > b);
+    }
+
+    /// 一个长视频的几十上百个切片不得挤掉其他文件（P2-01）：文件级按最佳单元排序，
+    /// 单文件结果内的片段数有上界。
+    #[test]
+    fn a_long_video_does_not_monopolise_the_result_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("i.sqlite")).unwrap();
+        let vec_path = dir.path().join("v.f32");
+        let root = db.add_root("/tmp/videos", "视频").unwrap();
+        let seen = crate::db::now_ns();
+        let mut rows: Vec<i64> = Vec::new();
+        let mut push_file = |name: &str, kind: Kind, clips: usize| -> i64 {
+            let s = Scanned {
+                root_id: root,
+                path: format!("/tmp/videos/{name}"),
+                name: name.into(),
+                ext: name.rsplit('.').next().unwrap_or("").into(),
+                kind,
+                size: 1,
+                mtime_ns: seen,
+            };
+            let id = db.upsert_file(&s, seen).unwrap().0;
+            db.set_file_state(id, crate::FileState::Done, None).unwrap();
+            if clips > 0 {
+                let windows: Vec<(f64, f64)> = (0..clips).map(|i| (i as f64, i as f64 + 1.0)).collect();
+                let inserted = db.sync_clips(id, &windows).unwrap();
+                for (cid, _) in inserted {
+                    let r = db.reserve_vec_row(EmbedRowKind::Clip, cid, id).unwrap();
+                    rows.push(r);
+                }
+            } else {
+                let r = db.reserve_vec_row(EmbedRowKind::Image, id, id).unwrap();
+                rows.push(r);
+            }
+            id
+        };
+        let long = push_file("long.mp4", Kind::Video, 300);
+        let photos: Vec<i64> = (0..3).map(|i| push_file(&format!("p{i}.jpg"), Kind::Image, 0)).collect();
+
+        let mut store = Store::open(&vec_path, 4).unwrap();
+        for (i, r) in rows.iter().enumerate() {
+            // 视频切片与查询完全一致；图片稍弱但同样相关
+            let v = if i < 300 { vec![1.0, 0.0, 0.0, 0.0] } else { vec![0.8, 0.6, 0.0, 0.0] };
+            store.put(*r as usize, &v).unwrap();
+        }
+        store.flush().unwrap();
+        drop(store);
+        db.activate_vec_rows(&rows).unwrap();
+
+        let s = Searcher::new(Arc::new(db), &vec_path).unwrap();
+        let mut q = vec![0.0f32; 4];
+        q[0] = 1.0;
+        let hits = s.semantic(&req("x"), &q, 4).unwrap();
+
+        assert_eq!(hits.len(), 4, "四个文件都要在结果里: {hits:?}");
+        assert_eq!(hits[0].0, long, "视频按最佳切片排第一");
+        for id in &photos {
+            assert!(hits.iter().any(|(fid, _, _)| fid == id), "相关图片不得被长视频挤掉");
+        }
+        let video_moments = &hits[0].2;
+        assert!(video_moments.len() <= CLIPS_PER_FILE_IN_RESULT, "单文件片段数必须有上界");
+        assert!((video_moments[0].3 - 1.0).abs() < 1e-6, "命中片段要带真实相似度");
     }
 
     #[test]

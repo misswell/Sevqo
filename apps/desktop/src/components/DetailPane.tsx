@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactElement } from 'react';
+import { useEffect, useMemo, useState, type ReactElement } from 'react';
 
 import { api, errorText } from '../api';
 import type { FileRecord, Hit, Moment, Root } from '../types';
@@ -28,7 +28,7 @@ function MomentRow({
       <span className="moment-range mono">
         {formatDurationMs(moment.startMs)}–{formatDurationMs(moment.endMs)}
       </span>
-      <span className="moment-score mono">{formatScore(moment.score)}</span>
+      {moment.score > 0 ? <span className="moment-score mono">{formatScore(moment.score)}</span> : null}
     </button>
   );
 }
@@ -45,7 +45,13 @@ export function DetailPane({
   const [record, setRecord] = useState<FileRecord | null>(null);
   const [error, setError] = useState<string | null>(null);
   const fileId = hit?.fileId ?? null;
-  const moments = useMoments(fileId);
+  const timeline = useMoments(fileId);
+  // 本次查询命中的片段来自 Hit.moments（带真实相似度，服务端已按相关度排序）；
+  // 完整时间轴另取一次，按时间排序、不带分数（P2-02）。
+  const hitMoments = useMemo(
+    () => [...(hit?.moments ?? [])].sort((a, b) => b.score - a.score),
+    [hit],
+  );
   const [previewRef, previewSeen] = useInView<HTMLDivElement>();
   const thumb = useThumb(fileId, previewSeen);
 
@@ -81,7 +87,7 @@ export function DetailPane({
   };
 
   const root = roots.find((r) => r.id === record?.rootId) ?? null;
-  const showsMoments = hit.kind === 'video' || (moments?.length ?? 0) > 0;
+  const showsMoments = hit.kind === 'video' || hitMoments.length > 0 || (timeline?.length ?? 0) > 0;
 
   return (
     <aside className="pane">
@@ -134,17 +140,32 @@ export function DetailPane({
         {showsMoments ? (
           <section className="pane-block">
             <header className="pane-block-title">{labels.detail.moments}</header>
-            {moments == null ? (
-              <p className="muted">{labels.common.loading}</p>
-            ) : moments.length === 0 ? (
-              <p className="muted">{labels.detail.momentsEmpty}</p>
-            ) : (
+            {hitMoments.length > 0 ? (
               <div className="moment-list">
-                {moments.slice(0, 12).map((m) => (
-                  <MomentRow key={`${m.clipId}-${m.startMs}`} fileId={hit.fileId} moment={m} onPlay={() => onMoment(hit, m)} />
+                {hitMoments.slice(0, 12).map((m) => (
+                  <MomentRow key={`hit-${m.clipId}-${m.startMs}`} fileId={hit.fileId} moment={m} onPlay={() => onMoment(hit, m)} />
                 ))}
               </div>
+            ) : timeline == null ? (
+              <p className="muted">{labels.common.loading}</p>
+            ) : (
+              <p className="muted">{labels.detail.momentsEmpty}</p>
             )}
+          </section>
+        ) : null}
+
+        {showsMoments && (timeline?.length ?? 0) > 0 ? (
+          <section className="pane-block">
+            <header className="pane-block-title">{labels.detail.timeline}</header>
+            <p className="muted">{labels.detail.timelineHint}</p>
+            <div className="moment-list">
+              {[...(timeline ?? [])]
+                .sort((a, b) => a.startMs - b.startMs)
+                .slice(0, 12)
+                .map((m) => (
+                  <MomentRow key={`tl-${m.clipId}-${m.startMs}`} fileId={hit.fileId} moment={m} onPlay={() => onMoment(hit, m)} />
+                ))}
+            </div>
           </section>
         ) : null}
 

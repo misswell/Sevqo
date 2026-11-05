@@ -113,10 +113,39 @@ fn truncate_bytes(s: &mut String, max_bytes: usize) -> bool {
 
 // --------------------------------------------------------------------------- docx
 
+/// Resource limits for untrusted ZIP containers (ZIP bomb protection, P1-11).
+/// Compression ratio is checked too: a 1 KB entry that inflates to 60 MB is the shape
+/// of an attack, not of a document.
+#[derive(Debug, Clone, Copy)]
+struct ZipLimits {
+    max_entries: usize,
+    max_entry_bytes: u64,
+    max_total_bytes: u64,
+    max_ratio: u64,
+}
+
+const DOCX_LIMITS: ZipLimits = ZipLimits {
+    max_entries: 1024,
+    max_entry_bytes: 64 * 1024 * 1024,
+    max_total_bytes: 128 * 1024 * 1024,
+    max_ratio: 200,
+};
+
 fn docx_text(raw: &[u8]) -> Result<String> {
+    docx_text_with(raw, DOCX_LIMITS)
+}
+
+fn docx_text_with(raw: &[u8], limits: ZipLimits) -> Result<String> {
     use std::io::{Cursor, Read};
     let mut archive = zip::ZipArchive::new(Cursor::new(raw.to_vec()))
         .map_err(|e| Error::Unsupported(format!("DOCX 解析失败: {e}")))?;
+    if archive.len() > limits.max_entries {
+        return Err(Error::Unsupported(format!(
+            "DOCX 条目过多（{} > {}），已拒绝解析",
+            archive.len(),
+            limits.max_entries
+        )));
+    }
     let mut parts = vec!["word/document.xml"];
     // headers/footers carry titles and footnotes people actually search for
     let names: Vec<String> = archive
@@ -126,16 +155,39 @@ fn docx_text(raw: &[u8]) -> Result<String> {
         .collect();
     parts.extend(names.iter().map(|s| s.as_str()));
     let mut out = String::new();
+    let mut total: u64 = 0;
     for name in parts {
-        let mut idx = match archive.by_name(name) {
+        let idx = match archive.by_name(name) {
             Ok(f) => f,
             Err(_) => continue,
         };
-        if idx.compressed_size() > 32 * 1024 * 1024 {
-            continue;
+        // Declared uncompressed size and ratio are checked before any decompression.
+        let declared = idx.size();
+        let compressed = idx.compressed_size().max(1);
+        if declared > limits.max_entry_bytes {
+            return Err(Error::Unsupported(format!(
+                "DOCX 条目 {name} 解压后过大（{declared} 字节），已拒绝解析"
+            )));
         }
-        let mut xml = String::new();
-        idx.read_to_string(&mut xml)?;
+        if declared / compressed > limits.max_ratio {
+            return Err(Error::Unsupported(format!(
+                "DOCX 条目 {name} 压缩比异常（{}:1），已拒绝解析",
+                declared / compressed
+            )));
+        }
+        // The header's own claim is not trusted: read at most the cap plus one byte.
+        let mut buf = Vec::new();
+        idx.take(limits.max_entry_bytes + 1).read_to_end(&mut buf)?;
+        if buf.len() as u64 > limits.max_entry_bytes {
+            return Err(Error::Unsupported(format!(
+                "DOCX 条目 {name} 解压超出上限，已拒绝解析"
+            )));
+        }
+        total += buf.len() as u64;
+        if total > limits.max_total_bytes {
+            return Err(Error::Unsupported("DOCX 解压总量超出上限，已拒绝解析".into()));
+        }
+        let xml = String::from_utf8_lossy(&buf);
         out.push_str(&xml_paragraphs(&xml));
     }
     Ok(out)
@@ -187,20 +239,28 @@ fn unescape_xml(s: &str) -> String {
 
 // ---------------------------------------------------------------------------- rtf
 
+/// RTF `\uN` carries a *signed 16-bit* UTF-16 code unit, and characters outside the BMP
+/// arrive as surrogate pairs. `\ucN` says how many fallback characters follow each `\uN`
+/// and is scoped to the enclosing group, so it needs a stack (P2-12).
 fn rtf_text(raw: &[u8]) -> String {
     let mut out = String::new();
     let mut i = 0usize;
     let mut skip_group_depth = 0usize;
     let mut depth = 0usize;
+    let mut uc: usize = 1;
+    let mut uc_stack: Vec<usize> = Vec::new();
+    let mut pending_high: Option<u16> = None;
     while i < raw.len() {
         let b = raw[i];
         match b {
             b'{' => {
                 depth += 1;
+                uc_stack.push(uc);
                 i += 1;
             }
             b'}' => {
                 depth = depth.saturating_sub(1);
+                uc = uc_stack.pop().unwrap_or(1);
                 if skip_group_depth > 0 && depth < skip_group_depth {
                     skip_group_depth = 0;
                 }
@@ -246,23 +306,24 @@ fn rtf_text(raw: &[u8]) -> String {
                             .map(|c| *c as char)
                             .collect();
                         if let Ok(v) = n.parse::<i64>() {
+                            // signed 16-bit → code unit; negatives wrap into 0x8000..=0xFFFF
+                            let unit = if v < 0 { (v + 65_536) as u16 } else { (v & 0xFFFF) as u16 };
                             if skip_group_depth == 0 {
-                                if let Some(c) = char::from_u32(v.unsigned_abs() as u32) {
-                                    out.push(c);
-                                }
+                                push_code_unit(&mut out, &mut pending_high, unit);
                             }
                         }
                         i += 1 + n.len();
                         if raw.get(i).copied() == Some(b' ') {
                             i += 1;
                         }
-                        // the ANSI fallback character that follows \uN is not text
-                        if raw.get(i).copied() == Some(b'?') {
-                            i += 1;
-                        } else if raw.get(i).copied() == Some(b'\\')
-                            && raw.get(i + 1).copied() == Some(b'\'')
-                        {
-                            i += 3;
+                        // Skip exactly `uc` fallback characters (default 1): either a
+                        // single byte or a \'hh escape, which is one character.
+                        for _ in 0..uc {
+                            match raw.get(i).copied() {
+                                Some(b'\\') if raw.get(i + 1).copied() == Some(b'\'') => i += 4,
+                                Some(_) => i += 1,
+                                None => break,
+                            }
                         }
                     }
                     w => {
@@ -298,7 +359,9 @@ fn rtf_text(raw: &[u8]) -> String {
                         if raw.get(i).copied() == Some(b' ') {
                             i += 1;
                         }
-                        if matches!(w, "par" | "line" | "sect") {
+                        if w == "uc" {
+                            uc = num.parse::<i64>().unwrap_or(1).clamp(0, 32) as usize;
+                        } else if matches!(w, "par" | "line" | "sect") {
                             if skip_group_depth == 0 {
                                 out.push('\n');
                             }
@@ -326,7 +389,36 @@ fn rtf_text(raw: &[u8]) -> String {
             }
         }
     }
+    if pending_high.take().is_some() {
+        out.push(char::REPLACEMENT_CHARACTER);
+    }
     dedup_blank_lines(&out)
+}
+
+/// Emit one UTF-16 code unit, pairing surrogates. An unpaired surrogate becomes U+FFFD
+/// rather than silently disappearing or turning into a wrong character.
+fn push_code_unit(out: &mut String, pending: &mut Option<u16>, unit: u16) {
+    match unit {
+        0xD800..=0xDBFF => {
+            if pending.take().is_some() {
+                out.push(char::REPLACEMENT_CHARACTER);
+            }
+            *pending = Some(unit);
+        }
+        0xDC00..=0xDFFF => match pending.take() {
+            Some(high) => {
+                let cp = 0x1_0000 + (((high as u32 - 0xD800) << 10) | (unit as u32 - 0xDC00));
+                out.push(char::from_u32(cp).unwrap_or(char::REPLACEMENT_CHARACTER));
+            }
+            None => out.push(char::REPLACEMENT_CHARACTER),
+        },
+        _ => {
+            if pending.take().is_some() {
+                out.push(char::REPLACEMENT_CHARACTER);
+            }
+            out.push(char::from_u32(unit as u32).unwrap_or(char::REPLACEMENT_CHARACTER));
+        }
+    }
 }
 
 /// RTF is byte-oriented: newer files embed UTF-8 text directly, older ANSI ones use a
@@ -544,5 +636,74 @@ mod tests {
         assert!(native("docx"));
         assert!(!native("pdf"));
         assert!(!native("jpg"));
+    }
+
+    // ------------------------------------------- DOCX ZIP 资源限制（P1-11）
+
+    fn zip_with(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, body) in entries {
+            w.start_file(*name, opts).unwrap();
+            w.write_all(body).unwrap();
+        }
+        w.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn docx_rejects_oversized_and_high_ratio_entries() {
+        // 声明大小超上限：直接拒绝，不做解压。
+        let small_limits = ZipLimits {
+            max_entries: 16,
+            max_entry_bytes: 1024,
+            max_total_bytes: 4096,
+            max_ratio: 200,
+        };
+        let doc = zip_with(&[("word/document.xml", &vec![b'a'; 4096])]);
+        let err = docx_text_with(&doc, small_limits).unwrap_err();
+        assert!(err.to_string().contains("过大"), "{err}");
+
+        // 压缩比异常：256KB 零字节压到几十字节，比例远超上限。
+        let ratio_limits = ZipLimits { max_entry_bytes: 1 << 20, ..small_limits };
+        let zeros = vec![0u8; 256 * 1024];
+        let bomb = zip_with(&[("word/document.xml", &zeros)]);
+        let err = docx_text_with(&bomb, ratio_limits).unwrap_err();
+        assert!(err.to_string().contains("压缩比"), "{err}");
+
+        // 条目数超限。
+        let names: Vec<String> = (0..20).map(|i| format!("word/header{i}.xml")).collect();
+        let bodies: Vec<&[u8]> = vec![b"<w:p/>"; names.len()];
+        let refs: Vec<(&str, &[u8])> = names.iter().map(|n| n.as_str()).zip(bodies).collect();
+        let archive = zip_with(&refs);
+        let err = docx_text_with(&archive, small_limits).unwrap_err();
+        assert!(err.to_string().contains("条目过多"), "{err}");
+
+        // 正常文档照常解析。
+        let ok = zip_with(&[("word/document.xml", "<w:p><w:t>海边的日落</w:t></w:p>".as_bytes())]);
+        let text = docx_text_with(&ok, small_limits).unwrap();
+        assert!(text.contains("海边的日落"), "{text}");
+    }
+
+    // ------------------------------------------- RTF Unicode（P2-12）
+
+    #[test]
+    fn rtf_decodes_signed_units_and_surrogate_pairs() {
+        let t = |src: &str| rtf_text(src.as_bytes()).trim().to_string();
+        // \u20013? \u25991? = 中文
+        assert_eq!(t(r"{\rtf1 \u20013?\u25991?}"), "中文");
+        // 负数：0x9F99（龙）= 40857 → signed = -24679
+        assert_eq!(t(r"{\rtf1 \u-24679?}"), "龙");
+        // 代理对：😀 = U+1F600 = D83D DE00 → signed -10179 / -8704
+        assert_eq!(t(r"{\rtf1 \u-10179?\u-8704?}"), "😀");
+        // \uc0：没有 fallback 字符，后面的正文不能被吞掉
+        assert_eq!(t(r"{\rtf1 \uc0\u20013\u25991}"), "中文");
+        // \uc2：跳过两个 fallback 字符
+        assert_eq!(t(r"{\rtf1 \uc2\u20013??X}"), "中X");
+        // 代理对之后跟普通文字，不乱序
+        assert_eq!(t("{\\rtf1 \\u-10179?\\u-8704? 完成}"), "😀 完成");
+        // 未配对的高代理：替换字符而不是丢掉或写错
+        assert_eq!(t(r"{\rtf1 \u-10179?}"), "\u{FFFD}");
     }
 }
