@@ -61,4 +61,5 @@ jobs:
       - name: ruff（语法与 pyflakes 级）
         run: ruff check inference --select E9,F
       - name: pytest
-        run: python -m pytest inference/tests -q
+        working-directory: inference
+        run: python -m pytest tests -q
