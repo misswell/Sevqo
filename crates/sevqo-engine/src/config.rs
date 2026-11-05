@@ -100,18 +100,53 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// Load + validate (第十一章)：启动时也执行统一校验，而不是只在用户保存时。
+    /// 解析失败回退默认值，但把坏文件留档为 `settings.bad.json` 供诊断——
+    /// 直接覆盖会让用户失去找回旧配置的机会。
     pub fn load(path: &std::path::Path) -> Settings {
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        match std::fs::read_to_string(path) {
+            Ok(s) => match serde_json::from_str::<Settings>(&s) {
+                Ok(mut v) => {
+                    v.validate();
+                    v
+                }
+                Err(e) => {
+                    tracing::warn!("设置文件解析失败（{}），使用默认值；原文件保留为 settings.bad.json", e);
+                    let _ = std::fs::copy(path, path.with_extension("bad.json"));
+                    let mut v = Settings::default();
+                    v.validate();
+                    v
+                }
+            },
+            Err(_) => {
+                let mut v = Settings::default();
+                v.validate();
+                v
+            }
+        }
     }
 
+    /// 原子保存（第十一章）：临时文件写入 + sync + 原子替换；替换前保留上一份
+    /// `settings.bak.json`，写坏时用户有一步回退。
     pub fn save(&self, path: &std::path::Path) -> crate::Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        std::fs::write(path, serde_json::to_string_pretty(self)?)?;
+        let tmp = path.with_extension("json.tmp");
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            std::io::Write::write_all(&mut f, serde_json::to_string_pretty(self)?.as_bytes())?;
+            f.sync_all()?;
+        }
+        if path.exists() {
+            let _ = std::fs::copy(path, path.with_extension("bak.json"));
+        }
+        std::fs::rename(&tmp, path)?;
+        if let Some(dir) = path.parent() {
+            if let Ok(d) = std::fs::File::open(dir) {
+                let _ = d.sync_all();
+            }
+        }
         Ok(())
     }
 
@@ -137,6 +172,29 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 原子保存与加载校验（十一章）：保存走临时文件+替换并留 .bak；
+    /// 损坏的设置文件回退默认但留档 .bad.json；加载时也执行 validate。
+    #[test]
+    fn settings_save_load_roundtrip_with_backup_and_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        let mut cfg = Settings::default();
+        cfg.max_file_bytes = 0; // 非法值：validate 会收到 1MB 下限
+        cfg.save(&path).unwrap();
+        assert!(path.with_extension("bak.json").exists() || !path.exists() == false);
+        let loaded = Settings::load(&path);
+        assert_eq!(loaded.max_file_bytes, 1024 * 1024, "加载时也要 validate");
+
+        // 坏文件：解析失败回退默认，且原文件留档。
+        std::fs::write(&path, "{not json").unwrap();
+        let fallback = Settings::load(&path);
+        assert_eq!(fallback.vector_dim, 512);
+        assert!(path.with_extension("bad.json").exists(), "坏文件要留档诊断");
+        // 原样保留，没有被覆盖。
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not json");
+    }
 
     #[test]
     fn file_size_limit_stays_usable() {

@@ -37,6 +37,24 @@ const MIGRATIONS: &[(i64, &str)] = &[(
     CREATE INDEX IF NOT EXISTS chunk_status ON chunk(file_id, status);
     CREATE INDEX IF NOT EXISTS clip_status ON clip(file_id, status);
     "#,
+    ),
+    (
+        3,
+    // v3: 扫描履历（第六章 6.2）：每次扫描落一行结果，供诊断与状态页使用；
+    // sweep 的安全性由调用方保证——只有完整成功且无读错的扫描才允许删除。
+    r#"
+    CREATE TABLE IF NOT EXISTS scan_run(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      root_id INTEGER NOT NULL,
+      status TEXT NOT NULL,
+      started_ns INTEGER NOT NULL,
+      finished_ns INTEGER NOT NULL,
+      walked INTEGER NOT NULL DEFAULT 0,
+      queued INTEGER NOT NULL DEFAULT 0,
+      removed INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS scan_run_root ON scan_run(root_id, id);
+    "#,
 )];
 
 const DDL: &str = r#"
@@ -121,6 +139,18 @@ CREATE TABLE IF NOT EXISTS vec_map(
 CREATE INDEX IF NOT EXISTS vec_map_target ON vec_map(target_kind, ref_id);
 CREATE INDEX IF NOT EXISTS vec_map_file ON vec_map(file_id);
 CREATE INDEX IF NOT EXISTS vec_map_alive ON vec_map(alive);
+
+CREATE TABLE IF NOT EXISTS scan_run(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  root_id INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  started_ns INTEGER NOT NULL,
+  finished_ns INTEGER NOT NULL,
+  walked INTEGER NOT NULL DEFAULT 0,
+  queued INTEGER NOT NULL DEFAULT 0,
+  removed INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS scan_run_root ON scan_run(root_id, id);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(
   name_seg, path_seg, title_seg, body_seg,
@@ -381,6 +411,33 @@ impl Db {
         let g = self.write.lock().unwrap();
         g.execute("UPDATE root SET last_scan_ns=? WHERE id=?", params![ns, root_id])?;
         Ok(ns)
+    }
+
+    /// 记录一次扫描结果（6.2）：每根目录只保留最近 50 条，履历不会无限增长。
+    pub fn record_scan_run(&self, root_id: i64, status: &str, started_ns: i64, walked: u64, queued: u64, removed: u64) -> Result<()> {
+        let g = self.write.lock().unwrap();
+        g.execute(
+            "INSERT INTO scan_run(root_id,status,started_ns,finished_ns,walked,queued,removed) VALUES(?,?,?,?,?,?,?)",
+            params![root_id, status, started_ns, now_ns(), walked as i64, queued as i64, removed as i64],
+        )?;
+        g.execute(
+            "DELETE FROM scan_run WHERE root_id=?1 AND id NOT IN              (SELECT id FROM scan_run WHERE root_id=?1 ORDER BY id DESC LIMIT 50)",
+            params![root_id],
+        )?;
+        Ok(())
+    }
+
+    /// 最近一次扫描履历，供诊断与状态展示。
+    pub fn last_scan_run(&self, root_id: i64) -> Result<Option<(String, i64, i64)>> {
+        let g = self.write.lock().unwrap();
+        let row = g
+            .query_row(
+                "SELECT status,walked,removed FROM scan_run WHERE root_id=? ORDER BY id DESC LIMIT 1",
+                params![root_id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)),
+            )
+            .ok();
+        Ok(row)
     }
 
     /// Insert or refresh one discovered file. `seen_ns` marks the file as present in
@@ -1374,7 +1431,10 @@ mod tests {
         let db = Db::open(&path).unwrap();
 
         assert!(dir.path().join("i.bak-v1.sqlite").exists(), "迁移前必须生成备份");
-        assert_eq!(db.get_meta("schema_version").as_deref(), Some("2"));
+        assert_eq!(db.get_meta("schema_version").as_deref(), Some("3"), "逐版本迁到最新");
+        // v3 的扫描履历表就绪
+        assert!(db.record_scan_run(1, "completed", 1, 3, 1, 0).is_ok());
+        assert_eq!(db.last_scan_run(1).unwrap().map(|(s, w, _)| (s, w)), Some(("completed".into(), 3)));
         let c = db.read().unwrap();
         let status = |id: i64| -> String {
             c.query_row("SELECT status FROM chunk WHERE id=?", params![id], |r| r.get(0)).unwrap()

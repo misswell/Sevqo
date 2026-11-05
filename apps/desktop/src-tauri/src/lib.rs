@@ -120,7 +120,9 @@ pub fn run() {
                 }
             }
 
-            // Files queued from a previous run: tell the UI it can resume.
+            // 启动对账（第六章）：离线期间的新增/修改/删除只有重新扫描才能发现。
+            // resume_on_launch 开启时直接跑一轮完整对账（扫描+索引，模式随当前能力）；
+            // 关闭时维持旧行为：只提示队列里还有多少，等用户手动开始。
             if resume {
                 let counts = state.db.counts().unwrap_or_default();
                 let queued = counts.get("pending").copied().unwrap_or(0);
@@ -139,6 +141,62 @@ pub fn run() {
                         },
                     );
                 }
+                // 对账扫描顺带处理离线删除（sweep 有完整成功护栏，不会误删）。
+                // 推理能力此刻多半还没就绪（模型后台校验中），先按 auto_mode 跑：
+                // TextOnly 也能把离线变化收进库；模型就绪后下载线程会再触发一轮补向量。
+                match commands::spawn_index_thread(&handle, &state, commands::auto_mode(&state), None, true) {
+                    Ok(()) => tracing::info!("启动对账已开始"),
+                    // 监听增量正在跑时拿不到许可：队列里的变更不会被丢，下一轮补上。
+                    Err(e) => tracing::info!("启动对账未立即开始：{e}"),
+                }
+            }
+
+            // 外置盘恢复（6.4）：低频健康检查 + 指数退避。根目录从「不存在」变为
+            // 「已挂载」时重注册 watcher 并触发一轮扫描；已可用目录不做任何事。
+            {
+                let disk_state = state.clone();
+                let disk_handle = handle.clone();
+                std::thread::Builder::new()
+                    .name("sevqo-root-health".into())
+                    .spawn(move || {
+                        let mut offline: std::collections::HashSet<String> = std::collections::HashSet::new();
+                        // 指数退避：30s 起步，最慢 5 分钟；发现恢复后回到 30s。
+                        let mut backoff_secs: u64 = 30;
+                        loop {
+                            std::thread::sleep(std::time::Duration::from_secs(backoff_secs));
+                            let roots = match disk_state.db.list_roots() {
+                                Ok(v) => v,
+                                Err(_) => continue,
+                            };
+                            let mut recovered = Vec::new();
+                            for r in roots.iter().filter(|r| r.enabled) {
+                                let path = commands::expand(&r.path);
+                                if path.exists() {
+                                    if offline.remove(&r.path) {
+                                        recovered.push(path);
+                                    }
+                                } else if offline.insert(r.path.clone()) {
+                                    tracing::warn!("根目录当前不可用（挂载后自动恢复）：{}", r.path);
+                                }
+                            }
+                            if recovered.is_empty() {
+                                backoff_secs = (backoff_secs * 2).min(300);
+                                continue;
+                            }
+                            backoff_secs = 30;
+                            if let Err(e) = commands::restart_watcher(&disk_state, &disk_handle) {
+                                tracing::warn!("重挂载后重启监听失败：{e}");
+                            }
+                            for path in &recovered {
+                                tracing::info!("根目录重新可用，开始增量对账：{}", path.display());
+                            }
+                            if let Err(e) = commands::spawn_index_thread(&disk_handle, &disk_state, commands::auto_mode(&disk_state), None, true) {
+                                tracing::info!("重挂载目录的对账未立即开始：{e}");
+                            }
+                        }
+                    })
+                    .map_err(|e| tracing::warn!("健康检查线程启动失败: {e}"))
+                    .ok();
             }
 
             // 在线更新：晚一点再问，别和首启的模型下载抢带宽；没有新版本就一声不吭。

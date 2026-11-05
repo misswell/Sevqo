@@ -18,7 +18,7 @@ use sevqo_engine::jobs::{compact, Indexer, Mode};
 use sevqo_engine::model::{self, ModelStatus};
 use sevqo_engine::scan::dir_label;
 use sevqo_engine::search::Searcher;
-use sevqo_engine::vectors::{self, Store};
+use sevqo_engine::vectors;
 use sevqo_engine::watch::{apply_change_with_options, Applied, Change, WatcherHandle};
 use sevqo_engine::{
     FileRecord, Filters, Hit, Kind, Moment, Paths, Phase, Progress, Root, SearchRequest, SearchResponse, Settings,
@@ -57,7 +57,7 @@ fn app_state(app: &AppHandle) -> Arc<AppState> {
 
 /// Which pass makes sense now: vectors only when some media kind is on *and* the model
 /// is present, otherwise the text/filename pass that works with no weights at all.
-fn auto_mode(st: &AppState) -> Mode {
+pub(crate) fn auto_mode(st: &AppState) -> Mode {
     if st.can_infer() {
         Mode::Full
     } else {
@@ -65,7 +65,7 @@ fn auto_mode(st: &AppState) -> Mode {
     }
 }
 
-fn expand(raw: &str) -> PathBuf {
+pub(crate) fn expand(raw: &str) -> PathBuf {
     sevqo_engine::scan::expand_home(raw.trim())
 }
 
@@ -426,7 +426,13 @@ pub fn index_start(app: AppHandle, mode: Option<String>, max_files: Option<usize
 
 /// Grab the run slot and hand one pass to the indexer thread. Shared by the explicit
 /// start command and the automatic pass after a root is added or re-enabled.
-fn spawn_index_thread(app: &AppHandle, st: &Arc<AppState>, mode: Mode, max_files: Option<usize>, scan_first: bool) -> Res<()> {
+pub(crate) fn spawn_index_thread(
+    app: &AppHandle,
+    st: &Arc<AppState>,
+    mode: Mode,
+    max_files: Option<usize>,
+    scan_first: bool,
+) -> Res<()> {
     let permit = st.try_begin_index().ok_or("索引正在运行中")?;
     st.control.reset();
     let app2 = app.clone();
@@ -877,6 +883,11 @@ pub fn spawn_model_download(st: Arc<AppState>, app: AppHandle, announce: bool) -
             let (ready, note, cancelled) = match &result {
                 Ok(()) => {
                     st.set_model_ready(true);
+                    // 模型到齐后自动补一轮：之前 TextOnly 收进库的 done 文件在这里
+                    // 被 mark_missing_vectors 重新排队并获得语义向量（六章启动对账的收尾）。
+                    if let Err(e) = spawn_index_thread(&app2, &st, auto_mode(&st), None, true) {
+                        tracing::info!("模型就绪后的补向量一轮未启动：{e}");
+                    }
                     let _ = app2.emit(
                         EV_MODEL,
                         model::DownloadProgress {

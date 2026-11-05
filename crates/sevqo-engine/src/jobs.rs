@@ -337,7 +337,9 @@ impl Indexer {
         let db = self.db.clone();
         let cancel = &self.control.cancel;
         let emit = self.emit.clone();
-        let mut stats = scan::scan(root_id, &path, &opts, cancel, |f| {
+        // 6.2 扫描履历：取消/失败也落一行，且绝不触发 sweep——错误在 `?` 处直接
+        // 传播，删除只可能发生在完整成功（无错误、无不可读子树）的扫描之后。
+        let scan_result = scan::scan(root_id, &path, &opts, cancel, |f| {
             candidates += 1;
             match db.upsert_file(&f, seen) {
                 Ok((_, needs)) => {
@@ -352,7 +354,18 @@ impl Indexer {
                 progress.queued = queued;
                 let _ = emit.try_send(progress.clone());
             }
-        })?;
+        });
+        let mut stats = match scan_result {
+            Ok(v) => v,
+            Err(Error::Cancelled) => {
+                let _ = self.db.record_scan_run(root_id, "cancelled", seen, candidates, queued, 0);
+                return Err(Error::Cancelled);
+            }
+            Err(e) => {
+                let _ = self.db.record_scan_run(root_id, "failed", seen, candidates, queued, 0);
+                return Err(e);
+            }
+        };
         stats.errors += write_errors;
         // An unreadable subtree is not evidence that its files were deleted.
         let removed = if stats.errors == 0 && stats.unreadable == 0 {
@@ -361,6 +374,7 @@ impl Indexer {
             0
         };
         let queued_now = self.db.pending_count(&kinds)?;
+        let _ = self.db.record_scan_run(root_id, "completed", seen, stats.walked, queued_now as u64, removed as u64);
         progress.discovered = stats.walked;
         progress.queued = queued_now;
         progress.message = Some(format!("扫描完成：新增 {queued} 个，清理 {removed} 个已删除"));

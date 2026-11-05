@@ -165,3 +165,46 @@
 - 长视频候选挤占（P2-01）、视频详情命中片段（P2-02）、前端 LRU（P2-03）：Sprint D。
 - DOCX 解压安全与 RTF Unicode：Sprint C（P1-11/P2-12）。
 - PR CI：Sprint F（P1-14）。
+
+## 2026-11-05 第三轮：全仓库重构方案（六/十一/十四章节）
+
+收到第三份方案（全仓库治理）。先做逐章对账，再实施缺口——方案自身要求「遇到不一致先查明实际调用链，选兼容性最好的实现，不机械增加字段」。
+
+### 与方案的逐章对账
+
+| 方案章节 | 状态 | 说明 |
+| --- | --- | --- |
+| 二 generation 存储 | **已实现（简化等价）** | `3ee9081`：generation 文件 + meta 表记录活动代/行数/维度/SHA256。未建 `vector_generations` 表、vec_map 不带 generation_id：单活动代设计下，压缩持 `vector_access.write()`、搜索持读锁，代切换不可能与搜索交错，无跨代读取问题；旧代文件在提交后、写锁内删除，不存在读者仍附着的情况。多代映射保留+保护期 GC 属重一份的方案，暂不引入 |
+| 二 2.3 写入顺序 | **已实现** | staging→fsync→激活（`9d0696f`）；「按物理行数分配而非 MAX+1」在本协议下不必要：staging 行本身占据 vec_map 的 row_id，MAX+1 永远指向未写过的区域，重建清映射后旧行字节无映射不可见（有回归测试） |
+| 二 2.5 损坏处理 | **已实现（部分）** | 启动检查头/维度/行数/长度/SHA256（未追加时）；启动全文件 NaN 扫描是 O(向量总量)，暂缓 |
+| 三 单元状态 | **已实现（简化等价）** | 状态列挂在 chunk/clip 上 + 文件级聚合；未建独立 `embedding_unit` 表与 partial/keyword_only 枚举值——语义由 stale/failed + error 说明承载，改枚举值会波及 UI 与全部查询，列为后续演进 |
+| 三 3.4 file_revision | 未实现 | 大型改造（影响全部调用链），独立批次 |
+| 四 Job Scheduler / sidecar 协议升级 | 未实现 | 有界子批已缓解单请求过大；request_id+cancel+独立读线程属协议重写，独立批次 |
+| 五 模型 manifest | **已实现** | `374a14c`；逐文件 .part+原子替换 vs 方案的整目录 staging 切换——两者都满足「失败保留旧版」，逐文件方案在断点续传上更优，保持现状 |
+| 六 6.2 扫描事务 | **本轮实现** | scan_run 履历表（migration v3，每根目录留 50 条）+ 取消/失败绝不 sweep（取消在 `?` 处短路本就安全，现显式记录） |
+| 六 6.3 删除对账 | **已实现** | `49c0208` delete_tree |
+| 六 6.4 外置盘恢复 | **本轮实现** | 启动后台健康检查：30s 起步指数退避（封顶 5 分钟），离线→重新挂载后自动重注册 watcher + 增量对账 |
+| 六 启动对账 | **本轮实现** | resume_on_launch=true 时启动即跑完整一轮（扫描全部启用根目录+索引队列，模式随当前能力）；模型就绪后下载线程自动补一轮语义向量 |
+| 七 7.1 PDF 独立 / 7.4 chunk 截断 | **已实现** | `b161ce7` 惰性加载 + 2048 片上限与诚实说明 |
+| 七 7.2 DOCX ZIP / 7.3 RTF | 未实现 | Sprint C |
+| 八 搜索公平性 / moments | 未实现 | Sprint D |
+| 九 前端缓存 | 未实现 | Sprint D |
+| 十 迁移机制 | **已实现** | `ede653c`（VACUUM INTO 备份+逐版本事务） |
+| 十一 配置安全 | **本轮实现** | 临时文件+sync+原子替换，留 .bak；加载时统一 validate；坏文件留档 .bad.json |
+| 十二 Doctor | 未实现 | 独立批次 |
+| 十四 PR CI | **本轮实现** | `.github/workflows/ci.yml`：cargo test --workspace 阻塞；clippy/fmt 先非阻塞（存量偏差待 normalize）；前端 typecheck+build；Python 轻依赖（numpy/pillow/pypdf，不装 torch）+ ruff(E9,F) + pytest |
+
+### 本轮验证
+
+| 验证 | 结果 |
+| --- | --- |
+| Rust 引擎 `cargo test -p sevqo-engine --lib` | 127 通过，0 失败 |
+| 桌面壳 `cargo test -p sevqo-desktop --release` | 13 通过，0 失败，1 忽略 |
+| 前端 typecheck/build | 通过（本轮零前端改动） |
+| Python 语法 | AST 解析通过；pytest 本机无依赖未跑，CI 首跑验证 |
+| clippy 本轮改动 | 零新增警告 |
+
+### 本轮未做（如实记录）
+
+- file_revision、embedding_unit 独立表、Job Scheduler、sidecar 协议重写（request_id/cancel/独立读线程）、Doctor、搜索公平性、前端 LRU、DOCX/RTF：按上表归入后续批次。
+- 启动对账的端到端行为（关应用改文件→重开自动出现）属 GUI 流程，本轮只以代码路径+单元测试保证，未做真机验收。

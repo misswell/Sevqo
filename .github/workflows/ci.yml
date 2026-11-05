@@ -1,0 +1,64 @@
+name: ci
+
+# PR CI（第十四章）：开发阶段的每次修改都过门禁，不再只在发版标签时才跑测试。
+# 范围刻意收窄为「当前仓库能稳定通过的检查」：
+#   - cargo test --workspace / clippy / fmt：fmt 存在全仓存量偏差，先以
+#     continue-on-error 记录，待一次性 normalize 提交后再转为阻塞项。
+#   - Python：只装测试所需的轻量依赖（numpy/pillow/pypdf），不装 torch；
+#     sidecar 协议级测试需要真实模型环境，目前由发布流程的真机 smoke 覆盖。
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test --workspace
+      - name: cargo clippy
+        continue-on-error: true # 存量警告清零后转为阻塞
+        run: cargo clippy --workspace --all-targets
+      - name: cargo fmt --check
+        continue-on-error: true # 全仓一次性 normalize 后转为阻塞
+        run: cargo fmt --check
+
+  frontend:
+    runs-on: macos-14
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+
+  python:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 安装测试所需轻量依赖（不含 torch）
+        run: python -m pip install --quiet numpy pillow pypdf pytest ruff
+      - name: ruff（语法与 pyflakes 级）
+        run: ruff check inference --select E9,F
+      - name: pytest
+        run: python -m pytest inference/tests -q
