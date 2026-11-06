@@ -36,6 +36,12 @@ impl Searcher {
         Ok(Searcher { db, base: vector_base.to_path_buf(), view })
     }
 
+    /// Keyword-only searcher (P2-04)：不加载、不校验向量文件。向量库损坏时
+    /// FTS 与文件列表必须照常可用，而不是跟着语义通道一起失败。
+    pub fn new_keyword_only(db: Arc<Db>) -> Searcher {
+        Searcher { db, base: PathBuf::new(), view: None }
+    }
+
     /// Re-resolve the active generation (a compaction may have switched files) and remap.
     pub fn refresh(&mut self) -> Result<()> {
         let path = active_vector_path(&self.base, &self.db)?;
@@ -131,27 +137,30 @@ impl Searcher {
         }
         files.sort_by(|a, b| b.1.total_cmp(&a.1));
         files.truncate(limit);
-        // fill in real clip timestamps now that we know the ranking
-        let ids: Vec<i64> = clips.keys().copied().collect();
-        let moments = self.db.moments_for(&ids)?;
-        for (file_id, list) in clips.iter_mut() {
-            if let Some(rows) = moments.get(file_id) {
-                let score_of: std::collections::HashMap<i64, f32> =
-                    list.iter().map(|(cid, _, _, s, _)| (*cid, *s)).collect();
-                *list = rows
-                    .iter()
-                    .filter_map(|(cid, start, end, _s, thumb)| {
-                        score_of.get(cid).map(|sc| (*cid, *start, *end, *sc, thumb.clone()))
-                    })
-                    .collect();
-                list.sort_by(|a, b| b.3.total_cmp(&a.3));
-                list.truncate(4);
-            }
-        }
-        let out = files
-            .into_iter()
-            .map(|(fid, sc)| (fid, sc, clips.remove(&fid).unwrap_or_default()))
+        // 只为最终结果里的文件补时间戳（P1 修复：此前对全部候选视频查完整时间轴，
+        // 既拖慢搜索又会撞 SQLite 参数上限）；按 clip id 精确查询并分批绑定参数。
+        let clip_ids: Vec<i64> = files
+            .iter()
+            .filter_map(|(fid, _)| clips.get(fid))
+            .flatten()
+            .map(|(cid, _, _, _, _)| *cid)
             .collect();
+        let moments = self.db.moments_by_clip_ids(&clip_ids)?;
+        let mut out = Vec::with_capacity(files.len());
+        for (fid, sc) in files {
+            let mut list = clips.remove(&fid).unwrap_or_default();
+            list.retain(|(cid, _, _, _, _)| moments.contains_key(cid));
+            for entry in list.iter_mut() {
+                let (cid, start, end, score, _) = entry;
+                if let Some((start_ms, end_ms, thumb)) = moments.get(cid) {
+                    *start = *start_ms;
+                    *end = *end_ms;
+                    *entry = (*cid, *start_ms, *end_ms, *score, thumb.clone());
+                }
+            }
+            list.sort_by(|a, b| b.3.total_cmp(&a.3));
+            out.push((fid, sc, list));
+        }
         Ok(out)
     }
 

@@ -55,6 +55,29 @@ const MIGRATIONS: &[(i64, &str)] = &[(
     );
     CREATE INDEX IF NOT EXISTS scan_run_root ON scan_run(root_id, id);
     "#,
+    ),
+    (
+        4,
+        // v4: vec_map 增加非负行号约束（P1 修复：负数行号曾在搜索里被折叠到第 0 行）。
+        // 重建表并丢弃负数行；引用被丢行的单元回 pending 重新嵌入。
+        r#"
+    UPDATE chunk SET vec_row=NULL,status='pending' WHERE vec_row IN (SELECT row_id FROM vec_map WHERE row_id<0);
+    UPDATE clip SET vec_row=NULL,status='pending' WHERE vec_row IN (SELECT row_id FROM vec_map WHERE row_id<0);
+    CREATE TABLE vec_map_v4(
+      row_id INTEGER PRIMARY KEY CHECK(row_id>=0),
+      target_kind TEXT NOT NULL,
+      ref_id INTEGER NOT NULL,
+      file_id INTEGER NOT NULL,
+      alive INTEGER NOT NULL DEFAULT 1
+    );
+    INSERT INTO vec_map_v4(row_id,target_kind,ref_id,file_id,alive)
+      SELECT row_id,target_kind,ref_id,file_id,alive FROM vec_map WHERE row_id>=0;
+    DROP TABLE vec_map;
+    ALTER TABLE vec_map_v4 RENAME TO vec_map;
+    CREATE INDEX IF NOT EXISTS vec_map_target ON vec_map(target_kind, ref_id);
+    CREATE INDEX IF NOT EXISTS vec_map_file ON vec_map(file_id);
+    CREATE INDEX IF NOT EXISTS vec_map_alive ON vec_map(alive);
+    "#,
 )];
 
 const DDL: &str = r#"
@@ -130,7 +153,7 @@ CREATE INDEX IF NOT EXISTS clip_file ON clip(file_id, start_ms);
 CREATE INDEX IF NOT EXISTS clip_status ON clip(file_id, status);
 
 CREATE TABLE IF NOT EXISTS vec_map(
-  row_id INTEGER PRIMARY KEY,
+  row_id INTEGER PRIMARY KEY CHECK(row_id>=0),
   target_kind TEXT NOT NULL,
   ref_id INTEGER NOT NULL,
   file_id INTEGER NOT NULL,
@@ -383,8 +406,10 @@ impl Db {
                 params![id],
             )?;
             g.execute(
-                "UPDATE file SET state='stale' WHERE root_id=? AND state='done' \
-                 AND id NOT IN (SELECT file_id FROM vec_map WHERE alive=1)",
+                "UPDATE file SET state='stale' WHERE root_id=? AND state IN ('done','keyword_only') \
+                 AND ( id NOT IN (SELECT file_id FROM vec_map WHERE alive=1) \
+                    OR id IN (SELECT file_id FROM chunk WHERE status!='persisted') \
+                    OR id IN (SELECT file_id FROM clip WHERE status!='persisted') )",
                 params![id],
             )?;
         }
@@ -534,6 +559,24 @@ impl Db {
     pub fn file_by_path(&self, path: &str) -> Option<FileRecord> {
         let g = self.write.lock().ok()?;
         g.query_row(&format!("SELECT {FILE_COLS} FROM file WHERE path=?"), params![path], read_file).ok()
+    }
+
+    /// 某根目录下的全部文件记录（排除规则清理用）。
+    pub fn files_of_root(&self, root_id: i64) -> Result<Vec<FileRecord>> {
+        let g = self.write.lock().unwrap();
+        let mut st = g.prepare(&format!("SELECT {FILE_COLS} FROM file WHERE root_id=?"))?;
+        let rows = st.query_map(params![root_id], read_file)?;
+        Ok(rows.filter_map(|x| x.ok()).collect())
+    }
+
+    /// 批量清除文件的全部派生数据（排除规则变更时使用）。
+    pub fn purge_by_ids(&self, ids: &[i64]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let g = self.write.lock().unwrap();
+        purge_files(&g, ids)?;
+        Ok(())
     }
 
     pub fn files_by_ids(&self, ids: &[i64]) -> Result<HashMap<i64, FileRecord>> {
@@ -950,6 +993,13 @@ impl Db {
         Ok(g.query_row("SELECT COALESCE(MAX(row_id),-1)+1 FROM vec_map", [], |r| r.get(0))?)
     }
 
+    /// 最大有效行号（无活行时 None）：启动校验用它确认映射全部落在文件行数内。
+    pub fn max_alive_row(&self) -> Result<Option<i64>> {
+        let g = self.write.lock().unwrap();
+        let v: Option<i64> = g.query_row("SELECT MAX(row_id) FROM vec_map WHERE alive=1", [], |r| r.get(0))?;
+        Ok(v)
+    }
+
     pub fn alive_vec_rows(&self) -> Result<usize> {
         let g = self.write.lock().unwrap();
         Ok(g.query_row("SELECT count(*) FROM vec_map WHERE alive=1", [], |r| r.get(0))?)
@@ -990,6 +1040,16 @@ impl Db {
         let tx = g.transaction()?;
         tx.execute("UPDATE chunk SET vec_row=NULL WHERE vec_row IN (SELECT row_id FROM vec_map WHERE alive=0)", [])?;
         tx.execute("UPDATE clip SET vec_row=NULL WHERE vec_row IN (SELECT row_id FROM vec_map WHERE alive=0)", [])?;
+        // 保险丝：映射被回收的单元绝不能继续自称 persisted，否则会永远跳过重嵌。
+        // 正常路径不会触发（invalidate 已按单元状态判定）；一旦触发就地自愈。
+        tx.execute(
+            "UPDATE chunk SET status='pending',retry_count=0,error=NULL WHERE status='persisted' AND vec_row IS NULL",
+            [],
+        )?;
+        tx.execute(
+            "UPDATE clip SET status='pending',retry_count=0,error=NULL WHERE status='persisted' AND vec_row IS NULL",
+            [],
+        )?;
         let dropped = tx.execute("DELETE FROM vec_map WHERE alive=0", [])?;
         for (old, new) in mapping {
             if old == new {
@@ -1081,11 +1141,32 @@ impl Db {
         Ok(n)
     }
 
-    /// Reclaim rows whose file is no longer indexed; returns rows freed.
+    /// Reclaim vector rows that no longer correspond to a *persisted unit* (P1 修复：
+    /// 此前按「文件级 state!='done'」整文件回收，会把进行中文件里已成功的片段一并
+    /// 删除，且单元状态仍是 persisted，之后不再重嵌——数据就此永久丢失）。现在：
+    /// chunk/clip 按 `status='persisted'` 保留；image 以文件自身为单元，仍按文件状态判定。
     pub fn invalidate_stale_rows(&self) -> Result<usize> {
         let g = self.write.lock().unwrap();
-        let n = g.execute("UPDATE vec_map SET alive=0 WHERE alive=1 AND file_id IN (SELECT id FROM file WHERE state!='done')", [])?;
+        let n = g.execute(
+            "UPDATE vec_map SET alive=0 WHERE alive=1 AND ( \
+               (target_kind='chunk' AND ref_id NOT IN (SELECT id FROM chunk WHERE status='persisted')) \
+            OR (target_kind='clip' AND ref_id NOT IN (SELECT id FROM clip WHERE status='persisted')) \
+            OR (target_kind='image' AND file_id IN (SELECT id FROM file WHERE state NOT IN ('done'))))",
+            [],
+        )?;
         Ok(n)
+    }
+
+    /// 是否存在未持久化的语义单元（chunk/clip）。
+    pub fn has_incomplete_units(&self, file_id: i64) -> Result<bool> {
+        let g = self.write.lock().unwrap();
+        let n: i64 = g.query_row(
+            "SELECT (SELECT count(*) FROM chunk WHERE file_id=?1 AND status!='persisted') \
+             + (SELECT count(*) FROM clip WHERE file_id=?1 AND status!='persisted')",
+            params![file_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
     }
 
     pub fn reset_vectors(&self) -> Result<()> {
@@ -1112,10 +1193,14 @@ impl Db {
     /// files cannot be processed, so queueing them only inflates the progress readout.
     pub fn mark_missing_vectors(&self) -> Result<usize> {
         let g = self.write.lock().unwrap();
+        // 「有至少一条有效向量」不等于「语义索引完整」：部分单元失败的文件同样要回队列。
         let n = g.execute(
-            "UPDATE file SET state='stale' WHERE state='done' AND kind IN ('image','video','document','code') \
+            "UPDATE file SET state='stale' WHERE state IN ('done','keyword_only') \
+             AND kind IN ('image','video','document','code') \
              AND root_id IN (SELECT id FROM root WHERE enabled=1) \
-             AND id NOT IN (SELECT file_id FROM vec_map WHERE alive=1)",
+             AND ( id NOT IN (SELECT file_id FROM vec_map WHERE alive=1) \
+                OR id IN (SELECT file_id FROM chunk WHERE status!='persisted') \
+                OR id IN (SELECT file_id FROM clip WHERE status!='persisted') )",
             [],
         )?;
         Ok(n)
@@ -1150,6 +1235,31 @@ impl Db {
         let mut st = g.prepare(&sql)?;
         let rows = st.query_map(rusqlite::params_from_iter(bind.iter()), read_file)?;
         Ok(rows.filter_map(|x| x.ok()).collect())
+    }
+
+    /// 按最终命中的 clip 精确查询时间轴（P1 修复：此前按候选文件查全时间轴，
+    /// 候选一多既拖慢搜索又会撞 SQLite 参数上限）。分批 IN，单批 400 个参数。
+    pub fn moments_by_clip_ids(
+        &self,
+        clip_ids: &[i64],
+    ) -> Result<HashMap<i64, (i64, i64, Option<String>)>> {
+        let mut out = HashMap::new();
+        if clip_ids.is_empty() {
+            return Ok(out);
+        }
+        let g = self.write.lock().unwrap();
+        for chunk in clip_ids.chunks(400) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!("SELECT id,start_ms,end_ms,thumb FROM clip WHERE id IN ({placeholders})");
+            let mut st = g.prepare(&sql)?;
+            let rows = st.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, Option<String>>(3)?))
+            })?;
+            for (id, start, end, thumb) in rows.flatten() {
+                out.insert(id, (start, end, thumb));
+            }
+        }
+        Ok(out)
     }
 
     pub fn moments_for(&self, file_ids: &[i64]) -> Result<HashMap<i64, Vec<(i64, i64, i64, f64, Option<String>)>>> {
@@ -1199,7 +1309,9 @@ fn push_filters(sql: &mut String, bind: &mut Vec<Box<dyn rusqlite::types::ToSql>
         sql.push_str(" AND f.mtime_ns<=?");
         bind.push(Box::new(v));
     }
-    sql.push_str(" AND f.state='done'");
+    // 关键词通道与浏览：keyword_only（仅关键词索引）的文件同样可搜；
+    // 语义候选另有独立的 done 门槛（见 vec_candidates_for）。
+    sql.push_str(" AND f.state IN ('done','keyword_only')");
 }
 
 fn ensure_filename_row(g: &Connection, id: i64, name: &str, path: &str) -> Result<()> {
@@ -1263,7 +1375,7 @@ pub fn totals(db: &Db) -> Result<Totals> {
     let mut st = c.prepare("SELECT state,count(*) FROM file GROUP BY state")?;
     for row in st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?.flatten() {
         match row.0.as_str() {
-            "done" => t.done = row.1,
+            "done" | "keyword_only" => t.done += row.1,
             "failed" => t.failed = row.1,
             "skipped" => t.skipped = row.1,
             _ => t.pending += row.1,
@@ -1431,7 +1543,7 @@ mod tests {
         let db = Db::open(&path).unwrap();
 
         assert!(dir.path().join("i.bak-v1.sqlite").exists(), "迁移前必须生成备份");
-        assert_eq!(db.get_meta("schema_version").as_deref(), Some("3"), "逐版本迁到最新");
+        assert_eq!(db.get_meta("schema_version").as_deref(), Some("4"), "逐版本迁到最新");
         // v3 的扫描履历表就绪
         assert!(db.record_scan_run(1, "completed", 1, 3, 1, 0).is_ok());
         assert_eq!(db.last_scan_run(1).unwrap().map(|(s, w, _)| (s, w)), Some(("completed".into(), 3)));
@@ -1504,6 +1616,26 @@ mod tests {
         assert!(db.file(deep).is_none());
         assert_eq!(db.alive_vec_rows().unwrap(), 0, "子文件的向量映射一并回收");
         assert!(db.file(sibling).is_some(), "同前缀不同名的文件不受影响");
+    }
+
+    /// 按 clip 精确查询且分批绑定参数：超过一批（400）也能全部返回，
+    /// 不在清单里的 clip 不会被带出（P1 修复：过量查询与参数上限）。
+    #[test]
+    fn moments_by_clip_ids_handles_more_than_one_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("i.sqlite")).unwrap();
+        let root = db.add_root("/tmp/v", "视频").unwrap();
+        let id = upsert(&db, root, "/tmp/v/a.mp4", Kind::Video);
+        let clips: Vec<(f64, f64)> = (0..401).map(|i| (i as f64, i as f64 + 1.0)).collect();
+        let inserted = db.sync_clips(id, &clips).unwrap();
+        let ids: Vec<i64> = inserted.iter().map(|(cid, _)| *cid).collect();
+
+        let got = db.moments_by_clip_ids(&ids).unwrap();
+        assert_eq!(got.len(), 401, "分批后仍要全部返回");
+        let (start, end, _) = got[&ids[400]];
+        assert_eq!((start, end), (400_000, 401_000));
+        let only_one = db.moments_by_clip_ids(&[ids[0]]).unwrap();
+        assert_eq!(only_one.len(), 1, "按需查询，不夹带");
     }
 
     /// 失败计数与聚合：可重试的失败让文件回 stale，重试耗尽则判 failed，

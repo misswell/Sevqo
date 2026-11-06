@@ -210,3 +210,30 @@
 - 启动对账的端到端行为（关应用改文件→重开自动出现）属 GUI 流程，本轮只以代码路径+单元测试保证，未做真机验收。
 - Sevqo v0.1.6 已于 2026-11-05 09:00 前后（北京时间）由云端发出（Release run `41940917446`，19m35s，提交 `8a3ac71`，标签 `v0.1.6`）。本版覆盖 2026-11-05 的三轮修复：向量 generation 压缩协议、数据库 v1→v3 逐版本迁移（含 VACUUM INTO 备份）、模型可信 manifest（固定 revision `f9972ac2` + 上游 SHA256）、chunk/clip 级索引状态与独立重试、长文档完整分片与截断说明、有界分批嵌入、目录删除子树清理、启动对账、外置盘自动恢复、配置原子保存、PR CI。复核 7 个产物：两个 dmg 挂载后包内 `Sevqo.app`（可执行名 `sevqo-desktop`）`The validate action worked!`，`lipo -archs` 分别为 arm64 / x86_64，`CFBundleShortVersionString` 为 `0.1.6`，`flags=0x10000(runtime)` + Developer ID 链（TeamIdentifier `U8U443D7ZL`）；两个更新归档解出的 `.app` 同样装订通过；本机 minisign 用 `tauri.conf.json` 内置公钥（key id `CEE9A3B0F135A93F`）验签 `Signature and comment signature verified`，trusted comment `version:0.1.6`；`latest.json` 版本 `0.1.6`、notes 非空、两平台 `signature` 与 `.sig` 文件逐字一致。Release 工作流内的 `release_packages_verify_with_the_configured_pubkey` 门禁通过。
 - 新增 PR CI 首日三跑：run `41940907652` 失败于 ruff E9,F（三处未使用导入，`3f41ac6` 修复）；run `41943625908` 失败于 pytest 收集（仓库根跑时 `sevqo_embed` 不在 sys.path，改为在 `inference/` 内运行，本地 venv 实测 4 passed，`ba75963`）；run `41944198031` 全绿（rust / frontend / python 三 job）。
+
+## 2026-11-06 第四轮：v0.1.7 审查修复（数据一致性专项）
+
+审查确认 v0.1.7 的架构方向正确，但指出若干真实缺口。逐条核实后全部属实，本轮修复：
+
+| 问题 | 修复 |
+| --- | --- |
+| P0 零字节向量文件 + 有效映射被当合法空库 | `check_active`：0 字节且 `alive>0` → 按损坏报错，绝不放行让 Store 重初始化；0 字节且无映射才放行。新增映射行号越界校验（`MAX(alive row) < header 行数`） |
+| P1 压缩回收「进行中文件」已成功的向量 | `invalidate_stale_rows` 改为按单元状态判定（chunk/clip 按 `status='persisted'` 保留，image 仍按文件状态）；`commit_compaction` 增加保险丝——被清映射却自称 persisted 的单元就地回 pending 自愈 |
+| P1 TextOnly 把部分语义完成标成 Done | 新增 `keyword_only` 文件状态（schema v4 迁移中顺带处理负行号，见下）；TextOnly 下含未持久化单元的文件标 `keyword_only` 并附说明，不再伪装完整；`mark_missing_vectors` 按单元完整性（而非「有无向量」）重排队，覆盖 done 与 keyword_only；模型就绪后的补齐轮自动接上 |
+| P1 搜索 moments 全候选过量查询 + 参数上限 | 新增 `moments_by_clip_ids`：只查最终结果文件的命中片段，分批 IN（400/批）；语义补全不再拖全候选时间轴 |
+| P1 负数行号折叠到第 0 行 | 搜索侧负行号得 -1 分绝不冒充第 0 行；压缩遇负行号报错；migration v4 重建 vec_map 增加 `CHECK(row_id>=0)`，迁移时丢弃负行并让引用单元回 pending |
+| P1 排除规则变更后旧内容仍可搜（隐私） | `set_settings` 检测排除规则变更 → 用与扫描一致的匹配器清理已排除文件（FTS/正文/chunk/clip/向量/缩略图）→ 自动跑一轮对账 |
+| P1 watcher 30 秒竞态 + 注册失败无重试 | 健康线程启动即初始化离线集合；「目录存在但不在监听集合」一律重注册（覆盖竞态与注册失败）；对账请求在线程内持久化，许可被占用时下一轮补跑，不再只记日志 |
+| P1 模型 revision 未与向量库绑定 | DB meta 记录 `model_revision`；启动比对，变更即清空向量与单元状态（保留 FTS），由 Full 对账用新模型重建；校验成功后登记 |
+| P1 父子根目录归属丢失 | `add_root` 拒绝重叠目录（canonicalize 后判父子关系） |
+| P2-04 向量库损坏拖垮关键词搜索 | 新增 `Searcher::new_keyword_only`；纯关键词请求与最近文件浏览不再加载/校验向量文件 |
+
+### 测试
+
+新增 10 条回归（引擎 137 / 桌面 17）：零字节+映射损坏、零字节+空库放行、行号越界损坏、负行号不冒充第 0 行、压缩保留未完成文件的已持久化单元、TextOnly→keyword_only→补齐、moments 分批查询、排除清理、模型 revision 重置、关键词搜索容错、父子目录重叠判定。迁移测试更新至 v4。
+
+### 纠正此前的过时陈述
+
+- 第三轮对账表中「七 7.2/7.3 DOCX ZIP 与 RTF、八 搜索公平性与 moments、九 前端缓存 | 未实现」已由 v0.1.7（`132aae1`）实现，本轮另修复其 moments 过量查询回归。
+- 2026-10-25 复审「明确不修：嵌套目录只浪费遍历、不会误删」判断有误——单值 root_id 下删除父目录确会清掉子目录范围的索引，本轮以拒绝重叠根目录修复。
+- 仍未完成（下批）：内容指纹与 file_revision、视频有界流水线与 sidecar 取消协议、截断状态透出 UI、RAM Budget 接入调度、put_many 连续写入、搜索 Top-K 聚合。

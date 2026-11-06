@@ -260,6 +260,7 @@ export const labels = {
     failed: '失败',
     skipped: '已跳过',
     stale: '需更新',
+    keyword_only: '仅关键词索引',
   } as Record<FileState, string>,
   settings: {
     title: '设置',

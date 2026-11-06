@@ -160,18 +160,27 @@ pub fn ensure_generation_store(base: &Path, db: &Db) -> Result<PathBuf> {
 /// since the compaction that recorded it (row count unchanged) — hashing a large file on
 /// every resolve would be prohibitive.
 fn check_active(active: &Path, db: &Db, deep: bool) -> Result<()> {
+    let live = db.alive_vec_rows()?;
     if !active.exists() {
-        if db.alive_vec_rows()? > 0 {
+        if live > 0 {
             return Err(Error::Config(format!(
-                "活动向量文件缺失: {}。索引数据库仍有 {} 条有效向量映射，文件可能被删除或移动。",
-                active.display(),
-                db.alive_vec_rows().unwrap_or(0)
+                "活动向量文件缺失: {}。索引数据库仍有 {live} 条有效向量映射，文件可能被删除或移动。",
+                active.display()
             )));
         }
         return Ok(());
     }
     let len = active.metadata()?.len() as usize;
     if len == 0 {
+        // 零字节 ≠ 空索引：磁盘异常/外部截断可能把有数据的文件清成 0 字节。
+        // 此时数据库里的映射仍在，放行会让 Store::open 重新初始化文件头、
+        // 旧 row_id 全部指向不存在（或被后续写入覆盖）的数据——必须按损坏处理。
+        if live > 0 {
+            return Err(Error::Config(format!(
+                "活动向量文件为 0 字节，但索引数据库仍有 {live} 条有效向量映射，已按损坏处理: {}",
+                active.display()
+            )));
+        }
         return Ok(());
     }
     if len < 16 {
@@ -183,6 +192,15 @@ fn check_active(active: &Path, db: &Db, deep: bool) -> Result<()> {
         std::io::Read::read_exact(&mut f, &mut head)?;
     }
     let (dim, rows) = parse_header(&head, len, active)?;
+    // 数据库有效映射必须落在文件声明的行数内；越界即损坏，不能静默当空向量。
+    if let Some(max_row) = db.max_alive_row()? {
+        if max_row >= rows as i64 {
+            return Err(Error::Config(format!(
+                "向量映射行号 {max_row} 超出文件行数 {rows}，索引已损坏: {}",
+                active.display()
+            )));
+        }
+    }
     let rec_dim = db.get_meta("vec_dim").and_then(|v| v.parse::<usize>().ok());
     if let Some(d) = rec_dim {
         if d != dim {
@@ -274,7 +292,7 @@ pub fn write_generation(src: &Path, dst: &Path, dim: usize, live: &[(i64, i64)])
     put(&mut w, &mut hash, &(live.len() as u32).to_le_bytes())?;
     for (old, _) in live {
         if *old < 0 {
-            continue;
+            return Err(Error::Config(format!("压缩遇到负数向量行号 {old}，索引已损坏")));
         }
         let v = view.as_ref().map(|s| s.row(*old as usize)).unwrap_or(&[]);
         if v.len() != dim {
@@ -565,7 +583,8 @@ impl MmapView {
         let mut scored: Vec<(VecRow, f32)> = candidates
             .par_iter()
             .map(|c| {
-                let v = self.row(c.row.max(0) as usize);
+                // 负数行号是数据库损坏的信号，绝不能折叠到第 0 行冒充别人的向量。
+                let v = if c.row < 0 { &[][..] } else { self.row(c.row as usize) };
                 let s = if v.len() == self.dim { dot(query, v) } else { -1.0 };
                 (clone_row(c), s)
             })
@@ -937,6 +956,71 @@ mod tests {
         assert_eq!(dropped, 0);
         assert_eq!(active_generation(&db), 1, "generation 不应翻转");
         assert!(!gen_path(&base, 2).exists(), "没有可回收内容就不该产出新文件");
+    }
+
+    /// 零字节活动文件 + 有效映射 = 损坏：必须报错，绝不能放行让 Store 重新初始化
+    /// 文件头（P0：意外截断会就此吞掉整套语义索引）。
+    #[test]
+    fn zero_byte_active_file_with_live_rows_is_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, db) = seeded_store(&dir, "vectors.f32");
+        let active = active_vector_path(&base, &db).unwrap();
+        // 模拟磁盘异常截断
+        std::fs::write(&active, []).unwrap();
+        let row = db.reserve_vec_row(EmbedRowKind::Image, 1, 1).unwrap();
+        db.activate_vec_rows(&[row]).unwrap();
+
+        let err = active_vector_path(&base, &db).unwrap_err();
+        assert!(err.to_string().contains("0 字节"), "{err}");
+        let err = ensure_generation_store(&base, &db).unwrap_err();
+        assert!(err.to_string().contains("0 字节"), "{err}");
+        assert!(!base.exists(), "文件绝不能被自动重建覆盖");
+    }
+
+    /// 零字节 + 零有效映射：合法的「尚未写入」，照常放行。
+    #[test]
+    fn zero_byte_active_file_without_live_rows_is_fine() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, db) = seeded_store(&dir, "vectors.f32");
+        let active = active_vector_path(&base, &db).unwrap();
+        std::fs::write(&active, []).unwrap();
+        assert_eq!(active_vector_path(&base, &db).unwrap(), active);
+    }
+
+    /// 数据库映射超出文件声明行数：启动即报损坏，不能静默当空向量搜。
+    #[test]
+    fn live_rows_beyond_header_row_count_are_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, db) = seeded_store(&dir, "vectors.f32"); // 2 行
+        let row = db.reserve_vec_row(EmbedRowKind::Image, 1, 1).unwrap(); // 第 2 行
+        db.activate_vec_rows(&[row]).unwrap();
+        // 把文件截到只剩 1 行：映射行 1 越界
+        let active = gen_path(&base, 1);
+        let data = std::fs::read(&active).unwrap();
+        std::fs::write(&active, &data[..16 + 2 * 4]).unwrap();
+        let err = active_vector_path(&base, &db).unwrap_err();
+        assert!(
+            err.to_string().contains("超出文件行数") || err.to_string().contains("长度不合法"),
+            "{err}"
+        );
+    }
+
+    /// 搜索侧负数行号守卫：绝不能折叠到第 0 行冒充别人的向量。
+    #[test]
+    fn negative_candidate_rows_never_match_row_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("v.f32");
+        let mut s = Store::open(&p, 2).unwrap();
+        s.put(0, &[1.0, 0.0]).unwrap();
+        s.flush().unwrap();
+        let view = MmapView::open(&p).unwrap().unwrap();
+        let bad = VecRow { row: -5, target: EmbedRowKind::Image, ref_id: 9, file_id: 200, file_kind: Kind::Image };
+        let good = VecRow { row: 0, target: EmbedRowKind::Image, ref_id: 1, file_id: 100, file_kind: Kind::Image };
+        let hits = view.search(&[1.0, 0.0], &[bad, good], 5);
+        let bad_hit = hits.iter().find(|(r, _)| r.file_id == 200).unwrap();
+        assert!(bad_hit.1 < 0.0, "负数行号不得匹配第 0 行的向量: {bad_hit:?}");
+        let good_hit = hits.iter().find(|(r, _)| r.file_id == 100).unwrap();
+        assert!((good_hit.1 - 1.0).abs() < 1e-6);
     }
 
     /// write_generation 产出完整可读的新文件：头、行数、内容与哈希一致。

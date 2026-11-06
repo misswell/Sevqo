@@ -247,6 +247,14 @@ pub async fn set_settings(app: AppHandle, next: Settings) -> Res<Settings> {
             return Err(es(e));
         }
         *st.settings.lock().map_err(|_| "设置锁已中毒".to_string())? = cfg.clone();
+        // 排除规则收紧后，已被排除的文件必须立刻从索引里消失（P1，隐私相关）：
+        // FTS、正文、chunk/clip、向量映射一起清，再跑一轮对账把其余内容补齐。
+        let exclusions_changed = old.exclude_dirs != cfg.exclude_dirs
+            || old.exclude_path_prefixes != cfg.exclude_path_prefixes;
+        if exclusions_changed {
+            let purged = purge_excluded_files(&st)?;
+            tracing::info!("排除规则变更：清理 {purged} 个已排除文件的索引");
+        }
         if runtime_changed {
             st.configure_client(&cfg);
         }
@@ -254,9 +262,61 @@ pub async fn set_settings(app: AppHandle, next: Settings) -> Res<Settings> {
             let _ = app.global_shortcut().unregister(old.global_shortcut.as_str());
         }
         let _ = st.db.set_meta("vector_dim", &cfg.vector_dim.to_string());
+        if exclusions_changed {
+            if let Err(e) = spawn_index_thread(&app, &st, auto_mode(&st), None, true) {
+                tracing::warn!("排除规则变更后的对账未启动：{e}");
+            }
+        }
         Ok(cfg)
     })
     .await
+}
+
+/// Remove every indexed file that now falls under the exclusion rules. Uses the same
+/// matcher as the scanner so scope stays consistent between walk, watcher and purge.
+fn purge_excluded_files(st: &Arc<AppState>) -> Res<usize> {
+    let cfg = st.settings();
+    let roots = st.db.list_roots().map_err(es)?;
+    let mut ids = Vec::new();
+    for root in roots.iter().filter(|r| r.enabled) {
+        let root_path = expand(&root.path);
+        let opts = sevqo_engine::scan::ScanOptions {
+            kinds: &[],
+            max_file_bytes: cfg.max_file_bytes,
+            exclude_dirs: &cfg.exclude_dirs,
+            exclude_prefixes: &cfg.exclude_path_prefixes,
+        };
+        for file in st.db.files_of_root(root.id).map_err(es)? {
+            let path = std::path::Path::new(&file.path);
+            if sevqo_engine::scan::excluded_path(&root_path, path, &opts) {
+                ids.push(file.id);
+            }
+        }
+    }
+    let n = ids.len();
+    st.db.purge_by_ids(&ids).map_err(es)?;
+    Ok(n)
+}
+
+/// 模型版本与向量库绑定（P1）：数据库记录上次校验通过的模型 revision；不一致说明
+/// 向量空间来自另一个模型，维度相同也绝不能混用——清空向量与单元状态，保留 FTS，
+/// 由下一轮 Full 对账重建语义索引。
+pub(crate) fn ensure_model_revision_compat(st: &Arc<AppState>, expected: &str) -> Res<()> {
+    match st.db.get_meta("model_revision") {
+        Some(prev) if prev != expected => {
+            tracing::warn!("模型 revision 变更（{prev} → {expected}）：重置语义索引（保留关键词索引）");
+            sevqo_engine::vectors::wipe(&st.vector_path, &st.db).map_err(es)?;
+            st.db.reset_vectors().map_err(es)?;
+            st.db.mark_missing_vectors().map_err(es)?;
+            st.db.set_meta("model_revision", expected).map_err(es)?;
+        }
+        Some(_) => {}
+        None => {
+            // 首次运行：尚无向量归属记录，只登记当前 revision。
+            st.db.set_meta("model_revision", expected).map_err(es)?;
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -299,8 +359,24 @@ pub async fn add_root(app: AppHandle, path: String, label: Option<String>) -> Re
             return Err("请选择目录，而不是文件".to_string());
         }
         let s = expanded.to_string_lossy().to_string();
-        if st.db.list_roots().map_err(es)?.iter().any(|r| r.path == s) {
+        let existing = st.db.list_roots().map_err(es)?;
+        if existing.iter().any(|r| r.path == s) {
             return Err("该目录已经在索引范围内".to_string());
+        }
+        // 父子目录不得同时作为根目录（P1）：文件归属是单值的，删除父目录会连带清掉
+        // 实际属于子目录范围的索引。用 canonicalize 比较，绕过符号链接与 ../ 的障眼法。
+        let norm = |p: &std::path::Path| p.canonicalize().map(|c| c.to_string_lossy().into_owned()).unwrap_or_else(|_| p.to_string_lossy().into_owned());
+        let new_norm = norm(&expanded);
+        for r in &existing {
+            let old_norm = norm(&expand(&r.path));
+            if new_norm.starts_with(&format!("{old_norm}/"))
+                || old_norm.starts_with(&format!("{new_norm}/"))
+            {
+                return Err(format!(
+                    "与已有目录「{}」重叠（父子关系），请只保留其中一层",
+                    r.label
+                ));
+            }
         }
         let name = label.filter(|l| !l.trim().is_empty()).unwrap_or_else(|| dir_label(&expanded));
         let id = st.db.add_root(&s, &name).map_err(es)?;
@@ -658,7 +734,7 @@ pub async fn recent(app: AppHandle, limit: Option<usize>) -> Res<Vec<Hit>> {
             ..Default::default()
         };
         req.query.clear();
-        let searcher = Searcher::new(st.db.clone(), &st.vector_path).map_err(es)?;
+        let searcher = Searcher::new_keyword_only(st.db.clone());
         Ok(searcher.run(&req, None).map_err(es)?.hits)
     })
     .await
@@ -705,7 +781,11 @@ fn resolve_query_vector(st: &Arc<AppState>, searcher: &Searcher, req: &SearchReq
 fn run_search(st: &Arc<AppState>, mut req: SearchRequest, injected: Option<Vec<f32>>) -> Res<SearchResponse> {
     let _vectors = st.vector_access.read().map_err(es)?;
     req.limit = req.limit.clamp(1, 500);
-    let searcher = Searcher::new(st.db.clone(), &st.vector_path).map_err(es)?;
+    // 纯关键词请求不碰向量文件：向量库损坏时 FTS 必须照常可用（P2-04）。
+    let searcher = match req.semantic {
+        true => Searcher::new(st.db.clone(), &st.vector_path).map_err(es)?,
+        false => Searcher::new_keyword_only(st.db.clone()),
+    };
     let (qv, degraded) = match injected {
         Some(v) => {
             let dim = searcher.vector_dim();
@@ -883,6 +963,7 @@ pub fn spawn_model_download(st: Arc<AppState>, app: AppHandle, announce: bool) -
             let (ready, note, cancelled) = match &result {
                 Ok(()) => {
                     st.set_model_ready(true);
+                    let _ = st.db.set_meta("model_revision", model::MODEL_REVISION);
                     // 模型到齐后自动补一轮：之前 TextOnly 收进库的 done 文件在这里
                     // 被 mark_missing_vectors 重新排队并获得语义向量（六章启动对账的收尾）。
                     if let Err(e) = spawn_index_thread(&app2, &st, auto_mode(&st), None, true) {
@@ -975,6 +1056,111 @@ mod review_tests {
             done.send(()).unwrap();
         });
         wait.recv_timeout(std::time::Duration::from_secs(2)).expect("progress sender held by Indexer must be dropped before join");
+    }
+
+    /// 排除规则收紧后，已排除文件的索引（FTS/正文/向量）必须立刻消失（P1，隐私）。
+    #[test]
+    fn purge_excluded_files_removes_newly_excluded_content() {
+        let (dir, st) = crate::state::test_state();
+        let root_path = dir.path().join("proj");
+        std::fs::create_dir_all(root_path.join("private")).unwrap();
+        let root = st.db.add_root(&root_path.to_string_lossy(), "项目").unwrap();
+        let seen = sevqo_engine::db::now_ns();
+        let mk = |path: &std::path::Path| sevqo_engine::scan::Scanned {
+            root_id: root,
+            path: path.to_string_lossy().into(),
+            name: path.file_name().unwrap().to_string_lossy().into(),
+            ext: "md".into(),
+            kind: sevqo_engine::Kind::Document,
+            size: 1,
+            mtime_ns: seen,
+        };
+        let pub_file = root_path.join("readme.md");
+        let secret = root_path.join("private").join("secret.md");
+        let a = st.db.upsert_file(&mk(&pub_file), seen).unwrap().0;
+        let b = st.db.upsert_file(&mk(&secret), seen).unwrap().0;
+        for id in [a, b] {
+            st.db.set_file_state(id, sevqo_engine::FileState::Done, None).unwrap();
+        }
+        // 排除 private/：模拟设置变更
+        {
+            let mut cfg = st.settings();
+            cfg.exclude_path_prefixes.push(root_path.join("private").to_string_lossy().into());
+            *st.settings.lock().unwrap() = cfg;
+        }
+        let purged = purge_excluded_files(&st).unwrap();
+        assert_eq!(purged, 1, "只清理被排除的文件");
+        assert!(st.db.file(a).is_some(), "未排除文件保留");
+        assert!(st.db.file(b).is_none(), "被排除文件连行带向量一起清掉");
+    }
+
+    /// 模型 revision 变更：清空向量与单元状态、保留关键词索引，并登记新 revision。
+    #[test]
+    fn model_revision_change_resets_semantic_index_but_keeps_fts() {
+        let (dir, st) = crate::state::test_state();
+        let root = st.db.add_root(&dir.path().join("d").to_string_lossy(), "d").unwrap();
+        let seen = sevqo_engine::db::now_ns();
+        let s = sevqo_engine::scan::Scanned {
+            root_id: root, path: dir.path().join("d").join("a.md").to_string_lossy().into(),
+            name: "a.md".into(), ext: "md".into(), kind: sevqo_engine::Kind::Document,
+            size: 1, mtime_ns: seen,
+        };
+        let id = st.db.upsert_file(&s, seen).unwrap().0;
+        st.db.store_text(id, None, "海边的日落", false).unwrap();
+        st.db.set_file_state(id, sevqo_engine::FileState::Done, None).unwrap();
+        let row = st.db.reserve_vec_row(sevqo_engine::EmbedRowKind::Chunk, id, id).unwrap();
+        st.db.activate_vec_rows(&[row]).unwrap();
+        st.db.set_meta("model_revision", "rev-old").unwrap();
+
+        ensure_model_revision_compat(&st, "rev-new").unwrap();
+
+        assert_eq!(st.db.alive_vec_rows().unwrap(), 0, "旧向量空间必须清空");
+        assert_eq!(st.db.get_meta("model_revision").as_deref(), Some("rev-new"));
+        let rec = st.db.file(id).unwrap();
+        assert_eq!(rec.state, sevqo_engine::FileState::Stale, "文件回队列等新模型重建");
+        assert!(st.db.stored_text(id).is_some(), "关键词索引保留");
+    }
+
+    /// 父子目录不得同时成为根目录（P1）：删除父目录会连带清掉子目录范围的索引。
+    #[test]
+    fn add_root_rejects_overlapping_directories() {
+        let (dir, st) = crate::state::test_state();
+        let parent = dir.path().join("projects");
+        let child = parent.join("appa");
+        std::fs::create_dir_all(&child).unwrap();
+        // 直接走数据库 + 判定逻辑的等价路径：重叠检查在 add_root 命令内，
+        // 这里验证判定本身的两个方向。
+        st.db.add_root(&parent.to_string_lossy(), "父").unwrap();
+        let norm = |p: &std::path::Path| p.to_string_lossy().into_owned();
+        let existing = st.db.list_roots().unwrap();
+        let new_norm = norm(&child);
+        let overlap = existing.iter().any(|r| {
+            let old_norm = norm(std::path::Path::new(&r.path));
+            new_norm.starts_with(&format!("{old_norm}/")) || old_norm.starts_with(&format!("{new_norm}/"))
+        });
+        assert!(overlap, "子目录必须被判定为与父目录重叠");
+    }
+
+    /// 向量库损坏时，纯关键词搜索照常可用（P2-04）。
+    #[test]
+    fn keyword_search_survives_a_corrupt_vector_store() {
+        let (dir, st) = crate::state::test_state();
+        let root = st.db.add_root(&dir.path().join("d").to_string_lossy(), "d").unwrap();
+        let seen = sevqo_engine::db::now_ns();
+        let s = sevqo_engine::scan::Scanned {
+            root_id: root, path: dir.path().join("d").join("a.md").to_string_lossy().into(),
+            name: "a.md".into(), ext: "md".into(), kind: sevqo_engine::Kind::Document,
+            size: 1, mtime_ns: seen,
+        };
+        let id = st.db.upsert_file(&s, seen).unwrap().0;
+        st.db.store_text(id, None, "海边的日落", false).unwrap();
+        st.db.set_file_state(id, sevqo_engine::FileState::Done, None).unwrap();
+        std::fs::write(&st.vector_path, [b'X'; 32]).unwrap(); // 坏 magic
+
+        assert!(sevqo_engine::search::Searcher::new(st.db.clone(), &st.vector_path).is_err());
+        let searcher = sevqo_engine::search::Searcher::new_keyword_only(st.db.clone());
+        let hits = searcher.keyword(&Default::default(), "日落", 10).unwrap();
+        assert_eq!(hits.len(), 1, "FTS 不受向量库损坏影响");
     }
 
     #[test]

@@ -36,6 +36,11 @@ pub fn run() {
     }
 
     let state = Arc::new(AppState::new(paths, settings, db));
+    // 模型版本与向量库绑定（P1）：revision 变更时重置语义索引、保留关键词索引，
+    // 之后的 Full 对账会用新模型重建向量。维度相同也不能混用两个模型的向量空间。
+    if let Err(e) = commands::ensure_model_revision_compat(&state, sevqo_engine::model::MODEL_REVISION) {
+        tracing::warn!("模型版本兼容检查失败: {e}");
+    }
     let managed = state.clone();
 
     tauri::Builder::default()
@@ -159,39 +164,74 @@ pub fn run() {
                 std::thread::Builder::new()
                     .name("sevqo-root-health".into())
                     .spawn(move || {
-                        let mut offline: std::collections::HashSet<String> = std::collections::HashSet::new();
-                        // 指数退避：30s 起步，最慢 5 分钟；发现恢复后回到 30s。
+                        // 启动即初始化离线集合（P1 修复：此前从空集合开始，30 秒内
+                        // 插回的盘不会触发恢复）。
+                        let mut offline: std::collections::HashSet<String> = disk_state
+                            .db
+                            .list_roots()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|r| r.enabled && !commands::expand(&r.path).exists())
+                            .map(|r| r.path)
+                            .collect();
+                        // 指数退避：30s 起步，最慢 5 分钟；有恢复动作后回到 30s。
                         let mut backoff_secs: u64 = 30;
+                        // 对账请求持久化在线程内：许可被占用时不丢，下一轮补跑。
+                        let mut pending_rescan = false;
                         loop {
                             std::thread::sleep(std::time::Duration::from_secs(backoff_secs));
                             let roots = match disk_state.db.list_roots() {
                                 Ok(v) => v,
                                 Err(_) => continue,
                             };
+                            // 实际监听中的根目录（watcher 注册成功才会出现在这里）。
+                            let watched: std::collections::HashSet<String> =
+                                disk_state.watcher.lock().ok().map_or_else(Default::default, |g| {
+                                    g.as_ref()
+                                        .map(|h| h.roots.iter().map(|p| p.to_string_lossy().into_owned()).collect())
+                                        .unwrap_or_default()
+                                });
+                            let mut need_restart = false;
                             let mut recovered = Vec::new();
                             for r in roots.iter().filter(|r| r.enabled) {
                                 let path = commands::expand(&r.path);
-                                if path.exists() {
-                                    if offline.remove(&r.path) {
-                                        recovered.push(path);
+                                let path_str = path.to_string_lossy().into_owned();
+                                if !path.exists() {
+                                    if offline.insert(r.path.clone()) {
+                                        tracing::warn!("根目录当前不可用（挂载后自动恢复）：{}", r.path);
                                     }
-                                } else if offline.insert(r.path.clone()) {
-                                    tracing::warn!("根目录当前不可用（挂载后自动恢复）：{}", r.path);
+                                    continue;
+                                }
+                                // 目录在但此前记录为离线：刚重新挂载。
+                                if offline.remove(&r.path) {
+                                    need_restart = true;
+                                    recovered.push(path.clone());
+                                }
+                                // 目录在但不在监听集合里：启动竞态或注册失败，都需重试。
+                                if !watched.contains(&path_str) {
+                                    need_restart = true;
                                 }
                             }
-                            if recovered.is_empty() {
+                            if need_restart {
+                                if let Err(e) = commands::restart_watcher(&disk_state, &disk_handle) {
+                                    tracing::warn!("重注册监听失败：{e}");
+                                }
+                                for path in &recovered {
+                                    tracing::info!("根目录重新可用，开始增量对账：{}", path.display());
+                                }
+                                pending_rescan = true;
+                            }
+                            if pending_rescan {
+                                match commands::spawn_index_thread(&disk_handle, &disk_state, commands::auto_mode(&disk_state), None, true) {
+                                    Ok(()) => {
+                                        pending_rescan = false;
+                                        backoff_secs = 30;
+                                    }
+                                    // 许可被占用：保留待办，下一轮重试。
+                                    Err(e) => tracing::info!("对账暂未开始（{e}），稍后重试"),
+                                }
+                            } else {
                                 backoff_secs = (backoff_secs * 2).min(300);
-                                continue;
-                            }
-                            backoff_secs = 30;
-                            if let Err(e) = commands::restart_watcher(&disk_state, &disk_handle) {
-                                tracing::warn!("重挂载后重启监听失败：{e}");
-                            }
-                            for path in &recovered {
-                                tracing::info!("根目录重新可用，开始增量对账：{}", path.display());
-                            }
-                            if let Err(e) = commands::spawn_index_thread(&disk_handle, &disk_state, commands::auto_mode(&disk_state), None, true) {
-                                tracing::info!("重挂载目录的对账未立即开始：{e}");
                             }
                         }
                     })

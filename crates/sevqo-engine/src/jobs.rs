@@ -71,6 +71,9 @@ enum Prepared {
     Embed { items: Vec<EmbedItem>, keys: Vec<String> },
     /// Nothing left to do: text is stored, or the file has no indexable content.
     Indexed,
+    /// 关键词索引完成但语义单元未全部持久化（模型不可用期间的 TextOnly 产物）。
+    /// 标记为 keyword_only：不进入待处理队列，模型就绪后由 mark_missing_vectors 补齐。
+    KeywordOnly,
     Skip(String),
 }
 
@@ -522,6 +525,10 @@ impl Indexer {
                     self.db.set_file_state(f.id, FileState::Done, None)?;
                     out.done += 1;
                 }
+                Ok(Prepared::KeywordOnly) => {
+                    self.db.set_file_state(f.id, FileState::KeywordOnly, Some("已建立关键词索引；语义索引待模型可用后补齐"))?;
+                    out.done += 1;
+                }
                 Ok(Prepared::Skip(reason)) => {
                     self.db.set_file_state(f.id, FileState::Skipped, Some(&reason))?;
                     out.skipped += 1;
@@ -677,7 +684,11 @@ impl Indexer {
             None,
         )?;
         if !want_vectors {
-            return Ok(Prepared::Indexed);
+            return Ok(if self.db.has_incomplete_units(f.id)? {
+                Prepared::KeywordOnly
+            } else {
+                Prepared::Indexed
+            });
         }
         let clips = plan_clips(probe.duration_s, &self.settings);
         if clips.is_empty() {
@@ -729,7 +740,16 @@ impl Indexer {
         };
         self.db.store_text(f.id, title.as_deref(), &text, truncated)?;
         if !want_vectors || text.trim().is_empty() {
-            return Ok(Prepared::Indexed);
+            // TextOnly 不得把「部分语义完成」伪装成完整 Done（P1 修复）：
+            // 之前成功过的单元保持原状，缺失的等模型就绪后由 mark_missing_vectors 补。
+            if text.trim().is_empty() {
+                return Ok(Prepared::Indexed);
+            }
+            return Ok(if self.db.has_incomplete_units(f.id)? {
+                Prepared::KeywordOnly
+            } else {
+                Prepared::Indexed
+            });
         }
         let chunks = extract::chunk_text(&text, 900, MAX_CHUNKS_PER_FILE);
         if chunks.is_empty() {
@@ -756,6 +776,11 @@ impl Indexer {
         }
         Ok(Prepared::Embed { items, keys })
     }
+}
+
+#[cfg(test)]
+fn chunk_id_of(db: &Db, file_id: i64, ord: usize) -> i64 {
+    db.chunk_rows(file_id).unwrap()[ord].0
 }
 
 fn path_str(p: &Path) -> String {
@@ -1547,6 +1572,115 @@ mod tests {
 
     /// 文件级状态由单元终态聚合：全持久化=done，可重试失败=stale（带解释），
     /// 重试耗尽=failed（带原因），图片（无单元行）按本轮结果判定。
+    /// 压缩不得回收「进行中文件」里已持久化的向量（P1 修复回归）：
+    /// 3 个片段 2 成 1 败，文件 stale；压缩后 2 条有效映射必须原样保留，
+    /// 第 3 条重试成功后整份文件可见、可搜。
+    #[test]
+    fn compaction_keeps_persisted_units_of_an_incomplete_file() {
+        let h = harness();
+        h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
+        let doc = add_doc(&h, "part.md", &"海边的日落。".repeat(450));
+        let rec = h.db.file(doc.id).unwrap();
+        let (idx, _rx) = indexer(&h, text_settings());
+        let Prepared::Embed { items, keys } = idx.prepare_text(&rec, true).unwrap() else {
+            panic!("应产出嵌入任务");
+        };
+        assert_eq!(items.len(), 3, "3 个片段");
+        // 模拟：前 2 个成功（落盘+激活+persisted），第 3 个失败（只预留 staging 行）
+        let rows: Vec<i64> = keys.iter().filter_map(|k| parse_key(k).map(|(_, r, _)| r)).collect();
+        let mut store = Store::open(&h.paths.vector_path, 512).unwrap();
+        for (i, r) in rows[..2].iter().enumerate() {
+            let mut v = vec![0.0f32; 512];
+            v[i] = 1.0;
+            store.put(*r as usize, &v).unwrap();
+        }
+        store.flush().unwrap();
+        drop(store);
+        h.db.activate_vec_rows(&rows[..2]).unwrap();
+        h.db
+            .mark_units_persisted(&[
+                (EmbedRowKind::Chunk, chunk_id_of(&h.db, doc.id, 0)),
+                (EmbedRowKind::Chunk, chunk_id_of(&h.db, doc.id, 1)),
+            ])
+            .unwrap();
+        h.db.mark_units_failed(&[(EmbedRowKind::Chunk, chunk_id_of(&h.db, doc.id, 2))], "超时").unwrap();
+        h.db.set_file_state(doc.id, FileState::Stale, Some("1 个片段待重试")).unwrap();
+        assert_eq!(h.db.alive_vec_rows().unwrap(), 2);
+
+        // 压缩：绝不能把前 2 条有效映射一起回收
+        let dropped = compact(&h.db, &h.paths.vector_path, 512).unwrap();
+        assert_eq!(dropped, 1, "只回收失败片段的 staging 行");
+        assert_eq!(h.db.alive_vec_rows().unwrap(), 2, "已持久化的向量必须保留");
+        let cs = h.db.chunk_rows(doc.id).unwrap();
+        let sum = h.db.unit_summary(doc.id, UNIT_RETRY_MAX).unwrap();
+        assert_eq!((sum.total, sum.persisted), (3, 2), "单元状态不受压缩影响");
+
+        // 第 3 个片段重试成功 → 整份文件完成、三个向量全部可搜
+        let row3 = h.db.reserve_vec_row(EmbedRowKind::Chunk, chunk_id_of(&h.db, doc.id, 2), doc.id).unwrap();
+        let active = crate::vectors::active_vector_path(&h.paths.vector_path, &h.db).unwrap();
+        let mut store = Store::open(&active, 512).unwrap();
+        let mut v = vec![0.0f32; 512];
+        v[2] = 1.0;
+        store.put(row3 as usize, &v).unwrap();
+        store.flush().unwrap();
+        drop(store);
+        h.db.activate_vec_rows(&[row3]).unwrap();
+        h.db.mark_units_persisted(&[(EmbedRowKind::Chunk, chunk_id_of(&h.db, doc.id, 2))]).unwrap();
+        h.db.set_file_state(doc.id, FileState::Done, None).unwrap();
+
+        let candidates = h.db.vec_candidates(&[]).unwrap();
+        assert_eq!(candidates.len(), 3, "三个片段全部可搜");
+        let view = crate::vectors::MmapView::open(&active).unwrap().unwrap();
+        let mut q = vec![0.0f32; 512];
+        q[1] = 1.0;
+        let hits = view.search(&q, &candidates, 5);
+        assert!((hits[0].1 - 1.0).abs() < 1e-6, "压缩后旧向量内容必须原样可读");
+        let _ = idx;
+    }
+
+    /// TextOnly 不得把「部分语义完成」伪装成 Done（P1 修复回归）：
+    /// 部分失败的文件在 TextOnly 下变 keyword_only；模型就绪后
+    /// mark_missing_vectors 按单元完整性把它重新排队。
+    #[test]
+    fn text_only_marks_partial_semantics_keyword_only_and_backfills_later() {
+        let h = harness();
+        h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
+        let doc = add_doc(&h, "half.md", &"山间的雾。".repeat(450));
+        let rec = h.db.file(doc.id).unwrap();
+        let (idx, _rx) = indexer(&h, text_settings());
+        let Prepared::Embed { keys, .. } = idx.prepare_text(&rec, true).unwrap() else {
+            panic!("应产出嵌入任务");
+        };
+        let chunk_ids: Vec<i64> = h.db.chunk_rows(doc.id).unwrap().into_iter().map(|(id, _)| id).collect();
+        // 前 2 个成功、第 3 个失败 → 文件 stale
+        h.db.activate_vec_rows(&keys.iter().filter_map(|k| parse_key(k).map(|(_, r, _)| r)).take(2).collect::<Vec<_>>()).unwrap();
+        h.db.mark_units_persisted(&[(EmbedRowKind::Chunk, chunk_ids[0]), (EmbedRowKind::Chunk, chunk_ids[1])]).unwrap();
+        h.db.mark_units_failed(&[(EmbedRowKind::Chunk, chunk_ids[2])], "超时").unwrap();
+        h.db.set_file_state(doc.id, FileState::Stale, Some("1 个片段待重试")).unwrap();
+
+        // 模型暂时不可用：TextOnly 一轮
+        let rec = h.db.file(doc.id).unwrap();
+        assert!(matches!(idx.prepare_text(&rec, false).unwrap(), Prepared::KeywordOnly));
+        h.db.set_file_state(doc.id, FileState::KeywordOnly, None).unwrap();
+
+        // 旧逻辑此时会把文件留在 Done、永不补齐；新逻辑：模型就绪后按单元完整性回队列
+        assert_eq!(h.db.mark_missing_vectors().unwrap(), 1, "部分失败的文件必须回队列");
+        assert_eq!(h.db.file(doc.id).unwrap().state, FileState::Stale);
+        assert!(h.db.has_incomplete_units(doc.id).unwrap());
+        // 语义完整的文件不被误伤：所有片段 persisted 且映射有效
+        let done_full = add_doc(&h, "full.md", "短的正文");
+        let rec2 = h.db.file(done_full.id).unwrap();
+        let Prepared::Embed { keys: full_keys, .. } = idx.prepare_text(&rec2, true).unwrap() else {
+            panic!("应产出嵌入任务");
+        };
+        h.db.activate_vec_rows(&full_keys.iter().filter_map(|k| parse_key(k).map(|(_, r, _)| r)).collect::<Vec<_>>()).unwrap();
+        let full_chunks: Vec<(EmbedRowKind, i64)> =
+            h.db.chunk_rows(done_full.id).unwrap().into_iter().map(|(id, _)| (EmbedRowKind::Chunk, id)).collect();
+        h.db.mark_units_persisted(&full_chunks).unwrap();
+        h.db.set_file_state(done_full.id, FileState::Done, None).unwrap();
+        assert_eq!(h.db.mark_missing_vectors().unwrap(), 0, "语义完整的文件不需要回队列");
+    }
+
     #[test]
     fn file_state_aggregates_from_units() {
         let h = harness();

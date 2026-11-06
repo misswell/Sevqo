@@ -64,7 +64,7 @@ export interface SearchResponse {
   note: string | null;
 }
 
-export type FileState = 'pending' | 'indexing' | 'done' | 'failed' | 'skipped' | 'stale';
+export type FileState = 'pending' | 'indexing' | 'done' | 'keyword_only' | 'failed' | 'skipped' | 'stale';
 
 export interface FileRecord {
   id: number;

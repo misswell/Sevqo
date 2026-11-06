@@ -59,6 +59,10 @@ pub enum FileState {
     Pending,
     Indexing,
     Done,
+    /// 关键词（文件名/正文）索引完成，但语义单元未全部持久化——通常是模型不可用
+    /// 期间的 TextOnly 产物。不进入语义待处理队列；模型就绪后由
+    /// `mark_missing_vectors` 重新排队补齐。
+    KeywordOnly,
     Failed,
     Skipped,
     Stale,
@@ -70,6 +74,7 @@ impl FileState {
             FileState::Pending => "pending",
             FileState::Indexing => "indexing",
             FileState::Done => "done",
+            FileState::KeywordOnly => "keyword_only",
             FileState::Failed => "failed",
             FileState::Skipped => "skipped",
             FileState::Stale => "stale",
@@ -78,6 +83,7 @@ impl FileState {
     pub fn parse(s: &str) -> FileState {
         match s {
             "done" => FileState::Done,
+            "keyword_only" => FileState::KeywordOnly,
             "failed" => FileState::Failed,
             "skipped" => FileState::Skipped,
             "stale" => FileState::Stale,
