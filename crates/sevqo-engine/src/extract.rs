@@ -20,11 +20,59 @@ pub struct Extracted {
 pub fn native(ext: &str) -> bool {
     matches!(
         ext,
-        "txt" | "md" | "markdown" | "mdx" | "org" | "rst" | "log" | "csv" | "tsv" | "rtf" | "docx" | "json"
-            | "json5" | "yaml" | "yml" | "toml" | "ini" | "xml" | "html" | "css" | "scss" | "vue" | "js"
-            | "jsx" | "ts" | "tsx" | "rs" | "go" | "py" | "java" | "kt" | "swift" | "c" | "h" | "cpp"
-            | "hpp" | "cc" | "rb" | "php" | "sql" | "sh" | "zsh" | "bash" | "lua" | "r" | "m" | "mm"
-            | "dart" | "scala" | "gradle" | "dockerfile" | "tf" | "proto"
+        "txt"
+            | "md"
+            | "markdown"
+            | "mdx"
+            | "org"
+            | "rst"
+            | "log"
+            | "csv"
+            | "tsv"
+            | "rtf"
+            | "docx"
+            | "json"
+            | "json5"
+            | "yaml"
+            | "yml"
+            | "toml"
+            | "ini"
+            | "xml"
+            | "html"
+            | "css"
+            | "scss"
+            | "vue"
+            | "js"
+            | "jsx"
+            | "ts"
+            | "tsx"
+            | "rs"
+            | "go"
+            | "py"
+            | "java"
+            | "kt"
+            | "swift"
+            | "c"
+            | "h"
+            | "cpp"
+            | "hpp"
+            | "cc"
+            | "rb"
+            | "php"
+            | "sql"
+            | "sh"
+            | "zsh"
+            | "bash"
+            | "lua"
+            | "r"
+            | "m"
+            | "mm"
+            | "dart"
+            | "scala"
+            | "gradle"
+            | "dockerfile"
+            | "tf"
+            | "proto"
     )
 }
 
@@ -32,11 +80,20 @@ pub fn title_for(path: &Path) -> Option<String> {
     path.file_stem().map(|s| s.to_string_lossy().to_string())
 }
 
-pub fn extract(path: &Path, ext: &str, max_read_bytes: u64, max_store_kb: usize) -> Result<Extracted> {
+pub fn extract(
+    path: &Path,
+    ext: &str,
+    max_read_bytes: u64,
+    max_store_kb: usize,
+) -> Result<Extracted> {
     let ext = ext.to_ascii_lowercase();
     let raw = read_bounded(path, max_read_bytes)?;
     if raw.is_empty() {
-        return Ok(Extracted { title: title_for(path), text: String::new(), truncated: false });
+        return Ok(Extracted {
+            title: title_for(path),
+            text: String::new(),
+            truncated: false,
+        });
     }
     let (mut text, truncated) = match ext.as_str() {
         "docx" => (docx_text(&raw)?, false),
@@ -185,7 +242,9 @@ fn docx_text_with(raw: &[u8], limits: ZipLimits) -> Result<String> {
         }
         total += buf.len() as u64;
         if total > limits.max_total_bytes {
-            return Err(Error::Unsupported("DOCX 解压总量超出上限，已拒绝解析".into()));
+            return Err(Error::Unsupported(
+                "DOCX 解压总量超出上限，已拒绝解析".into(),
+            ));
         }
         let xml = String::from_utf8_lossy(&buf);
         out.push_str(&xml_paragraphs(&xml));
@@ -307,7 +366,11 @@ fn rtf_text(raw: &[u8]) -> String {
                             .collect();
                         if let Ok(v) = n.parse::<i64>() {
                             // signed 16-bit → code unit; negatives wrap into 0x8000..=0xFFFF
-                            let unit = if v < 0 { (v + 65_536) as u16 } else { (v & 0xFFFF) as u16 };
+                            let unit = if v < 0 {
+                                (v + 65_536) as u16
+                            } else {
+                                (v & 0xFFFF) as u16
+                            };
                             if skip_group_depth == 0 {
                                 push_code_unit(&mut out, &mut pending_high, unit);
                             }
@@ -384,7 +447,11 @@ fn rtf_text(raw: &[u8]) -> String {
                     push_clean(&mut out, &decode_rtf_bytes(&raw[start..i]));
                     continue;
                 }
-                out.push(if b.is_ascii_whitespace() { ' ' } else { b as char });
+                out.push(if b.is_ascii_whitespace() {
+                    ' '
+                } else {
+                    b as char
+                });
                 i += 1;
             }
         }
@@ -455,7 +522,7 @@ fn html_text(raw: &[u8]) -> String {
     let mut in_script = false;
     let lower = s.to_ascii_lowercase();
     let mut chars = s.char_indices().peekable();
-    while let Some((i, c)) = chars.next() {
+    for (i, c) in chars.by_ref() {
         if c == '<' {
             tag = true;
             let rest = &lower[i..];
@@ -589,7 +656,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("note.txt");
         // "海边的日落" in GB2312 — what Chinese editors wrote before UTF-8
-        std::fs::write(&p, [0xBAu8, 0xA3, 0xB1, 0xDF, 0xB5, 0xC4, 0xC8, 0xD5, 0xC2, 0xE4]).unwrap();
+        std::fs::write(
+            &p,
+            [0xBAu8, 0xA3, 0xB1, 0xDF, 0xB5, 0xC4, 0xC8, 0xD5, 0xC2, 0xE4],
+        )
+        .unwrap();
         let got = extract(&p, "txt", 1 << 20, 64).unwrap();
         assert_eq!(got.text, "海边的日落", "{:?}", got.text);
     }
@@ -604,7 +675,8 @@ mod tests {
 
     #[test]
     fn html_drops_script_body() {
-        let html = "<html><body><script>var x=1;</script><p>海 <b>边</b></p></body></html>".as_bytes();
+        let html =
+            "<html><body><script>var x=1;</script><p>海 <b>边</b></p></body></html>".as_bytes();
         assert_eq!(html_text(html).trim(), "海 边");
     }
 
@@ -666,7 +738,10 @@ mod tests {
         assert!(err.to_string().contains("过大"), "{err}");
 
         // 压缩比异常：256KB 零字节压到几十字节，比例远超上限。
-        let ratio_limits = ZipLimits { max_entry_bytes: 1 << 20, ..small_limits };
+        let ratio_limits = ZipLimits {
+            max_entry_bytes: 1 << 20,
+            ..small_limits
+        };
         let zeros = vec![0u8; 256 * 1024];
         let bomb = zip_with(&[("word/document.xml", &zeros)]);
         let err = docx_text_with(&bomb, ratio_limits).unwrap_err();
@@ -681,7 +756,10 @@ mod tests {
         assert!(err.to_string().contains("条目过多"), "{err}");
 
         // 正常文档照常解析。
-        let ok = zip_with(&[("word/document.xml", "<w:p><w:t>海边的日落</w:t></w:p>".as_bytes())]);
+        let ok = zip_with(&[(
+            "word/document.xml",
+            "<w:p><w:t>海边的日落</w:t></w:p>".as_bytes(),
+        )]);
         let text = docx_text_with(&ok, small_limits).unwrap();
         assert!(text.contains("海边的日落"), "{text}");
     }

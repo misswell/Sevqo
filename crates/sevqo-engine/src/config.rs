@@ -111,7 +111,10 @@ impl Settings {
                     v
                 }
                 Err(e) => {
-                    tracing::warn!("设置文件解析失败（{}），使用默认值；原文件保留为 settings.bad.json", e);
+                    tracing::warn!(
+                        "设置文件解析失败（{}），使用默认值；原文件保留为 settings.bad.json",
+                        e
+                    );
                     let _ = std::fs::copy(path, path.with_extension("bad.json"));
                     let mut v = Settings::default();
                     v.validate();
@@ -161,7 +164,9 @@ impl Settings {
         self.infer_batch = self.infer_batch.clamp(1, 32);
         // 0 不是「不限制」而是「一个文件都不收」：扫描会静默跳过全部内容，
         // 队列看起来像扫完了。留在 1MB 以上才是个有意义的单文件上限。
-        self.max_file_bytes = self.max_file_bytes.clamp(1024 * 1024, 16 * 1024 * 1024 * 1024);
+        self.max_file_bytes = self
+            .max_file_bytes
+            .clamp(1024 * 1024, 16 * 1024 * 1024 * 1024);
         if (self.video_window_s * self.video_fps) as usize > 32 {
             // never ask the encoder for more than max_frames
             self.video_fps = 32.0 / self.video_window_s;
@@ -180,10 +185,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
 
-        let mut cfg = Settings::default();
-        cfg.max_file_bytes = 0; // 非法值：validate 会收到 1MB 下限
+        let cfg = Settings {
+            max_file_bytes: 0,
+            ..Settings::default()
+        }; // 非法值：validate 会收到 1MB 下限
         cfg.save(&path).unwrap();
-        assert!(path.with_extension("bak.json").exists() || !path.exists() == false);
+        cfg.save(&path).unwrap(); // 第二次保存时才存在可备份的上一份
+        assert!(
+            path.with_extension("bak.json").exists(),
+            "保存应保留上一份备份"
+        );
         let loaded = Settings::load(&path);
         assert_eq!(loaded.max_file_bytes, 1024 * 1024, "加载时也要 validate");
 
@@ -198,8 +209,10 @@ mod tests {
 
     #[test]
     fn file_size_limit_stays_usable() {
-        let mut s = Settings::default();
-        s.max_file_bytes = 0;
+        let mut s = Settings {
+            max_file_bytes: 0,
+            ..Settings::default()
+        };
         s.validate();
         assert_eq!(s.max_file_bytes, 1024 * 1024);
 

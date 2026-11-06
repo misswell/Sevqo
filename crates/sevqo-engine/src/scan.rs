@@ -72,7 +72,9 @@ fn is_excluded_dir(name: &str, excludes: &[String]) -> bool {
 }
 
 fn under_prefixes(path: &Path, prefixes: &[String]) -> bool {
-    prefixes.iter().any(|p| !p.is_empty() && path.starts_with(expand_home(p)))
+    prefixes
+        .iter()
+        .any(|p| !p.is_empty() && path.starts_with(expand_home(p)))
 }
 
 /// Apply the same scope exclusions to a watcher event as to a directory walk.
@@ -80,7 +82,9 @@ pub fn excluded_path(root: &Path, path: &Path, opts: &ScanOptions) -> bool {
     if under_prefixes(path, opts.exclude_prefixes) {
         return true;
     }
-    let Ok(relative) = path.strip_prefix(root) else { return true };
+    let Ok(relative) = path.strip_prefix(root) else {
+        return true;
+    };
     relative.components().any(|c| {
         let name = c.as_os_str().to_string_lossy();
         name.starts_with('.') || is_excluded_dir(&name, opts.exclude_dirs)
@@ -138,7 +142,9 @@ where
             continue;
         }
         if file_type.is_dir() {
-            if is_excluded_dir(&name_os, opts.exclude_dirs) || under_prefixes(path, opts.exclude_prefixes) {
+            if is_excluded_dir(&name_os, opts.exclude_dirs)
+                || under_prefixes(path, opts.exclude_prefixes)
+            {
                 stats.skipped_excluded += 1;
                 builder.skip_current_dir();
             }
@@ -194,7 +200,7 @@ pub fn dir_label(root: &Path) -> String {
 
 pub fn expand_home(p: &str) -> PathBuf {
     if p == "~" {
-        return dirs::home_dir().map(PathBuf::from).unwrap_or_else(|| PathBuf::from(p));
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(p));
     }
     if let Some(rest) = p.strip_prefix("~/") {
         if let Some(h) = dirs::home_dir() {
@@ -240,7 +246,10 @@ mod tests {
         std::fs::write(d.join("big.bin"), vec![0u8; 10]).unwrap();
 
         let excl = ["node_modules".to_string()];
-        let opts = ScanOptions { exclude_dirs: &excl, ..Default::default() };
+        let opts = ScanOptions {
+            exclude_dirs: &excl,
+            ..Default::default()
+        };
         let cancel = AtomicBool::new(false);
         let mut found = Vec::new();
         let stats = scan(1, d, &opts, &cancel, |s| found.push(s.name)).unwrap();
@@ -254,7 +263,10 @@ mod tests {
     fn max_bytes_skips_large() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
-        let opts = ScanOptions { max_file_bytes: 3, ..Default::default() };
+        let opts = ScanOptions {
+            max_file_bytes: 3,
+            ..Default::default()
+        };
         let cancel = AtomicBool::new(false);
         let mut found = Vec::new();
         let stats = scan(1, dir.path(), &opts, &cancel, |s| found.push(s.name)).unwrap();

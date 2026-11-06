@@ -89,7 +89,10 @@ pub struct Debouncer {
 
 impl Debouncer {
     pub fn new(quiet: Duration) -> Debouncer {
-        Debouncer { quiet, pending: HashMap::new() }
+        Debouncer {
+            quiet,
+            pending: HashMap::new(),
+        }
     }
 
     /// Absorb an event; returns paths that have been quiet long enough to act on.
@@ -115,10 +118,8 @@ impl Debouncer {
                 };
                 if replace {
                     self.pending.insert(p.clone(), (change, now));
-                } else {
-                    if let Some(entry) = self.pending.get_mut(p) {
-                        entry.1 = now;
-                    }
+                } else if let Some(entry) = self.pending.get_mut(p) {
+                    entry.1 = now;
                 }
             }
         }
@@ -208,7 +209,10 @@ impl WatcherHandle {
             }
         });
 
-        Ok(WatcherHandle { watcher, roots: watched })
+        Ok(WatcherHandle {
+            watcher,
+            roots: watched,
+        })
     }
 
     pub fn unwatch(&mut self, root: &Path) {
@@ -225,7 +229,10 @@ impl Debouncer {
             .filter(|(_, (_, at))| now.saturating_duration_since(*at) >= self.quiet)
             .map(|(p, _)| p.clone())
             .collect();
-        stale.into_iter().filter_map(|p| self.pending.remove(&p).map(|(c, _)| c)).collect()
+        stale
+            .into_iter()
+            .filter_map(|p| self.pending.remove(&p).map(|(c, _)| c))
+            .collect()
     }
 }
 
@@ -259,23 +266,38 @@ fn mtime_ns(meta: &std::fs::Metadata) -> i64 {
 
 /// Apply one watched change to the index. A file that no longer exists is deleted from
 /// the index, so results never point at a moved or trashed file.
-pub fn apply_change(db: &crate::db::Db, change: &Change, wanted_kinds: &[crate::Kind], max_file_bytes: u64) -> crate::Result<Applied> {
-    apply_change_with_options(db, change, &crate::scan::ScanOptions {
-        kinds: wanted_kinds,
-        max_file_bytes,
-        exclude_dirs: &[],
-        exclude_prefixes: &[],
-    })
+pub fn apply_change(
+    db: &crate::db::Db,
+    change: &Change,
+    wanted_kinds: &[crate::Kind],
+    max_file_bytes: u64,
+) -> crate::Result<Applied> {
+    apply_change_with_options(
+        db,
+        change,
+        &crate::scan::ScanOptions {
+            kinds: wanted_kinds,
+            max_file_bytes,
+            exclude_dirs: &[],
+            exclude_prefixes: &[],
+        },
+    )
 }
 
-pub fn apply_change_with_options(db: &crate::db::Db, change: &Change, opts: &crate::scan::ScanOptions) -> crate::Result<Applied> {
+pub fn apply_change_with_options(
+    db: &crate::db::Db,
+    change: &Change,
+    opts: &crate::scan::ScanOptions,
+) -> crate::Result<Applied> {
     use crate::db;
     use crate::scan::Scanned;
 
     let path = change.path();
     let s = path.to_string_lossy().to_string();
     if !path.as_os_str().is_empty() {
-        let Some(root_id) = root_for(db, path)? else { return Ok(Applied::Ignored) };
+        let Some(root_id) = root_for(db, path)? else {
+            return Ok(Applied::Ignored);
+        };
         let Some(root) = db.list_roots()?.into_iter().find(|r| r.id == root_id) else {
             // 根目录在校验和读取之间被删掉了：当作不在索引范围内，别把进程带崩。
             return Ok(Applied::Ignored);
@@ -309,9 +331,15 @@ pub fn apply_change_with_options(db: &crate::db::Db, change: &Change, opts: &cra
         Ok(m) if m.is_file() => m,
         _ => return Ok(Applied::Ignored),
     };
-    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
     let ext = ext_of(&name);
-    if opts.kinds.is_empty() || !crate::scan::wanted(&ext, opts.kinds) || meta.len() > opts.max_file_bytes {
+    if opts.kinds.is_empty()
+        || !crate::scan::wanted(&ext, opts.kinds)
+        || meta.len() > opts.max_file_bytes
+    {
         return Ok(Applied::Ignored);
     }
     let root_id = match root_for(db, path)? {
@@ -330,7 +358,11 @@ pub fn apply_change_with_options(db: &crate::db::Db, change: &Change, opts: &cra
         mtime_ns: mtime_ns(&meta),
     };
     let (_, needs) = db.upsert_file(&scanned, seen)?;
-    Ok(if needs { Applied::NeedsIndex } else { Applied::Unchanged })
+    Ok(if needs {
+        Applied::NeedsIndex
+    } else {
+        Applied::Unchanged
+    })
 }
 
 /// The enabled root that contains `path`, longest match winning.
@@ -363,19 +395,31 @@ mod tests {
         let kinds = [crate::Kind::Document];
         let prefixes = [dir.path().join("private").to_string_lossy().to_string()];
         let opts = crate::scan::ScanOptions {
-            kinds: &kinds, max_file_bytes: 1024,
-            exclude_dirs: &["node_modules".into()], exclude_prefixes: &prefixes,
+            kinds: &kinds,
+            max_file_bytes: 1024,
+            exclude_dirs: &["node_modules".into()],
+            exclude_prefixes: &prefixes,
         };
-        for name in [".hidden/note.txt", "node_modules/note.txt", "private/note.txt"] {
+        for name in [
+            ".hidden/note.txt",
+            "node_modules/note.txt",
+            "private/note.txt",
+        ] {
             let path = dir.path().join(name);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, "excluded").unwrap();
-            assert_eq!(apply_change_with_options(&db, &Change::Modified(path.clone()), &opts).unwrap(), Applied::Ignored);
+            assert_eq!(
+                apply_change_with_options(&db, &Change::Modified(path.clone()), &opts).unwrap(),
+                Applied::Ignored
+            );
             assert!(db.file_by_path(&path.to_string_lossy()).is_none());
         }
         let path = dir.path().join("note.txt");
         std::fs::write(&path, "included").unwrap();
-        assert_eq!(apply_change_with_options(&db, &Change::Modified(path), &opts).unwrap(), Applied::NeedsIndex);
+        assert_eq!(
+            apply_change_with_options(&db, &Change::Modified(path), &opts).unwrap(),
+            Applied::NeedsIndex
+        );
     }
 
     fn p(s: &str) -> PathBuf {
@@ -395,8 +439,18 @@ mod tests {
         let t0 = Instant::now();
         let mut d = Debouncer::new(Duration::from_millis(100));
         assert!(d.push(Change::Created(p("/a/b.txt")), t0).is_empty());
-        assert!(d.push(Change::Modified(p("/a/b.txt")), t0 + Duration::from_millis(30)).is_empty());
-        assert!(d.push(Change::Modified(p("/a/b.txt")), t0 + Duration::from_millis(60)).is_empty());
+        assert!(d
+            .push(
+                Change::Modified(p("/a/b.txt")),
+                t0 + Duration::from_millis(30)
+            )
+            .is_empty());
+        assert!(d
+            .push(
+                Change::Modified(p("/a/b.txt")),
+                t0 + Duration::from_millis(60)
+            )
+            .is_empty());
         let out = d.push_timeout(t0 + Duration::from_millis(200));
         assert_eq!(out.len(), 1, "three writes must produce one re-index");
         // the first kind survives, so a brand-new file is not treated as a modification
@@ -437,9 +491,17 @@ mod tests {
 
     #[test]
     fn create_and_remove_map_directly() {
-        let c = classify(Event { kind: EventKind::Create(notify::event::CreateKind::File), paths: vec![p("/x")], attrs: Default::default() });
+        let c = classify(Event {
+            kind: EventKind::Create(notify::event::CreateKind::File),
+            paths: vec![p("/x")],
+            attrs: Default::default(),
+        });
         assert_eq!(c[0], Change::Created(p("/x")));
-        let r = classify(Event { kind: EventKind::Remove(notify::event::RemoveKind::File), paths: vec![p("/y")], attrs: Default::default() });
+        let r = classify(Event {
+            kind: EventKind::Remove(notify::event::RemoveKind::File),
+            paths: vec![p("/y")],
+            attrs: Default::default(),
+        });
         assert_eq!(r[0], Change::Removed(p("/y")));
     }
 
@@ -450,7 +512,10 @@ mod tests {
         assert!(handle.is_ok());
         let got = rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(matches!(got, Change::Rescan(_)), "{got:?}");
-        assert!(handle.unwrap().roots.is_empty(), "nothing was actually watched");
+        assert!(
+            handle.unwrap().roots.is_empty(),
+            "nothing was actually watched"
+        );
     }
 
     #[test]

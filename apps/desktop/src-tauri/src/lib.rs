@@ -14,7 +14,9 @@ use crate::state::AppState;
 const SHORTCUT_FALLBACK: &str = "Alt+Space";
 
 pub fn run() {
-    let model_home = std::env::var("SEVQO_MODEL_HOME").ok().filter(|s| !s.is_empty());
+    let model_home = std::env::var("SEVQO_MODEL_HOME")
+        .ok()
+        .filter(|s| !s.is_empty());
     let (paths, settings, db) = match commands::bootstrap_paths(model_home.as_deref()) {
         Ok(v) => v,
         Err(e) => {
@@ -26,7 +28,11 @@ pub fn run() {
     tracing::info!("数据目录 {}", paths.data_dir.display());
 
     let shortcut = settings.global_shortcut.clone();
-    let wants_media = settings.index_images || settings.index_video;
+    // 方案十：文本语义索引同样需要模型权重，不能只看图片/视频开关。
+    let wants_media = settings.index_images
+        || settings.index_video
+        || settings.index_documents
+        || settings.index_code;
     let resume = settings.resume_on_launch;
     let update_check = settings.update_check;
     // P0-01：启动时对向量库做一次一致性检查与孤儿 generation 清理。失败只记录并继续：
@@ -34,11 +40,35 @@ pub fn run() {
     if let Err(e) = sevqo_engine::vectors::ensure_generation_store(&paths.vector_path, &db) {
         tracing::error!("向量库启动检查失败: {e}");
     }
+    // 模型版本与向量库绑定（方案十）：revision 变更即重置语义索引、保留关键词索引。
+    if let Err(e) = commands::ensure_model_revision_compat_db(
+        &db,
+        &paths.vector_path,
+        sevqo_engine::model::MODEL_REVISION,
+    ) {
+        tracing::warn!("模型版本兼容检查失败: {e}");
+    }
+    // 一致性检查器（方案 2.4）：只自愈可确定的数据关系，其余上报。
+    match sevqo_engine::integrity::check_and_repair(&db) {
+        Ok(r) if !r.is_clean() => {
+            tracing::warn!(
+                "索引一致性：自愈 persisted失联 {}、孤儿映射 {}、done缺单元 {}；待人工: {:?}",
+                r.fixed_stale_units,
+                r.fixed_orphan_rows,
+                r.fixed_incomplete_done,
+                r.problems
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("索引一致性检查失败: {e}"),
+    }
 
     let state = Arc::new(AppState::new(paths, settings, db));
     // 模型版本与向量库绑定（P1）：revision 变更时重置语义索引、保留关键词索引，
     // 之后的 Full 对账会用新模型重建向量。维度相同也不能混用两个模型的向量空间。
-    if let Err(e) = commands::ensure_model_revision_compat(&state, sevqo_engine::model::MODEL_REVISION) {
+    if let Err(e) =
+        commands::ensure_model_revision_compat(&state, sevqo_engine::model::MODEL_REVISION)
+    {
         tracing::warn!("模型版本兼容检查失败: {e}");
     }
     let managed = state.clone();
@@ -48,7 +78,10 @@ pub fn run() {
         .plugin(
             ShortcutBuilder::new()
                 .with_handler(|app, _shortcut, event| {
-                    if matches!(event.state, tauri_plugin_global_shortcut::ShortcutState::Pressed) {
+                    if matches!(
+                        event.state,
+                        tauri_plugin_global_shortcut::ShortcutState::Pressed
+                    ) {
                         toggle_spotlight(app);
                     }
                 })
@@ -120,7 +153,8 @@ pub fn run() {
             // 首启按需下载：weights arrive in the background and stream their progress.
             // 判据是「权重齐没齐」而不是「能不能推理」——没配 Python 时也该先把这 1.49 GB 取回来。
             if wants_media && !state.model_ready() {
-                if let Err(e) = commands::spawn_model_download(state.clone(), handle.clone(), false) {
+                if let Err(e) = commands::spawn_model_download(state.clone(), handle.clone(), false)
+                {
                     tracing::warn!("模型自动下载未启动：{e}");
                 }
             }
@@ -149,7 +183,18 @@ pub fn run() {
                 // 对账扫描顺带处理离线删除（sweep 有完整成功护栏，不会误删）。
                 // 推理能力此刻多半还没就绪（模型后台校验中），先按 auto_mode 跑：
                 // TextOnly 也能把离线变化收进库；模型就绪后下载线程会再触发一轮补向量。
-                match commands::spawn_index_thread(&handle, &state, commands::auto_mode(&state), None, true) {
+                if let Ok(n) = state.db.requeue_skipped_existing() {
+                    if n > 0 {
+                        tracing::info!("启动对账：重排 {n} 个此前被跳过的任务");
+                    }
+                }
+                match commands::spawn_index_thread(
+                    &handle,
+                    &state,
+                    commands::auto_mode(&state),
+                    None,
+                    true,
+                ) {
                     Ok(()) => tracing::info!("启动对账已开始"),
                     // 监听增量正在跑时拿不到许可：队列里的变更不会被丢，下一轮补上。
                     Err(e) => tracing::info!("启动对账未立即开始：{e}"),
@@ -185,10 +230,18 @@ pub fn run() {
                                 Err(_) => continue,
                             };
                             // 实际监听中的根目录（watcher 注册成功才会出现在这里）。
-                            let watched: std::collections::HashSet<String> =
-                                disk_state.watcher.lock().ok().map_or_else(Default::default, |g| {
+                            let watched: std::collections::HashSet<String> = disk_state
+                                .watcher
+                                .lock()
+                                .ok()
+                                .map_or_else(Default::default, |g| {
                                     g.as_ref()
-                                        .map(|h| h.roots.iter().map(|p| p.to_string_lossy().into_owned()).collect())
+                                        .map(|h| {
+                                            h.roots
+                                                .iter()
+                                                .map(|p| p.to_string_lossy().into_owned())
+                                                .collect()
+                                        })
                                         .unwrap_or_default()
                                 });
                             let mut need_restart = false;
@@ -198,7 +251,10 @@ pub fn run() {
                                 let path_str = path.to_string_lossy().into_owned();
                                 if !path.exists() {
                                     if offline.insert(r.path.clone()) {
-                                        tracing::warn!("根目录当前不可用（挂载后自动恢复）：{}", r.path);
+                                        tracing::warn!(
+                                            "根目录当前不可用（挂载后自动恢复）：{}",
+                                            r.path
+                                        );
                                     }
                                     continue;
                                 }
@@ -213,16 +269,32 @@ pub fn run() {
                                 }
                             }
                             if need_restart {
-                                if let Err(e) = commands::restart_watcher(&disk_state, &disk_handle) {
+                                if let Err(e) = commands::restart_watcher(&disk_state, &disk_handle)
+                                {
                                     tracing::warn!("重注册监听失败：{e}");
                                 }
                                 for path in &recovered {
-                                    tracing::info!("根目录重新可用，开始增量对账：{}", path.display());
+                                    tracing::info!(
+                                        "根目录重新可用，开始增量对账：{}",
+                                        path.display()
+                                    );
+                                }
+                                // 方案 5.4：磁盘离线期间被跳过的任务，文件已重新出现的重新排队。
+                                match disk_state.db.requeue_skipped_existing() {
+                                    Ok(n) if n > 0 => tracing::info!("重排 {n} 个此前被跳过的任务"),
+                                    Ok(_) => {}
+                                    Err(e) => tracing::warn!("重排 skipped 任务失败: {e}"),
                                 }
                                 pending_rescan = true;
                             }
                             if pending_rescan {
-                                match commands::spawn_index_thread(&disk_handle, &disk_state, commands::auto_mode(&disk_state), None, true) {
+                                match commands::spawn_index_thread(
+                                    &disk_handle,
+                                    &disk_state,
+                                    commands::auto_mode(&disk_state),
+                                    None,
+                                    true,
+                                ) {
                                     Ok(()) => {
                                         pending_rescan = false;
                                         backoff_secs = 30;
@@ -286,7 +358,10 @@ fn init_tracing(log_dir: &std::path::Path) {
         .map(std::sync::Mutex::new);
     match file {
         Some(w) => {
-            let _ = tracing_subscriber::fmt().with_env_filter(filter).with_writer(w).try_init();
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(w)
+                .try_init();
         }
         None => {
             let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();

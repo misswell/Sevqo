@@ -27,20 +27,76 @@ pub struct ModelFile {
 /// Files required to load `SentenceTransformer(dir)` locally. The model is Apache-2.0
 /// and ungated, so no token is ever needed.
 pub const FILES: &[ModelFile] = &[
-    ModelFile { path: "1_Pooling/config.json", size: 90, sha256: "8759bdf7c77efc7df7723f64856a593c8943b71ee38baf2a88771fbaf78438f9" },
-    ModelFile { path: "2_Normalize/config.json", size: 97, sha256: "cdb09dfca347a56aa2d691744e38d5ad3c7cbc2834e7181272b9a15328b82524" },
-    ModelFile { path: "README.md", size: 22_234, sha256: "2c058c304c68221f1de80979594036eff3972b2bce686bb7b0f43621a6b0b011" },
-    ModelFile { path: "chat_template.jinja", size: 1016, sha256: "4b852efc0b9960283e735363331e6f325b33bc74bdbaa076f595bc4e9b94d85e" },
-    ModelFile { path: "config.json", size: 4455, sha256: "b8f1e9931b57fbc054acdb445c41765d55b0074c58d145fa82839941ad1b5bb3" },
-    ModelFile { path: "config_sentence_transformers.json", size: 1565, sha256: "031e56a498d33c349ab489a21885bcfe25b4fcba841149dc99e1e90d4a7c28f5" },
-    ModelFile { path: "modules.json", size: 413, sha256: "3d02572a0455b832de67fb8e63a54981bc7e8b46e337c95e917bd8122a533bfd" },
-    ModelFile { path: "preprocessor_config.json", size: 511, sha256: "ea2ae257e901064abdd98dceb19f2b0da06af600bed15e0f99f5c85c37ee9d78" },
-    ModelFile { path: "processor_config.json", size: 1788, sha256: "168f6a08522f3ce5dea596d94d003af2fd691742d4f41fe1f9d8cce76bfbf69c" },
-    ModelFile { path: "sentence_bert_config.json", size: 747, sha256: "b1bcd9f2dce3ae863b359e87d0710b5dbc3314a59ecb4e2f97c7778fc8e4b228" },
-    ModelFile { path: "tokenizer_config.json", size: 1599, sha256: "17bd5d6e9364ca49a534e1502076593317c298d4a663623091ed45388f004874" },
-    ModelFile { path: "tokenizer.model", size: 4_689_013, sha256: "e594c8a90eb08d8bda498ff4747977dc827ae0c3c56b5c0d41a605a22d02ef03" },
-    ModelFile { path: "tokenizer.json", size: 32_170_510, sha256: "4d777ef5bdc1aa36227abdfb77c3e49e7b9c892d16e1b6bda41c393504828be4" },
-    ModelFile { path: "model.safetensors", size: 1_488_915_288, sha256: "197a32965d4b1105faf060417baa899e193fb73cd401f42ec9295234d5553d79" },
+    ModelFile {
+        path: "1_Pooling/config.json",
+        size: 90,
+        sha256: "8759bdf7c77efc7df7723f64856a593c8943b71ee38baf2a88771fbaf78438f9",
+    },
+    ModelFile {
+        path: "2_Normalize/config.json",
+        size: 97,
+        sha256: "cdb09dfca347a56aa2d691744e38d5ad3c7cbc2834e7181272b9a15328b82524",
+    },
+    ModelFile {
+        path: "README.md",
+        size: 22_234,
+        sha256: "2c058c304c68221f1de80979594036eff3972b2bce686bb7b0f43621a6b0b011",
+    },
+    ModelFile {
+        path: "chat_template.jinja",
+        size: 1016,
+        sha256: "4b852efc0b9960283e735363331e6f325b33bc74bdbaa076f595bc4e9b94d85e",
+    },
+    ModelFile {
+        path: "config.json",
+        size: 4455,
+        sha256: "b8f1e9931b57fbc054acdb445c41765d55b0074c58d145fa82839941ad1b5bb3",
+    },
+    ModelFile {
+        path: "config_sentence_transformers.json",
+        size: 1565,
+        sha256: "031e56a498d33c349ab489a21885bcfe25b4fcba841149dc99e1e90d4a7c28f5",
+    },
+    ModelFile {
+        path: "modules.json",
+        size: 413,
+        sha256: "3d02572a0455b832de67fb8e63a54981bc7e8b46e337c95e917bd8122a533bfd",
+    },
+    ModelFile {
+        path: "preprocessor_config.json",
+        size: 511,
+        sha256: "ea2ae257e901064abdd98dceb19f2b0da06af600bed15e0f99f5c85c37ee9d78",
+    },
+    ModelFile {
+        path: "processor_config.json",
+        size: 1788,
+        sha256: "168f6a08522f3ce5dea596d94d003af2fd691742d4f41fe1f9d8cce76bfbf69c",
+    },
+    ModelFile {
+        path: "sentence_bert_config.json",
+        size: 747,
+        sha256: "b1bcd9f2dce3ae863b359e87d0710b5dbc3314a59ecb4e2f97c7778fc8e4b228",
+    },
+    ModelFile {
+        path: "tokenizer_config.json",
+        size: 1599,
+        sha256: "17bd5d6e9364ca49a534e1502076593317c298d4a663623091ed45388f004874",
+    },
+    ModelFile {
+        path: "tokenizer.model",
+        size: 4_689_013,
+        sha256: "e594c8a90eb08d8bda498ff4747977dc827ae0c3c56b5c0d41a605a22d02ef03",
+    },
+    ModelFile {
+        path: "tokenizer.json",
+        size: 32_170_510,
+        sha256: "4d777ef5bdc1aa36227abdfb77c3e49e7b9c892d16e1b6bda41c393504828be4",
+    },
+    ModelFile {
+        path: "model.safetensors",
+        size: 1_488_915_288,
+        sha256: "197a32965d4b1105faf060417baa899e193fb73cd401f42ec9295234d5553d79",
+    },
 ];
 
 pub fn total_bytes() -> u64 {
@@ -153,7 +209,10 @@ fn remember_checksum(dir: &Path, rel: &str, digest: &str) {
             all = m;
         }
     }
-    all.insert(rel.to_string(), serde_json::Value::String(digest.to_string()));
+    all.insert(
+        rel.to_string(),
+        serde_json::Value::String(digest.to_string()),
+    );
     let _ = std::fs::write(&idx, serde_json::to_vec_pretty(&all).unwrap_or_default());
 }
 
@@ -164,6 +223,7 @@ struct Fetch<'a> {
 }
 
 impl<'a> Fetch<'a> {
+    #[allow(clippy::too_many_arguments)] // minisign/断点续传协议字段，重组无益
     /// Range-resume one file. Returns Err only after exhausting `attempts`. The download
     /// only replaces the target file after its SHA256 matches the trusted manifest
     /// (P0-04): a mismatch deletes the `.part` and retries from scratch, and any existing
@@ -195,21 +255,30 @@ impl<'a> Fetch<'a> {
                 let _ = std::fs::remove_file(&part_path);
                 have = 0;
             }
-            match self.stream_to_part(endpoint, rel, size, have, &part_path, cancel, |done, rate| {
-                on_progress(DownloadProgress {
-                    file: rel.to_string(),
-                    file_index,
-                    file_count: FILES.len(),
-                    done_bytes: done,
-                    total_bytes: size,
-                    overall_bytes: overall_base + done,
-                    overall_total: total_bytes(),
-                    bytes_per_second: rate,
-                    endpoint: endpoint.clone(),
-                    note: None,
-                })
-            }) {
-                Ok(digest) => match commit_verified(&part_path, &final_path, &digest, expected_sha) {
+            match self.stream_to_part(
+                endpoint,
+                rel,
+                size,
+                have,
+                &part_path,
+                cancel,
+                |done, rate| {
+                    on_progress(DownloadProgress {
+                        file: rel.to_string(),
+                        file_index,
+                        file_count: FILES.len(),
+                        done_bytes: done,
+                        total_bytes: size,
+                        overall_bytes: overall_base + done,
+                        overall_total: total_bytes(),
+                        bytes_per_second: rate,
+                        endpoint: endpoint.clone(),
+                        note: None,
+                    })
+                },
+            ) {
+                Ok(digest) => match commit_verified(&part_path, &final_path, &digest, expected_sha)
+                {
                     Ok(()) => {
                         remember_checksum(self.dir, rel, &digest);
                         return Ok(());
@@ -244,6 +313,7 @@ impl<'a> Fetch<'a> {
         Err(Error::Download(format!("{rel}: {last_err}")))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn stream_to_part(
         &self,
         endpoint: &str,
@@ -294,7 +364,9 @@ impl<'a> Fetch<'a> {
             if cancel.load(Ordering::Relaxed) {
                 return Err(Error::Cancelled);
             }
-            let n = resp.read(&mut buf).map_err(|e| Error::Download(e.to_string()))?;
+            let n = resp
+                .read(&mut buf)
+                .map_err(|e| Error::Download(e.to_string()))?;
             if n == 0 {
                 break;
             }
@@ -302,7 +374,8 @@ impl<'a> Fetch<'a> {
             digest.update(&buf[..n]);
             done += n as u64;
             if last_emit.elapsed() > Duration::from_millis(400) {
-                let rate = done.saturating_sub(have) as f64 / started.elapsed().as_secs_f64().max(0.001);
+                let rate =
+                    done.saturating_sub(have) as f64 / started.elapsed().as_secs_f64().max(0.001);
                 report(done, rate);
                 last_emit = Instant::now();
             }
@@ -312,7 +385,11 @@ impl<'a> Fetch<'a> {
         if done != size {
             return Err(Error::Download(format!("连接中断于 {done}/{size} 字节")));
         }
-        Ok(digest.finalize().iter().map(|b| format!("{b:02x}")).collect())
+        Ok(digest
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect())
     }
 }
 
@@ -325,7 +402,10 @@ pub fn ensure(
     mut on_progress: impl FnMut(DownloadProgress),
 ) -> Result<()> {
     let endpoints = if endpoints.is_empty() {
-        vec!["https://hf-mirror.com".to_string(), "https://huggingface.co".to_string()]
+        vec![
+            "https://hf-mirror.com".to_string(),
+            "https://huggingface.co".to_string(),
+        ]
     } else {
         endpoints.to_vec()
     };
@@ -334,7 +414,11 @@ pub fn ensure(
         "Sevqo/0.1 (local media search)",
         proxy.map(|s| s.trim()).filter(|s| !s.is_empty()),
     )?;
-    let fetch = Fetch { client: &client, dir, endpoints: &endpoints };
+    let fetch = Fetch {
+        client: &client,
+        dir,
+        endpoints: &endpoints,
+    };
 
     let mut overall = 0u64;
     for (i, f) in FILES.iter().enumerate() {
@@ -365,10 +449,19 @@ pub fn ensure(
             continue;
         }
         let base = overall;
-        fetch.one(f.path, f.size, f.sha256, 24, cancel, &mut |mut pr| {
-            pr.overall_bytes = base + pr.done_bytes;
-            on_progress(pr)
-        }, i, base)?;
+        fetch.one(
+            f.path,
+            f.size,
+            f.sha256,
+            24,
+            cancel,
+            &mut |mut pr| {
+                pr.overall_bytes = base + pr.done_bytes;
+                on_progress(pr)
+            },
+            i,
+            base,
+        )?;
         overall += f.size;
     }
     // 每个文件都已单独通过 manifest 校验（缓存哈希比对、下载提交前比对），
@@ -382,7 +475,9 @@ pub fn ensure(
 fn commit_verified(part: &Path, final_path: &Path, digest: &str, expected_sha: &str) -> Result<()> {
     if !digest.eq_ignore_ascii_case(expected_sha) {
         let _ = std::fs::remove_file(part);
-        return Err(Error::Download(format!("SHA256 校验失败：期望 {expected_sha}，实际 {digest}")));
+        return Err(Error::Download(format!(
+            "SHA256 校验失败：期望 {expected_sha}，实际 {digest}"
+        )));
     }
     std::fs::rename(part, final_path)?;
     Ok(())
@@ -395,11 +490,19 @@ pub fn verify(dir: &Path) -> Result<()> {
         let p = dir.join(f.path);
         let m = std::fs::metadata(&p).map_err(|_| Error::Download(format!("缺少 {}", f.path)))?;
         if m.len() != f.size {
-            return Err(Error::Download(format!("{} 大小不符（期望 {} 字节，实际 {}）", f.path, f.size, m.len())));
+            return Err(Error::Download(format!(
+                "{} 大小不符（期望 {} 字节，实际 {}）",
+                f.path,
+                f.size,
+                m.len()
+            )));
         }
         let got = sha256_of(&p)?;
         if got != f.sha256 {
-            return Err(Error::Download(format!("{} 校验失败，内容与可信清单不符，请修复模型", f.path)));
+            return Err(Error::Download(format!(
+                "{} 校验失败，内容与可信清单不符，请修复模型",
+                f.path
+            )));
         }
     }
     Ok(())
@@ -419,7 +522,10 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let bytes = vec![b'x'; first.size as usize];
         std::fs::write(&path, &bytes).unwrap();
-        assert!(verify(dir.path()).unwrap_err().to_string().contains("校验失败"));
+        assert!(verify(dir.path())
+            .unwrap_err()
+            .to_string()
+            .contains("校验失败"));
         assert_eq!(std::fs::read(path).unwrap(), bytes, "校验失败不得删文件");
     }
 
@@ -432,7 +538,11 @@ mod tests {
         for f in FILES {
             assert!(f.size > 0, "{}", f.path);
             assert_eq!(f.sha256.len(), 64, "{}", f.path);
-            assert!(f.sha256.bytes().all(|b| b.is_ascii_hexdigit()), "{}", f.path);
+            assert!(
+                f.sha256.bytes().all(|b| b.is_ascii_hexdigit()),
+                "{}",
+                f.path
+            );
         }
     }
 
@@ -449,7 +559,11 @@ mod tests {
         let err = commit_verified(&part, &final_path, "deadbeef", "cafebabe").unwrap_err();
         assert!(err.to_string().contains("校验失败"), "{err}");
         assert!(!part.exists(), "校验失败的 .part 必须丢弃");
-        assert_eq!(std::fs::read(&final_path).unwrap(), b"original", "原文件不得被动过");
+        assert_eq!(
+            std::fs::read(&final_path).unwrap(),
+            b"original",
+            "原文件不得被动过"
+        );
 
         std::fs::write(&part, b"good bytes").unwrap();
         commit_verified(&part, &final_path, "cafebabe", "CAFEBABE").unwrap();
@@ -469,7 +583,10 @@ mod tests {
             url("https://hf-mirror.com/", "1_Pooling/config.json"),
             format!("https://hf-mirror.com/google/embeddinggemma-2/resolve/{MODEL_REVISION}/1_Pooling/config.json?download=true")
         );
-        assert!(!url("https://huggingface.co", "x").contains("/resolve/main/"), "绝不追着 main 下载");
+        assert!(
+            !url("https://huggingface.co", "x").contains("/resolve/main/"),
+            "绝不追着 main 下载"
+        );
     }
 
     #[test]

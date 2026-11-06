@@ -237,3 +237,27 @@
 - 第三轮对账表中「七 7.2/7.3 DOCX ZIP 与 RTF、八 搜索公平性与 moments、九 前端缓存 | 未实现」已由 v0.1.7（`132aae1`）实现，本轮另修复其 moments 过量查询回归。
 - 2026-10-25 复审「明确不修：嵌套目录只浪费遍历、不会误删」判断有误——单值 root_id 下删除父目录确会清掉子目录范围的索引，本轮以拒绝重叠根目录修复。
 - 仍未完成（下批）：内容指纹与 file_revision、视频有界流水线与 sidecar 取消协议、截断状态透出 UI、RAM Budget 接入调度、put_many 连续写入、搜索 Top-K 聚合。
+
+## 2026-11-07 第五轮：全面整改方案 v0.1.8-A 批（数据安全收尾 + 门禁转硬）
+
+方案四批次（A 数据安全 / B 生命周期 / C 性能资源 / D 文档模型 UI）中，A 批主体与 B/C/D 的多项已在 2026-11-05/06 各轮落地（见上两节）。本轮按方案第 17.1–17.3 条先对照再补真实缺口：
+
+| 方案条目 | 状态 | 本轮动作 |
+| --- | --- | --- |
+| 2.2 旧 Generation 延迟清理 | 补齐 | compact 不再立即删旧代；`ensure_generation_store` 在活动代深度校验通过后才清理——新代损坏时旧代保留为恢复来源。注：自动回滚到旧代需要按代分隔的 vec_map（方案 2.2 的 generation_id 列），当前单活动代设计下数据库只存一份映射，回滚会造成映射与文件错位，故只保留文件并明确报错，不做自动回滚 |
+| 2.4 IntegrityChecker | 新增 | `integrity::check_and_repair`：persisted 失联→pending 自愈、孤儿映射→失效、done 缺单元→stale；不可判定项只上报不改动；启动序列调用并记日志 |
+| 8.3 put_many 连续写入 | 新增 | 相邻行合并整块、行内单次 write_all，乱序/交错行语义与旧版等价（含测试） |
+| 5.4 离线不得永久 Skipped | 补齐 | `requeue_skipped_existing`：文件重新出现即回 pending；健康线程恢复时与启动对账时各调一次 |
+| 十 纯文档配置不触发模型校验 | 补齐 | `wants_media` 改为任一索引类型开启即触发模型校验/下载 |
+| 17.14 clippy/fmt 非阻塞 | 转硬 | 全仓（含 --all-targets 与 smoke 示例）警告清零、rustfmt 全仓规范化；ci.yml 两项改为 `-- -D warnings` 阻塞门禁 |
+
+### 本轮测试
+
+引擎 141（新增 IntegrityChecker 3 条、put_many 乱序 1 条）、桌面 17、前端 typecheck+build、`cargo clippy --workspace --all-targets -- -D warnings` 与 `cargo fmt --check` 本地全过。
+
+### 批次状态（如实）
+
+- **A 数据安全**：完成。
+- **B 生命周期**：完成主体（keyword_only、mark_missing_vectors 按单元、重叠根目录拒绝、排除对账、watcher 状态修复、离线 Skipped 重排）。未做：内容指纹与 file_revision（八/四）。
+- **C 性能资源**：完成 moments 精确查询、put_many 连续写入。未做：视频有界流水线与批量推理、sidecar 取消协议、RAM Budget 接入调度、搜索 Top-K（百万级）。
+- **D 文档模型 UI**：完成模型 manifest/revision 绑定、关键词容错、keyword_only 标签。未做：截断状态透出 UI、Office/EPUB 解析器、根目录显式状态列、完整前端状态面板。

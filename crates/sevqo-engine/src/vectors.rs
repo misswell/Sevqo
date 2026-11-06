@@ -34,13 +34,19 @@ pub const GEN_META: &str = "vec_generation";
 /// Path of generation `gen` for a store based at `base` (`…/vectors.f32` →
 /// `…/vectors.g000001.f32`). The legacy name is only used before adoption.
 pub fn gen_path(base: &Path, gen: u64) -> PathBuf {
-    let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("vectors");
+    let stem = base
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("vectors");
     base.with_file_name(format!("{stem}.g{gen:06}.f32"))
 }
 
 /// Generation number encoded in a sibling file name, if any (`vectors.g000007.f32` → 7).
 fn parse_gen_name(base: &Path, name: &str) -> Option<u64> {
-    let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("vectors");
+    let stem = base
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("vectors");
     let rest = name.strip_prefix(stem)?.strip_prefix(".g")?;
     let digits = rest.strip_suffix(".f32")?;
     if digits.len() != 6 || !digits.bytes().all(|b| b.is_ascii_digit()) {
@@ -104,7 +110,11 @@ pub fn gen_tmp_path(base: &Path, gen: u64) -> PathBuf {
 /// Safe while old mmaps are still open (unix unlink keeps mapped pages valid) and while
 /// nothing may append to a superseded generation.
 pub fn cleanup_generations(base: &Path, active: u64) -> Result<()> {
-    let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("vectors").to_string();
+    let stem = base
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("vectors")
+        .to_string();
     if let Some(dir) = base.parent() {
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
@@ -148,9 +158,12 @@ fn adopt_legacy(base: &Path, db: &Db) -> Result<PathBuf> {
 /// `.tmp` write-outs. Call this once at startup before watchers, the indexer and
 /// searchers exist; a running compaction must never be cleaned up from underneath.
 pub fn ensure_generation_store(base: &Path, db: &Db) -> Result<PathBuf> {
+    // 校验先行：活动代通过深度检查之前，绝不能清理任何其他 Generation 文件——
+    // 旧代是压缩失败/新代损坏时唯一可能的恢复来源。
     let active = active_vector_path(base, db)?;
     check_active(&active, db, true)?;
     let gen = gen_meta(db).unwrap_or(1);
+    // 活动代完整有效，被取代的旧代此时才允许清理（方案 2.2：延迟执行）。
     cleanup_generations(base, gen)?;
     Ok(active)
 }
@@ -184,7 +197,10 @@ fn check_active(active: &Path, db: &Db, deep: bool) -> Result<()> {
         return Ok(());
     }
     if len < 16 {
-        return Err(Error::Config(format!("向量文件已损坏: {}", active.display())));
+        return Err(Error::Config(format!(
+            "向量文件已损坏: {}",
+            active.display()
+        )));
     }
     let mut head = [0u8; 16];
     {
@@ -210,7 +226,9 @@ fn check_active(active: &Path, db: &Db, deep: bool) -> Result<()> {
             )));
         }
     }
-    let rec_rows = db.get_meta("vec_row_count").and_then(|v| v.parse::<usize>().ok());
+    let rec_rows = db
+        .get_meta("vec_row_count")
+        .and_then(|v| v.parse::<usize>().ok());
     if let Some(r) = rec_rows {
         if rows < r {
             return Err(Error::Config(format!(
@@ -244,7 +262,12 @@ pub fn wipe(base: &Path, db: &Db) -> Result<()> {
                 let name = entry.file_name();
                 if let Some(n) = name.to_str() {
                     if parse_gen_name(base, n).is_some()
-                        || (n.ends_with(".tmp") && n.starts_with(base.file_stem().and_then(|s| s.to_str()).unwrap_or("vectors")))
+                        || (n.ends_with(".tmp")
+                            && n.starts_with(
+                                base.file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("vectors"),
+                            ))
                     {
                         let _ = std::fs::remove_file(entry.path());
                     }
@@ -266,7 +289,10 @@ pub fn wipe(base: &Path, db: &Db) -> Result<()> {
 /// Returns the SHA256 of the complete new file.
 pub fn write_generation(src: &Path, dst: &Path, dim: usize, live: &[(i64, i64)]) -> Result<String> {
     if live.len() > u32::MAX as usize {
-        return Err(Error::Config(format!("压缩结果 {} 行超出格式上限", live.len())));
+        return Err(Error::Config(format!(
+            "压缩结果 {} 行超出格式上限",
+            live.len()
+        )));
     }
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)?;
@@ -292,7 +318,9 @@ pub fn write_generation(src: &Path, dst: &Path, dim: usize, live: &[(i64, i64)])
     put(&mut w, &mut hash, &(live.len() as u32).to_le_bytes())?;
     for (old, _) in live {
         if *old < 0 {
-            return Err(Error::Config(format!("压缩遇到负数向量行号 {old}，索引已损坏")));
+            return Err(Error::Config(format!(
+                "压缩遇到负数向量行号 {old}，索引已损坏"
+            )));
         }
         let v = view.as_ref().map(|s| s.row(*old as usize)).unwrap_or(&[]);
         if v.len() != dim {
@@ -337,19 +365,28 @@ fn parse_header(head: &[u8], total_len: usize, path: &Path) -> Result<(usize, us
         return Err(Error::Config(format!("向量文件已损坏: {}", path.display())));
     }
     if &head[0..8] != HEADER {
-        return Err(Error::Config(format!("向量文件格式错误: {}", path.display())));
+        return Err(Error::Config(format!(
+            "向量文件格式错误: {}",
+            path.display()
+        )));
     }
     let dim = u32::from_le_bytes([head[8], head[9], head[10], head[11]]) as usize;
     let rows = u32::from_le_bytes([head[12], head[13], head[14], head[15]]) as usize;
     if dim == 0 {
-        return Err(Error::Config(format!("向量文件维度为 0: {}", path.display())));
+        return Err(Error::Config(format!(
+            "向量文件维度为 0: {}",
+            path.display()
+        )));
     }
     let need = rows
         .checked_mul(row_bytes(dim))
         .and_then(|body| body.checked_add(16))
         .ok_or_else(|| Error::Config(format!("向量文件头超出合法范围: {}", path.display())))?;
     if total_len < need {
-        return Err(Error::Config(format!("向量文件长度不合法: {}", path.display())));
+        return Err(Error::Config(format!(
+            "向量文件长度不合法: {}",
+            path.display()
+        )));
     }
     Ok((dim, rows))
 }
@@ -376,7 +413,13 @@ impl Store {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let mut file = OpenOptions::new().create(true).read(true).write(true).open(path)?;
+        // 不加 truncate：已存在的 generation 文件必须原样打开，只有空文件才会被写入头。
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)?;
         let existing = file.metadata()?.len() as usize;
         let (stored_dim, rows) = if existing == 0 {
             file.write_all(HEADER)?;
@@ -396,7 +439,12 @@ impl Store {
             (d, r)
         };
         file.seek(SeekFrom::End(0))?;
-        Ok(Store { path: path.to_path_buf(), dim: stored_dim, rows, file })
+        Ok(Store {
+            path: path.to_path_buf(),
+            dim: stored_dim,
+            rows,
+            file,
+        })
     }
 
     pub fn dim(&self) -> usize {
@@ -433,13 +481,37 @@ impl Store {
         if need > self.file.seek(SeekFrom::End(0))? as usize {
             self.file.set_len(need as u64)?;
         }
-        for (row, v) in items {
-            self.file.seek(SeekFrom::Start((16 + *row * row_bytes(self.dim)) as u64))?;
-            for x in v {
-                self.file.write_all(&x.to_le_bytes())?;
+        // 连续批量写入（方案 8.3）：同一行内一次 write_all，相邻行合并成整块，
+        // 不再对每个 float 各发一次系统调用（512 维 × 10 万行 = 5120 万次小块写）。
+        let mut sorted: Vec<&(usize, Vec<f32>)> = items.iter().collect();
+        sorted.sort_by_key(|(row, _)| *row);
+        let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+        let mut run_start: usize = 0;
+        let mut run_next: usize = 0;
+        let flush_run = |buf: &mut Vec<u8>, start: usize, end: usize, f: &mut File| -> Result<()> {
+            if buf.is_empty() {
+                return Ok(());
             }
+            f.seek(SeekFrom::Start((16 + start * row_bytes(self.dim)) as u64))?;
+            f.write_all(buf)?;
+            buf.clear();
+            let _ = end;
+            Ok(())
+        };
+        for &&(row, ref v) in sorted.iter() {
+            if run_next != row && !buf.is_empty() {
+                flush_run(&mut buf, run_start, run_next, &mut self.file)?;
+                run_start = row;
+            } else if buf.is_empty() {
+                run_start = row;
+            }
+            for x in v {
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
+            run_next = row + 1;
             self.rows = self.rows.max(row + 1);
         }
+        flush_run(&mut buf, run_start, run_next, &mut self.file)?;
         Ok(())
     }
 
@@ -500,7 +572,9 @@ impl Store {
         let mut replacement = tempfile::NamedTempFile::new_in(parent)?;
         replacement.write_all(&out)?;
         replacement.as_file().sync_all()?;
-        self.file = replacement.persist(&self.path).map_err(|e| Error::Io(e.error))?;
+        self.file = replacement
+            .persist(&self.path)
+            .map_err(|e| Error::Io(e.error))?;
         self.rows = live.len();
         self.file.sync_data()?;
         Ok(())
@@ -541,7 +615,11 @@ impl MmapView {
         if rows == 0 {
             return Ok(None);
         }
-        Ok(Some(MmapView { inner: mmap, dim, rows }))
+        Ok(Some(MmapView {
+            inner: mmap,
+            dim,
+            rows,
+        }))
     }
 
     pub fn dim(&self) -> usize {
@@ -584,8 +662,16 @@ impl MmapView {
             .par_iter()
             .map(|c| {
                 // 负数行号是数据库损坏的信号，绝不能折叠到第 0 行冒充别人的向量。
-                let v = if c.row < 0 { &[][..] } else { self.row(c.row as usize) };
-                let s = if v.len() == self.dim { dot(query, v) } else { -1.0 };
+                let v = if c.row < 0 {
+                    &[][..]
+                } else {
+                    self.row(c.row as usize)
+                };
+                let s = if v.len() == self.dim {
+                    dot(query, v)
+                } else {
+                    -1.0
+                };
                 (clone_row(c), s)
             })
             .collect();
@@ -596,7 +682,13 @@ impl MmapView {
 }
 
 fn clone_row(r: &VecRow) -> VecRow {
-    VecRow { row: r.row, target: r.target, ref_id: r.ref_id, file_id: r.file_id, file_kind: r.file_kind }
+    VecRow {
+        row: r.row,
+        target: r.target,
+        ref_id: r.ref_id,
+        file_id: r.file_id,
+        file_kind: r.file_kind,
+    }
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
@@ -638,7 +730,13 @@ mod tests {
     use crate::{EmbedRowKind, Kind};
 
     fn row(id: i64) -> VecRow {
-        VecRow { row: id, target: EmbedRowKind::Image, ref_id: id, file_id: 100 + id, file_kind: Kind::Image }
+        VecRow {
+            row: id,
+            target: EmbedRowKind::Image,
+            ref_id: id,
+            file_id: 100 + id,
+            file_kind: Kind::Image,
+        }
     }
 
     #[test]
@@ -705,6 +803,29 @@ mod tests {
     }
 
     #[test]
+    fn put_many_handles_unsorted_and_interleaved_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("v.f32");
+        let mut s = Store::open(&p, 2).unwrap();
+        // 乱序 + 同行重复覆盖 + 非相邻行
+        s.put_many(&[
+            (5, vec![0.5, 0.5]),
+            (0, vec![1.0, 0.0]),
+            (2, vec![0.0, 1.0]),
+            (5, vec![0.6, 0.8]),
+        ])
+        .unwrap();
+        s.flush().unwrap();
+        assert_eq!(s.rows(), 6);
+        assert_eq!(s.row(0).unwrap(), vec![1.0, 0.0]);
+        assert_eq!(s.row(2).unwrap(), vec![0.0, 1.0]);
+        assert_eq!(s.row(5).unwrap(), vec![0.6, 0.8]);
+        assert_eq!(s.row(3).unwrap(), vec![0.0, 0.0], "空洞保持零向量");
+        let view = MmapView::open(&p).unwrap().unwrap();
+        assert_eq!(view.rows(), 6);
+    }
+
+    #[test]
     fn dimension_change_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("v.f32");
@@ -763,7 +884,10 @@ mod tests {
         let view = MmapView::open(&p).unwrap().unwrap();
         let hits = view.search(&[1.0, 0.0], &[row(0), row(77)], 5);
         assert_eq!(hits[0].0.row, 0);
-        assert!(hits.iter().any(|h| h.1 < 0.0), "missing row must score below zero");
+        assert!(
+            hits.iter().any(|h| h.1 < 0.0),
+            "missing row must score below zero"
+        );
     }
 
     // ------------------------------------------------------ P0-05: 边界与溢出
@@ -827,7 +951,10 @@ mod tests {
         let view = MmapView::open(&p).unwrap().unwrap();
         assert_eq!(view.row(0), &[1.0, 0.0]);
         assert!(view.row(2).is_empty(), "恰好等于行数的一行也是越界");
-        assert!(view.row(usize::MAX).is_empty(), "异常大行号不得 panic 或越界读");
+        assert!(
+            view.row(usize::MAX).is_empty(),
+            "异常大行号不得 panic 或越界读"
+        );
         assert!(view.row(usize::MAX - 5).is_empty());
     }
 
@@ -859,7 +986,11 @@ mod tests {
         drop(s);
         let db = Db::open(&dir.path().join("i.sqlite")).unwrap();
         let active = active_vector_path(&base, &db).unwrap();
-        assert_eq!(active, gen_path(&base, 1), "legacy 文件应被收编为 generation 1");
+        assert_eq!(
+            active,
+            gen_path(&base, 1),
+            "legacy 文件应被收编为 generation 1"
+        );
         (base, db)
     }
 
@@ -955,7 +1086,10 @@ mod tests {
 
         assert_eq!(dropped, 0);
         assert_eq!(active_generation(&db), 1, "generation 不应翻转");
-        assert!(!gen_path(&base, 2).exists(), "没有可回收内容就不该产出新文件");
+        assert!(
+            !gen_path(&base, 2).exists(),
+            "没有可回收内容就不该产出新文件"
+        );
     }
 
     /// 零字节活动文件 + 有效映射 = 损坏：必须报错，绝不能放行让 Store 重新初始化
@@ -1014,11 +1148,26 @@ mod tests {
         s.put(0, &[1.0, 0.0]).unwrap();
         s.flush().unwrap();
         let view = MmapView::open(&p).unwrap().unwrap();
-        let bad = VecRow { row: -5, target: EmbedRowKind::Image, ref_id: 9, file_id: 200, file_kind: Kind::Image };
-        let good = VecRow { row: 0, target: EmbedRowKind::Image, ref_id: 1, file_id: 100, file_kind: Kind::Image };
+        let bad = VecRow {
+            row: -5,
+            target: EmbedRowKind::Image,
+            ref_id: 9,
+            file_id: 200,
+            file_kind: Kind::Image,
+        };
+        let good = VecRow {
+            row: 0,
+            target: EmbedRowKind::Image,
+            ref_id: 1,
+            file_id: 100,
+            file_kind: Kind::Image,
+        };
         let hits = view.search(&[1.0, 0.0], &[bad, good], 5);
         let bad_hit = hits.iter().find(|(r, _)| r.file_id == 200).unwrap();
-        assert!(bad_hit.1 < 0.0, "负数行号不得匹配第 0 行的向量: {bad_hit:?}");
+        assert!(
+            bad_hit.1 < 0.0,
+            "负数行号不得匹配第 0 行的向量: {bad_hit:?}"
+        );
         let good_hit = hits.iter().find(|(r, _)| r.file_id == 100).unwrap();
         assert!((good_hit.1 - 1.0).abs() < 1e-6);
     }

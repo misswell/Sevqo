@@ -292,7 +292,11 @@ mod tests {
         assert_eq!(percent_of(50, 100), 50);
         assert_eq!(percent_of(100, 100), 100);
         assert_eq!(percent_of(150, 100), 100);
-        assert_eq!(percent_of(10, 0), 0, "unknown length must not divide by zero");
+        assert_eq!(
+            percent_of(10, 0),
+            0,
+            "unknown length must not divide by zero"
+        );
     }
 
     /// The event shape is what the webview renders; a typo here silently blanks the UI.
@@ -331,7 +335,10 @@ mod tests {
             let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
                 .unwrap_or_else(|e| panic!("找不到更新产物目录 {}：{e}", dir.display()))
                 .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.extension().is_some_and(|x| x == "gz") && p.to_string_lossy().ends_with(".app.tar.gz"))
+                .filter(|p| {
+                    p.extension().is_some_and(|x| x == "gz")
+                        && p.to_string_lossy().ends_with(".app.tar.gz")
+                })
                 .collect();
             v.sort();
             v
@@ -345,7 +352,9 @@ mod tests {
         let encoded = conf["plugins"]["updater"]["pubkey"]
             .as_str()
             .expect("tauri.conf.json 里要有 plugins.updater.pubkey");
-        let version = conf["version"].as_str().expect("tauri.conf.json 里要有 version");
+        let version = conf["version"]
+            .as_str()
+            .expect("tauri.conf.json 里要有 version");
         let text = String::from_utf8(
             base64::engine::general_purpose::STANDARD
                 .decode(encoded)

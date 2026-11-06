@@ -6,20 +6,30 @@ use rusqlite::{params, Connection, Row};
 
 use crate::{segment, EmbedRowKind, Error, FileRecord, FileState, Kind, Result, SearchRequest};
 
+/// moments/clip 查询的行形状别名（clippy type_complexity）。
+pub type ClipRow = (i64, i64, i64, Option<i64>, Option<String>);
+/// 搜索命中的片段时间轴行：(clip_id, start_ms, end_ms, score, thumb)。
+pub type MomentRow = (i64, i64, i64, f32, Option<String>);
+/// 单个 clip 的精确时间轴：(start_ms, end_ms, thumb)。
+pub type ClipMoment = (i64, i64, Option<String>);
+/// 文件级时间轴：按文件分组、按时间排序的 clip 列表，score 为 0（无查询上下文）。
+pub type MomentsByFile = HashMap<i64, Vec<(i64, i64, i64, f64, Option<String>)>>;
+
 pub const SCHEMA_VERSION: i64 = 2;
 
 /// Sequential migrations: `(target_version, SQL)`. Each entry upgrades a database from
 /// `target_version - 1` and runs exactly once, inside its own transaction, after a
 /// verified backup has been taken (P1-13). A database newer than this build refuses to
 /// open rather than guessing at unknown columns.
-const MIGRATIONS: &[(i64, &str)] = &[(
-    2,
-    // v2: chunk/clip gain per-unit index state (P0-03). Legacy rows were written under
-    // the old regime: a row with an *activated* vec_map entry really has bytes on disk,
-    // everything else (never reserved, or staged and never activated) needs re-embedding.
-    // Done files carrying non-persisted units go back to `stale` so the queue picks them
-    // up instead of silently keeping a partial index.
-    r#"
+const MIGRATIONS: &[(i64, &str)] = &[
+    (
+        2,
+        // v2: chunk/clip gain per-unit index state (P0-03). Legacy rows were written under
+        // the old regime: a row with an *activated* vec_map entry really has bytes on disk,
+        // everything else (never reserved, or staged and never activated) needs re-embedding.
+        // Done files carrying non-persisted units go back to `stale` so the queue picks them
+        // up instead of silently keeping a partial index.
+        r#"
     ALTER TABLE chunk ADD COLUMN status TEXT NOT NULL DEFAULT 'persisted';
     ALTER TABLE chunk ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE chunk ADD COLUMN error TEXT;
@@ -40,9 +50,9 @@ const MIGRATIONS: &[(i64, &str)] = &[(
     ),
     (
         3,
-    // v3: 扫描履历（第六章 6.2）：每次扫描落一行结果，供诊断与状态页使用；
-    // sweep 的安全性由调用方保证——只有完整成功且无读错的扫描才允许删除。
-    r#"
+        // v3: 扫描履历（第六章 6.2）：每次扫描落一行结果，供诊断与状态页使用；
+        // sweep 的安全性由调用方保证——只有完整成功且无读错的扫描才允许删除。
+        r#"
     CREATE TABLE IF NOT EXISTS scan_run(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       root_id INTEGER NOT NULL,
@@ -78,7 +88,8 @@ const MIGRATIONS: &[(i64, &str)] = &[(
     CREATE INDEX IF NOT EXISTS vec_map_file ON vec_map(file_id);
     CREATE INDEX IF NOT EXISTS vec_map_alive ON vec_map(alive);
     "#,
-)];
+    ),
+];
 
 const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -215,7 +226,10 @@ fn migrate(c: &mut Connection, path: &Path, from: i64) -> Result<()> {
             params![target.to_string()],
         )?;
         tx.commit()?;
-        tracing::info!("索引数据库已从 v{from} 迁移到 v{target}（备份: {}）", bak.display());
+        tracing::info!(
+            "索引数据库已从 v{from} 迁移到 v{target}（备份: {}）",
+            bak.display()
+        );
     }
     Ok(())
 }
@@ -291,7 +305,11 @@ impl Db {
         // v2 的 DDL 会建引用新列的索引，因此必须先确定版本：全新库一次事务建表+记版本；
         // 旧库先迁移补列，最后再跑一遍幂等 DDL 兜底。
         let stored: Option<String> = c
-            .query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get(0))
+            .query_row(
+                "SELECT value FROM meta WHERE key='schema_version'",
+                [],
+                |r| r.get(0),
+            )
             .ok();
         let known_tables: i64 = c
             .query_row(
@@ -304,7 +322,10 @@ impl Db {
             None if known_tables == 0 => {
                 let tx = c.transaction()?;
                 tx.execute_batch(DDL)?;
-                tx.execute("INSERT INTO meta(key,value) VALUES('schema_version',?)", params![SCHEMA_VERSION.to_string()])?;
+                tx.execute(
+                    "INSERT INTO meta(key,value) VALUES('schema_version',?)",
+                    params![SCHEMA_VERSION.to_string()],
+                )?;
                 tx.commit()?;
                 SCHEMA_VERSION
             }
@@ -334,7 +355,15 @@ impl Db {
         for (id, name, path) in missing {
             ensure_filename_row(&c, id, &name, &path)?;
         }
-        Ok(Db { path: path.to_path_buf(), write: Mutex::new(c) })
+        Ok(Db {
+            path: path.to_path_buf(),
+            write: Mutex::new(c),
+        })
+    }
+
+    /// 一致性检查器（integrity）需要的写连接访问；仅限同 crate。
+    pub(crate) fn write_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.write.lock().unwrap()
     }
 
     pub fn read(&self) -> Result<Connection> {
@@ -347,7 +376,10 @@ impl Db {
 
     pub fn get_meta(&self, key: &str) -> Option<String> {
         let g = self.write.lock().ok()?;
-        g.query_row("SELECT value FROM meta WHERE key=?", params![key], |r| r.get(0)).ok()
+        g.query_row("SELECT value FROM meta WHERE key=?", params![key], |r| {
+            r.get(0)
+        })
+        .ok()
     }
 
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
@@ -373,13 +405,16 @@ impl Db {
             "INSERT INTO root(path,label) VALUES(?,?) ON CONFLICT(path) DO UPDATE SET label=excluded.label, enabled=1",
             params![path, label],
         )?;
-        let id: i64 = g.query_row("SELECT id FROM root WHERE path=?", params![path], |r| r.get(0))?;
+        let id: i64 = g.query_row("SELECT id FROM root WHERE path=?", params![path], |r| {
+            r.get(0)
+        })?;
         Ok(id)
     }
 
     pub fn list_roots(&self) -> Result<Vec<crate::Root>> {
         let g = self.write.lock().unwrap();
-        let mut st = g.prepare("SELECT id,path,label,enabled,last_scan_ns FROM root ORDER BY id")?;
+        let mut st =
+            g.prepare("SELECT id,path,label,enabled,last_scan_ns FROM root ORDER BY id")?;
         let rows = st.query_map([], |r| {
             Ok(crate::Root {
                 id: r.get(0)?,
@@ -399,7 +434,10 @@ impl Db {
     /// same way [`Self::mark_missing_vectors`] would.
     pub fn set_root_enabled(&self, id: i64, enabled: bool) -> Result<()> {
         let g = self.write.lock().unwrap();
-        g.execute("UPDATE root SET enabled=? WHERE id=?", params![enabled as i64, id])?;
+        g.execute(
+            "UPDATE root SET enabled=? WHERE id=?",
+            params![enabled as i64, id],
+        )?;
         if enabled {
             g.execute(
                 "UPDATE file SET state='stale',error=NULL WHERE root_id=? AND state='failed'",
@@ -434,16 +472,27 @@ impl Db {
     pub fn begin_scan(&self, root_id: i64) -> Result<i64> {
         let ns = now_ns();
         let g = self.write.lock().unwrap();
-        g.execute("UPDATE root SET last_scan_ns=? WHERE id=?", params![ns, root_id])?;
+        g.execute(
+            "UPDATE root SET last_scan_ns=? WHERE id=?",
+            params![ns, root_id],
+        )?;
         Ok(ns)
     }
 
     /// 记录一次扫描结果（6.2）：每根目录只保留最近 50 条，履历不会无限增长。
-    pub fn record_scan_run(&self, root_id: i64, status: &str, started_ns: i64, walked: u64, queued: u64, removed: u64) -> Result<()> {
+    pub fn record_scan_run(
+        &self,
+        root_id: i64,
+        status: &str,
+        started_ns: i64,
+        walked: i64,
+        queued: i64,
+        removed: i64,
+    ) -> Result<()> {
         let g = self.write.lock().unwrap();
         g.execute(
             "INSERT INTO scan_run(root_id,status,started_ns,finished_ns,walked,queued,removed) VALUES(?,?,?,?,?,?,?)",
-            params![root_id, status, started_ns, now_ns(), walked as i64, queued as i64, removed as i64],
+            params![root_id, status, started_ns, now_ns(), walked, queued, removed],
         )?;
         g.execute(
             "DELETE FROM scan_run WHERE root_id=?1 AND id NOT IN              (SELECT id FROM scan_run WHERE root_id=?1 ORDER BY id DESC LIMIT 50)",
@@ -478,8 +527,14 @@ impl Db {
             .ok();
         match existing {
             Some((id, size, mtime, _state)) if size == f.size && mtime == f.mtime_ns => {
-                g.execute("UPDATE file SET indexed_ns=? WHERE id=?", params![seen_ns, id])?;
-                let needs = g.query_row("SELECT state FROM file WHERE id=?", params![id], |r| r.get::<_, String>(0))
+                g.execute(
+                    "UPDATE file SET indexed_ns=? WHERE id=?",
+                    params![seen_ns, id],
+                )?;
+                let needs = g
+                    .query_row("SELECT state FROM file WHERE id=?", params![id], |r| {
+                        r.get::<_, String>(0)
+                    })
                     .map(|s| s != "done" && s != "skipped")
                     .unwrap_or(true);
                 Ok((id, needs))
@@ -536,29 +591,48 @@ impl Db {
     pub fn set_file_state(&self, id: i64, state: FileState, error: Option<&str>) -> Result<()> {
         let g = self.write.lock().unwrap();
         if state == FileState::Done {
-            let (name, path): (String, String) = g.query_row("SELECT name,path FROM file WHERE id=?", params![id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            let (name, path): (String, String) =
+                g.query_row("SELECT name,path FROM file WHERE id=?", params![id], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?;
             ensure_filename_row(&g, id, &name, &path)?;
         }
-        g.execute("UPDATE file SET state=?,error=?,indexed_ns=? WHERE id=?", params![state.as_str(), error, now_ns(), id])?;
+        g.execute(
+            "UPDATE file SET state=?,error=?,indexed_ns=? WHERE id=?",
+            params![state.as_str(), error, now_ns(), id],
+        )?;
         Ok(())
     }
 
     pub fn recover_indexing_files(&self, ids: &[i64]) -> Result<()> {
         let g = self.write.lock().unwrap();
         for id in ids {
-            g.execute("UPDATE file SET state='pending' WHERE id=? AND state='indexing'", params![id])?;
+            g.execute(
+                "UPDATE file SET state='pending' WHERE id=? AND state='indexing'",
+                params![id],
+            )?;
         }
         Ok(())
     }
 
     pub fn file(&self, id: i64) -> Option<FileRecord> {
         let g = self.write.lock().ok()?;
-        g.query_row(&format!("SELECT {FILE_COLS} FROM file WHERE id=?"), params![id], read_file).ok()
+        g.query_row(
+            &format!("SELECT {FILE_COLS} FROM file WHERE id=?"),
+            params![id],
+            read_file,
+        )
+        .ok()
     }
 
     pub fn file_by_path(&self, path: &str) -> Option<FileRecord> {
         let g = self.write.lock().ok()?;
-        g.query_row(&format!("SELECT {FILE_COLS} FROM file WHERE path=?"), params![path], read_file).ok()
+        g.query_row(
+            &format!("SELECT {FILE_COLS} FROM file WHERE path=?"),
+            params![path],
+            read_file,
+        )
+        .ok()
     }
 
     /// 某根目录下的全部文件记录（排除规则清理用）。
@@ -588,7 +662,10 @@ impl Db {
         let sql = format!("SELECT {FILE_COLS} FROM file WHERE id IN ({placeholders})");
         let mut st = g.prepare(&sql)?;
         let mut out = HashMap::new();
-        for rec in st.query_map(rusqlite::params_from_iter(ids.iter()), read_file)?.flatten() {
+        for rec in st
+            .query_map(rusqlite::params_from_iter(ids.iter()), read_file)?
+            .flatten()
+        {
             out.insert(rec.id, rec);
         }
         Ok(out)
@@ -600,7 +677,11 @@ impl Db {
         let g = self.write.lock().unwrap();
         let mut sql = format!("SELECT {FILE_COLS} FROM file WHERE state IN ('pending','stale') AND root_id IN (SELECT id FROM root WHERE enabled=1)");
         if !kinds.is_empty() {
-            let list = kinds.iter().map(|k| format!("'{}'", kind_str(*k))).collect::<Vec<_>>().join(",");
+            let list = kinds
+                .iter()
+                .map(|k| format!("'{}'", kind_str(*k)))
+                .collect::<Vec<_>>()
+                .join(",");
             sql.push_str(&format!(" AND kind IN ({list})"));
         }
         sql.push_str(
@@ -617,7 +698,11 @@ impl Db {
         let g = self.write.lock().unwrap();
         let mut sql = "SELECT count(*) FROM file WHERE state IN ('pending','stale') AND root_id IN (SELECT id FROM root WHERE enabled=1)".to_string();
         if !kinds.is_empty() {
-            let list = kinds.iter().map(|k| format!("'{}'", kind_str(*k))).collect::<Vec<_>>().join(",");
+            let list = kinds
+                .iter()
+                .map(|k| format!("'{}'", kind_str(*k)))
+                .collect::<Vec<_>>()
+                .join(",");
             sql.push_str(&format!(" AND kind IN ({list})"));
         }
         let n: i64 = g.query_row(&sql, [], |r| r.get(0))?;
@@ -633,7 +718,11 @@ impl Db {
 
     pub fn delete_by_path(&self, path: &str) -> Result<Option<i64>> {
         let g = self.write.lock().unwrap();
-        let id: Option<i64> = g.query_row("SELECT id FROM file WHERE path=?", params![path], |r| r.get(0)).ok();
+        let id: Option<i64> = g
+            .query_row("SELECT id FROM file WHERE path=?", params![path], |r| {
+                r.get(0)
+            })
+            .ok();
         if let Some(id) = id {
             purge_files(&g, &[id])?;
         }
@@ -648,10 +737,11 @@ impl Db {
     pub fn delete_tree(&self, path: &str) -> Result<usize> {
         let g = self.write.lock().unwrap();
         let ids: Vec<i64> = {
-            let mut st = g.prepare(
-                "SELECT id FROM file WHERE path=? OR substr(path,1,?)=?||'/'",
-            )?;
-            let rows = st.query_map(params![path, path.chars().count() as i64 + 1, path], |r| r.get(0))?;
+            let mut st =
+                g.prepare("SELECT id FROM file WHERE path=? OR substr(path,1,?)=?||'/'")?;
+            let rows = st.query_map(params![path, path.chars().count() as i64 + 1, path], |r| {
+                r.get(0)
+            })?;
             rows.filter_map(|x| x.ok()).collect()
         };
         let n = ids.len();
@@ -665,7 +755,13 @@ impl Db {
 
     /// Store extracted text plus the segmented FTS row. `fts` is contentless, so
     /// snippets must be built from `text_store` in Rust, not with snippet().
-    pub fn store_text(&self, file_id: i64, title: Option<&str>, text: &str, truncated: bool) -> Result<()> {
+    pub fn store_text(
+        &self,
+        file_id: i64,
+        title: Option<&str>,
+        text: &str,
+        truncated: bool,
+    ) -> Result<()> {
         let g = self.write.lock().unwrap();
         g.execute("DELETE FROM fts WHERE rowid=?", params![file_id])?;
         if text.trim().is_empty() && title.map(|t| t.trim().is_empty()).unwrap_or(true) {
@@ -673,8 +769,14 @@ impl Db {
             g.execute("DELETE FROM text_store WHERE file_id=?", params![file_id])?;
             return Ok(());
         }
-        let path: String = g.query_row("SELECT path FROM file WHERE id=?", params![file_id], |r| r.get(0))?;
-        let name: String = g.query_row("SELECT name FROM file WHERE id=?", params![file_id], |r| r.get(0))?;
+        let path: String =
+            g.query_row("SELECT path FROM file WHERE id=?", params![file_id], |r| {
+                r.get(0)
+            })?;
+        let name: String =
+            g.query_row("SELECT name FROM file WHERE id=?", params![file_id], |r| {
+                r.get(0)
+            })?;
         if !text.is_empty() {
             g.execute(
                 "INSERT INTO text_store(file_id,text) VALUES(?,?) ON CONFLICT(file_id) DO UPDATE SET text=excluded.text",
@@ -702,7 +804,12 @@ impl Db {
 
     pub fn stored_text(&self, file_id: i64) -> Option<String> {
         let g = self.write.lock().ok()?;
-        g.query_row("SELECT text FROM text_store WHERE file_id=?", params![file_id], |r| r.get(0)).ok()
+        g.query_row(
+            "SELECT text FROM text_store WHERE file_id=?",
+            params![file_id],
+            |r| r.get(0),
+        )
+        .ok()
     }
 
     /// Extracted body character count (0 when the file has no doc row). Lets the
@@ -719,7 +826,13 @@ impl Db {
 
     pub fn doc_title(&self, file_id: i64) -> Option<String> {
         let g = self.write.lock().ok()?;
-        g.query_row("SELECT title FROM doc WHERE file_id=?", params![file_id], |r| r.get(0)).ok().flatten()
+        g.query_row(
+            "SELECT title FROM doc WHERE file_id=?",
+            params![file_id],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten()
     }
 
     /// Insert the chunk set for a file, preserving rows whose text is unchanged so their
@@ -741,7 +854,10 @@ impl Db {
             match old.iter().find(|(_, o, _)| *o == ord) {
                 Some((id, _, prev)) if prev == text => out.push((*id, ord as usize)),
                 Some((id, _, _)) => {
-                    g.execute("UPDATE vec_map SET alive=0 WHERE target_kind='chunk' AND ref_id=?", params![id])?;
+                    g.execute(
+                        "UPDATE vec_map SET alive=0 WHERE target_kind='chunk' AND ref_id=?",
+                        params![id],
+                    )?;
                     g.execute(
                         "UPDATE chunk SET text=?,status='pending',retry_count=0,error=NULL,vec_row=NULL WHERE id=?",
                         params![text, id],
@@ -758,7 +874,10 @@ impl Db {
             }
         }
         for (id, _ord, _) in old.iter().filter(|(_, o, _)| *o >= chunks.len() as i64) {
-            g.execute("UPDATE vec_map SET alive=0 WHERE target_kind='chunk' AND ref_id=?", params![id])?;
+            g.execute(
+                "UPDATE vec_map SET alive=0 WHERE target_kind='chunk' AND ref_id=?",
+                params![id],
+            )?;
             g.execute("DELETE FROM chunk WHERE id=?", params![id])?;
         }
         Ok(out)
@@ -769,8 +888,11 @@ impl Db {
     pub fn sync_clips(&self, file_id: i64, clips: &[(f64, f64)]) -> Result<Vec<(i64, usize)>> {
         let g = self.write.lock().unwrap();
         let old: Vec<(i64, i64, i64, i64)> = {
-            let mut st = g.prepare("SELECT id,ord,start_ms,end_ms FROM clip WHERE file_id=? ORDER BY ord")?;
-            let rows = st.query_map(params![file_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+            let mut st =
+                g.prepare("SELECT id,ord,start_ms,end_ms FROM clip WHERE file_id=? ORDER BY ord")?;
+            let rows = st.query_map(params![file_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?;
             rows.filter_map(|x| x.ok()).collect()
         };
         let mut out = Vec::with_capacity(clips.len());
@@ -781,9 +903,14 @@ impl Db {
             let existing = old.iter().find(|(_, o, _, _)| *o == ord);
             match existing {
                 // Same slot, same window: keep unit state untouched.
-                Some((id, _, s, e)) if *s == start_ms && *e == end_ms => out.push((*id, ord as usize)),
+                Some((id, _, s, e)) if *s == start_ms && *e == end_ms => {
+                    out.push((*id, ord as usize))
+                }
                 Some((id, _, _, _)) => {
-                    g.execute("UPDATE vec_map SET alive=0 WHERE target_kind='clip' AND ref_id=?", params![id])?;
+                    g.execute(
+                        "UPDATE vec_map SET alive=0 WHERE target_kind='clip' AND ref_id=?",
+                        params![id],
+                    )?;
                     g.execute(
                         "UPDATE clip SET start_ms=?,end_ms=?,status='pending',retry_count=0,error=NULL,vec_row=NULL WHERE id=?",
                         params![start_ms, end_ms, id],
@@ -800,16 +927,23 @@ impl Db {
             }
         }
         for (id, _ord, _, _) in old.iter().filter(|(_, o, _, _)| *o >= clips.len() as i64) {
-            g.execute("UPDATE vec_map SET alive=0 WHERE target_kind='clip' AND ref_id=?", params![id])?;
+            g.execute(
+                "UPDATE vec_map SET alive=0 WHERE target_kind='clip' AND ref_id=?",
+                params![id],
+            )?;
             g.execute("DELETE FROM clip WHERE id=?", params![id])?;
         }
         Ok(out)
     }
 
-    pub fn clip_rows(&self, file_id: i64) -> Result<Vec<(i64, i64, i64, Option<i64>, Option<String>)>> {
+    pub fn clip_rows(&self, file_id: i64) -> Result<Vec<ClipRow>> {
         let g = self.write.lock().unwrap();
-        let mut st = g.prepare("SELECT id,start_ms,end_ms,vec_row,thumb FROM clip WHERE file_id=? ORDER BY ord")?;
-        let rows = st.query_map(params![file_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
+        let mut st = g.prepare(
+            "SELECT id,start_ms,end_ms,vec_row,thumb FROM clip WHERE file_id=? ORDER BY ord",
+        )?;
+        let rows = st.query_map(params![file_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?;
         Ok(rows.filter_map(|x| x.ok()).collect())
     }
 
@@ -840,7 +974,11 @@ impl Db {
             "SELECT id,start_ms,end_ms FROM clip WHERE file_id=? AND status!='persisted' ORDER BY ord",
         )?;
         let rows = st.query_map(params![file_id], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as f64 / 1000.0, r.get::<_, i64>(2)? as f64 / 1000.0))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)? as f64 / 1000.0,
+                r.get::<_, i64>(2)? as f64 / 1000.0,
+            ))
         })?;
         Ok(rows.filter_map(|x| x.ok()).collect())
     }
@@ -948,18 +1086,29 @@ impl Db {
     /// never surface as a valid mapping pointing at missing bytes.
     pub fn reserve_vec_row(&self, target: EmbedRowKind, ref_id: i64, file_id: i64) -> Result<i64> {
         let g = self.write.lock().unwrap();
-        g.execute("UPDATE vec_map SET alive=0 WHERE target_kind=? AND ref_id=?", params![target.as_str(), ref_id])?;
-        let next: i64 = g.query_row("SELECT COALESCE(MAX(row_id),-1)+1 FROM vec_map", [], |r| r.get(0))?;
+        g.execute(
+            "UPDATE vec_map SET alive=0 WHERE target_kind=? AND ref_id=?",
+            params![target.as_str(), ref_id],
+        )?;
+        let next: i64 = g.query_row("SELECT COALESCE(MAX(row_id),-1)+1 FROM vec_map", [], |r| {
+            r.get(0)
+        })?;
         g.execute(
             "INSERT INTO vec_map(row_id,target_kind,ref_id,file_id,alive) VALUES(?,?,?,?,0)",
             params![next, target.as_str(), ref_id, file_id],
         )?;
         match target {
             EmbedRowKind::Chunk => {
-                g.execute("UPDATE chunk SET vec_row=? WHERE id=?", params![next, ref_id])?;
+                g.execute(
+                    "UPDATE chunk SET vec_row=? WHERE id=?",
+                    params![next, ref_id],
+                )?;
             }
             EmbedRowKind::Clip => {
-                g.execute("UPDATE clip SET vec_row=? WHERE id=?", params![next, ref_id])?;
+                g.execute(
+                    "UPDATE clip SET vec_row=? WHERE id=?",
+                    params![next, ref_id],
+                )?;
             }
             EmbedRowKind::Image => {}
         }
@@ -984,25 +1133,39 @@ impl Db {
 
     pub fn set_clip_thumb(&self, clip_id: i64, thumb: &str) -> Result<()> {
         let g = self.write.lock().unwrap();
-        g.execute("UPDATE clip SET thumb=? WHERE id=?", params![thumb, clip_id])?;
+        g.execute(
+            "UPDATE clip SET thumb=? WHERE id=?",
+            params![thumb, clip_id],
+        )?;
         Ok(())
     }
 
     pub fn vec_rows(&self) -> Result<usize> {
         let g = self.write.lock().unwrap();
-        Ok(g.query_row("SELECT COALESCE(MAX(row_id),-1)+1 FROM vec_map", [], |r| r.get(0))?)
+        Ok(
+            g.query_row("SELECT COALESCE(MAX(row_id),-1)+1 FROM vec_map", [], |r| {
+                r.get(0)
+            })?,
+        )
     }
 
     /// 最大有效行号（无活行时 None）：启动校验用它确认映射全部落在文件行数内。
     pub fn max_alive_row(&self) -> Result<Option<i64>> {
         let g = self.write.lock().unwrap();
-        let v: Option<i64> = g.query_row("SELECT MAX(row_id) FROM vec_map WHERE alive=1", [], |r| r.get(0))?;
+        let v: Option<i64> =
+            g.query_row("SELECT MAX(row_id) FROM vec_map WHERE alive=1", [], |r| {
+                r.get(0)
+            })?;
         Ok(v)
     }
 
     pub fn alive_vec_rows(&self) -> Result<usize> {
         let g = self.write.lock().unwrap();
-        Ok(g.query_row("SELECT count(*) FROM vec_map WHERE alive=1", [], |r| r.get(0))?)
+        Ok(
+            g.query_row("SELECT count(*) FROM vec_map WHERE alive=1", [], |r| {
+                r.get(0)
+            })?,
+        )
     }
 
     /// Which embedded unit owns a row id — used to attach thumbnails after embedding.
@@ -1011,7 +1174,13 @@ impl Db {
         g.query_row(
             "SELECT target_kind,ref_id,file_id FROM vec_map WHERE row_id=?",
             params![row],
-            |r| Ok((EmbedRowKind::parse(&r.get::<_, String>(0)?), r.get(1)?, r.get(2)?)),
+            |r| {
+                Ok((
+                    EmbedRowKind::parse(&r.get::<_, String>(0)?),
+                    r.get(1)?,
+                    r.get(2)?,
+                ))
+            },
         )
         .ok()
     }
@@ -1019,8 +1188,15 @@ impl Db {
     pub fn live_rows_for_compaction(&self) -> Result<Vec<(i64, i64)>> {
         let g = self.write.lock().unwrap();
         let mut st = g.prepare("SELECT row_id FROM vec_map WHERE alive=1 ORDER BY row_id")?;
-        let olds: Vec<i64> = st.query_map([], |r| r.get(0))?.filter_map(|x| x.ok()).collect();
-        Ok(olds.into_iter().enumerate().map(|(i, old)| (old, i as i64)).collect())
+        let olds: Vec<i64> = st
+            .query_map([], |r| r.get(0))?
+            .filter_map(|x| x.ok())
+            .collect();
+        Ok(olds
+            .into_iter()
+            .enumerate()
+            .map(|(i, old)| (old, i as i64))
+            .collect())
     }
 
     /// After compaction, rewrite row ids and every `vec_row` pointer *and* flip the
@@ -1055,9 +1231,18 @@ impl Db {
             if old == new {
                 continue;
             }
-            tx.execute("UPDATE vec_map SET row_id=? WHERE row_id=?", params![new, old])?;
-            tx.execute("UPDATE chunk SET vec_row=? WHERE vec_row=?", params![new, old])?;
-            tx.execute("UPDATE clip SET vec_row=? WHERE vec_row=?", params![new, old])?;
+            tx.execute(
+                "UPDATE vec_map SET row_id=? WHERE row_id=?",
+                params![new, old],
+            )?;
+            tx.execute(
+                "UPDATE chunk SET vec_row=? WHERE vec_row=?",
+                params![new, old],
+            )?;
+            tx.execute(
+                "UPDATE clip SET vec_row=? WHERE vec_row=?",
+                params![new, old],
+            )?;
         }
         tx.execute(
             "INSERT INTO meta(key,value) VALUES('vec_generation',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -1081,7 +1266,11 @@ impl Db {
 
     pub fn dead_rows(&self) -> Result<usize> {
         let g = self.write.lock().unwrap();
-        Ok(g.query_row("SELECT count(*) FROM vec_map WHERE alive=0", [], |r| r.get(0))?)
+        Ok(
+            g.query_row("SELECT count(*) FROM vec_map WHERE alive=0", [], |r| {
+                r.get(0)
+            })?,
+        )
     }
 
     /// Searchable vector rows, pre-filtered by modality so the scan can skip whole blocks.
@@ -1118,15 +1307,18 @@ impl Db {
         let mut bind: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         push_filters(&mut sql, &mut bind, req);
         let mut st = g.prepare(&sql)?;
-        let rows = st.query_map(rusqlite::params_from_iter(bind.iter()), |r| -> rusqlite::Result<crate::VecRow> {
-            Ok(crate::VecRow {
-                row: r.get(0)?,
-                target: EmbedRowKind::parse(&r.get::<_, String>(1)?),
-                ref_id: r.get(2)?,
-                file_id: r.get(3)?,
-                file_kind: kind_of(&r.get::<_, String>(4)?),
-            })
-        })?;
+        let rows = st.query_map(
+            rusqlite::params_from_iter(bind.iter()),
+            |r| -> rusqlite::Result<crate::VecRow> {
+                Ok(crate::VecRow {
+                    row: r.get(0)?,
+                    target: EmbedRowKind::parse(&r.get::<_, String>(1)?),
+                    ref_id: r.get(2)?,
+                    file_id: r.get(3)?,
+                    file_kind: kind_of(&r.get::<_, String>(4)?),
+                })
+            },
+        )?;
         Ok(rows.filter_map(|x| x.ok()).collect())
     }
 
@@ -1157,6 +1349,25 @@ impl Db {
         Ok(n)
     }
 
+    /// 把「文件已重新出现」的历史 skipped 任务重新排队（方案 5.4：临时离线不得
+    /// 变成永久跳过）。路径仍不存在的保持 skipped。返回重排数量。
+    pub fn requeue_skipped_existing(&self) -> Result<usize> {
+        let g = self.write.lock().unwrap();
+        let mut st = g.prepare("SELECT id,path FROM file WHERE state='skipped' AND kind IN ('image','video','document','code')")?;
+        let rows = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let mut n = 0;
+        for (id, path) in rows.flatten() {
+            if std::path::Path::new(&path).exists() {
+                g.execute(
+                    "UPDATE file SET state='pending',error=NULL WHERE id=?",
+                    params![id],
+                )?;
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
     /// 是否存在未持久化的语义单元（chunk/clip）。
     pub fn has_incomplete_units(&self, file_id: i64) -> Result<bool> {
         let g = self.write.lock().unwrap();
@@ -1173,7 +1384,10 @@ impl Db {
         let g = self.write.lock().unwrap();
         g.execute("DELETE FROM vec_map", [])?;
         for t in ["chunk", "clip"] {
-            g.execute(&format!("UPDATE {t} SET vec_row=NULL,status='pending',retry_count=0,error=NULL"), [])?;
+            g.execute(
+                &format!("UPDATE {t} SET vec_row=NULL,status='pending',retry_count=0,error=NULL"),
+                [],
+            )?;
         }
         Ok(())
     }
@@ -1183,7 +1397,10 @@ impl Db {
         let n = g.execute("UPDATE file SET state='pending',error=NULL", [])?;
         g.execute("DELETE FROM vec_map", [])?;
         for t in ["chunk", "clip"] {
-            g.execute(&format!("UPDATE {t} SET vec_row=NULL,status='pending',retry_count=0,error=NULL"), [])?;
+            g.execute(
+                &format!("UPDATE {t} SET vec_row=NULL,status='pending',retry_count=0,error=NULL"),
+                [],
+            )?;
         }
         Ok(n)
     }
@@ -1210,7 +1427,12 @@ impl Db {
 
     /// Keyword channel: BM25 over the segmented index. Column weights favour the file
     /// name, which is what people type when they half-remember a filename.
-    pub fn keyword_search(&self, expr: &str, req: &SearchRequest, limit: usize) -> Result<Vec<(i64, f64)>> {
+    pub fn keyword_search(
+        &self,
+        expr: &str,
+        req: &SearchRequest,
+        limit: usize,
+    ) -> Result<Vec<(i64, f64)>> {
         let g = self.write.lock().unwrap();
         let mut sql = String::from(
             "SELECT f.id, bm25(fts, 12.0, 2.0, 6.0, 1.0) FROM fts JOIN file f ON f.id=fts.rowid WHERE fts MATCH ?",
@@ -1220,7 +1442,9 @@ impl Db {
         sql.push_str(" ORDER BY 2 LIMIT ?");
         bind.push(Box::new(limit as i64));
         let mut st = g.prepare(&sql)?;
-        let rows = st.query_map(rusqlite::params_from_iter(bind.iter()), |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let rows = st.query_map(rusqlite::params_from_iter(bind.iter()), |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
         Ok(rows.filter_map(|x| x.ok()).collect())
     }
 
@@ -1239,10 +1463,7 @@ impl Db {
 
     /// 按最终命中的 clip 精确查询时间轴（P1 修复：此前按候选文件查全时间轴，
     /// 候选一多既拖慢搜索又会撞 SQLite 参数上限）。分批 IN，单批 400 个参数。
-    pub fn moments_by_clip_ids(
-        &self,
-        clip_ids: &[i64],
-    ) -> Result<HashMap<i64, (i64, i64, Option<String>)>> {
+    pub fn moments_by_clip_ids(&self, clip_ids: &[i64]) -> Result<HashMap<i64, ClipMoment>> {
         let mut out = HashMap::new();
         if clip_ids.is_empty() {
             return Ok(out);
@@ -1250,10 +1471,16 @@ impl Db {
         let g = self.write.lock().unwrap();
         for chunk in clip_ids.chunks(400) {
             let placeholders = vec!["?"; chunk.len()].join(",");
-            let sql = format!("SELECT id,start_ms,end_ms,thumb FROM clip WHERE id IN ({placeholders})");
+            let sql =
+                format!("SELECT id,start_ms,end_ms,thumb FROM clip WHERE id IN ({placeholders})");
             let mut st = g.prepare(&sql)?;
             let rows = st.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, Option<String>>(3)?))
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                ))
             })?;
             for (id, start, end, thumb) in rows.flatten() {
                 out.insert(id, (start, end, thumb));
@@ -1262,7 +1489,7 @@ impl Db {
         Ok(out)
     }
 
-    pub fn moments_for(&self, file_ids: &[i64]) -> Result<HashMap<i64, Vec<(i64, i64, i64, f64, Option<String>)>>> {
+    pub fn moments_for(&self, file_ids: &[i64]) -> Result<MomentsByFile> {
         if file_ids.is_empty() {
             return Ok(HashMap::new());
         }
@@ -1270,23 +1497,41 @@ impl Db {
         let placeholders = vec!["?"; file_ids.len()].join(",");
         let sql = format!("SELECT file_id,id,start_ms,end_ms,thumb FROM clip WHERE file_id IN ({placeholders}) ORDER BY file_id,start_ms");
         let mut st = g.prepare(&sql)?;
-        let mut out: HashMap<i64, Vec<(i64, i64, i64, f64, Option<String>)>> = HashMap::new();
+        let mut out: MomentsByFile = HashMap::new();
         for row in st
             .query_map(rusqlite::params_from_iter(file_ids.iter()), |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, Option<String>>(4)?))
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                ))
             })?
             .flatten()
         {
-            out.entry(row.0).or_default().push((row.1, row.2, row.3, 0.0, row.4));
+            out.entry(row.0)
+                .or_default()
+                .push((row.1, row.2, row.3, 0.0, row.4));
         }
         Ok(out)
     }
 }
 
-fn push_filters(sql: &mut String, bind: &mut Vec<Box<dyn rusqlite::types::ToSql>>, req: &SearchRequest) {
+fn push_filters(
+    sql: &mut String,
+    bind: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
+    req: &SearchRequest,
+) {
     sql.push_str(" AND f.root_id IN (SELECT id FROM root WHERE enabled=1)");
     if !req.filters.kinds.is_empty() {
-        let list = req.filters.kinds.iter().map(|k| format!("'{}'", kind_str(*k))).collect::<Vec<_>>().join(",");
+        let list = req
+            .filters
+            .kinds
+            .iter()
+            .map(|k| format!("'{}'", kind_str(*k)))
+            .collect::<Vec<_>>()
+            .join(",");
         sql.push_str(&format!(" AND f.kind IN ({list})"));
     }
     if let Some(r) = req.filters.root_id {
@@ -1356,7 +1601,10 @@ fn purge_derived(g: &Connection, file_id: i64) -> Result<()> {
     g.execute("DELETE FROM clip WHERE file_id=?", params![file_id])?;
     // The vector file is append-only: a row can only be reclaimed by compaction, so
     // tombstone the map entry instead of deleting it and orphaning the bytes.
-    g.execute("UPDATE vec_map SET alive=0 WHERE file_id=?", params![file_id])?;
+    g.execute(
+        "UPDATE vec_map SET alive=0 WHERE file_id=?",
+        params![file_id],
+    )?;
     g.execute("DELETE FROM fts WHERE rowid=?", params![file_id])?;
     Ok(())
 }
@@ -1371,9 +1619,17 @@ pub struct Totals {
 
 pub fn totals(db: &Db) -> Result<Totals> {
     let c = db.read()?;
-    let mut t = Totals { pending: 0, done: 0, failed: 0, skipped: 0 };
+    let mut t = Totals {
+        pending: 0,
+        done: 0,
+        failed: 0,
+        skipped: 0,
+    };
     let mut st = c.prepare("SELECT state,count(*) FROM file GROUP BY state")?;
-    for row in st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?.flatten() {
+    for row in st
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+        .flatten()
+    {
         match row.0.as_str() {
             "done" | "keyword_only" => t.done += row.1,
             "failed" => t.failed = row.1,
@@ -1387,14 +1643,37 @@ pub fn totals(db: &Db) -> Result<Totals> {
 pub fn stats(db: &Db) -> Result<HashMap<String, i64>> {
     let c = db.read()?;
     let mut out: HashMap<String, i64> = HashMap::new();
-    out.insert("files".into(), c.query_row("SELECT count(*) FROM file", [], |r| r.get(0))?);
-    out.insert("bytes".into(), c.query_row("SELECT COALESCE(SUM(size),0) FROM file", [], |r| r.get(0))?);
-    out.insert("vectors".into(), c.query_row("SELECT count(*) FROM vec_map WHERE alive=1", [], |r| r.get(0))?);
-    out.insert("clips".into(), c.query_row("SELECT count(*) FROM clip", [], |r| r.get(0))?);
-    out.insert("chunks".into(), c.query_row("SELECT count(*) FROM chunk", [], |r| r.get(0))?);
-    out.insert("roots".into(), c.query_row("SELECT count(*) FROM root", [], |r| r.get(0))?);
+    out.insert(
+        "files".into(),
+        c.query_row("SELECT count(*) FROM file", [], |r| r.get(0))?,
+    );
+    out.insert(
+        "bytes".into(),
+        c.query_row("SELECT COALESCE(SUM(size),0) FROM file", [], |r| r.get(0))?,
+    );
+    out.insert(
+        "vectors".into(),
+        c.query_row("SELECT count(*) FROM vec_map WHERE alive=1", [], |r| {
+            r.get(0)
+        })?,
+    );
+    out.insert(
+        "clips".into(),
+        c.query_row("SELECT count(*) FROM clip", [], |r| r.get(0))?,
+    );
+    out.insert(
+        "chunks".into(),
+        c.query_row("SELECT count(*) FROM chunk", [], |r| r.get(0))?,
+    );
+    out.insert(
+        "roots".into(),
+        c.query_row("SELECT count(*) FROM root", [], |r| r.get(0))?,
+    );
     let mut st = c.prepare("SELECT kind,count(*) FROM file GROUP BY kind")?;
-    for row in st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?.flatten() {
+    for row in st
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+        .flatten()
+    {
         out.insert(format!("kind_{}", row.0), row.1);
     }
     Ok(out)
@@ -1431,17 +1710,32 @@ mod tests {
         let no_vec = upsert(&db, root, "/tmp/photos/plain.md", Kind::Document);
         let failed = upsert(&db, root, "/tmp/photos/broken.jpg", Kind::Image);
         db.set_file_state(with_vec, FileState::Done, None).unwrap();
-        let row = db.reserve_vec_row(EmbedRowKind::Image, with_vec, with_vec).unwrap();
+        let row = db
+            .reserve_vec_row(EmbedRowKind::Image, with_vec, with_vec)
+            .unwrap();
         db.activate_vec_rows(&[row]).unwrap();
         db.set_file_state(no_vec, FileState::Done, None).unwrap();
-        db.set_file_state(failed, FileState::Failed, Some("嵌入失败")).unwrap();
+        db.set_file_state(failed, FileState::Failed, Some("嵌入失败"))
+            .unwrap();
 
         db.set_root_enabled(root, false).unwrap();
         db.set_root_enabled(root, true).unwrap();
 
-        assert_eq!(db.file(with_vec).unwrap().state, FileState::Done, "size/mtime 未变且向量有效，不该重嵌入");
-        assert_eq!(db.file(no_vec).unwrap().state, FileState::Stale, "缺向量的 done 文件应排队补齐");
-        assert_eq!(db.file(failed).unwrap().state, FileState::Stale, "失败文件应重试");
+        assert_eq!(
+            db.file(with_vec).unwrap().state,
+            FileState::Done,
+            "size/mtime 未变且向量有效，不该重嵌入"
+        );
+        assert_eq!(
+            db.file(no_vec).unwrap().state,
+            FileState::Stale,
+            "缺向量的 done 文件应排队补齐"
+        );
+        assert_eq!(
+            db.file(failed).unwrap().state,
+            FileState::Stale,
+            "失败文件应重试"
+        );
         assert!(db.file(failed).unwrap().error.is_none(), "重试要清掉旧错误");
         assert_eq!(db.alive_vec_rows().unwrap(), 1, "启用不清除向量");
         assert_eq!(db.pending(10, &[]).unwrap().len(), 2);
@@ -1476,11 +1770,13 @@ mod tests {
         db.set_file_state(id, FileState::Done, None).unwrap();
         let file_thumb = dir.path().join("t.jpg");
         std::fs::write(&file_thumb, b"thumb").unwrap();
-        db.set_file_meta(id, None, None, None, Some(&file_thumb.to_string_lossy())).unwrap();
+        db.set_file_meta(id, None, None, None, Some(&file_thumb.to_string_lossy()))
+            .unwrap();
         let clips = db.sync_clips(id, &[(0.0, 2.0)]).unwrap();
         let clip_thumb = dir.path().join("clip-0.jpg");
         std::fs::write(&clip_thumb, b"clip").unwrap();
-        db.set_clip_thumb(clips[0].0, &clip_thumb.to_string_lossy()).unwrap();
+        db.set_clip_thumb(clips[0].0, &clip_thumb.to_string_lossy())
+            .unwrap();
 
         db.delete_by_path("/tmp/photos/a.mp4").unwrap();
 
@@ -1524,7 +1820,8 @@ mod tests {
         {
             let c = rusqlite::Connection::open(&path).unwrap();
             c.execute_batch(V1_DDL).unwrap();
-            c.execute_batch(r#"
+            c.execute_batch(
+                r#"
                 INSERT INTO meta VALUES('schema_version','1');
                 INSERT INTO root(path,label) VALUES('/tmp/d','目录');
                 INSERT INTO file(id,root_id,path,name,ext,kind,size,mtime_ns,state) VALUES
@@ -1537,30 +1834,57 @@ mod tests {
                   (0,'chunk',1,1,1),(1,'chunk',2,1,0);
                 -- 文件 2：一个从未预留的 clip
                 INSERT INTO clip(id,file_id,ord,start_ms,end_ms) VALUES (5,2,0,0,12000);
-            "#).unwrap();
+            "#,
+            )
+            .unwrap();
         }
 
         let db = Db::open(&path).unwrap();
 
-        assert!(dir.path().join("i.bak-v1.sqlite").exists(), "迁移前必须生成备份");
-        assert_eq!(db.get_meta("schema_version").as_deref(), Some("4"), "逐版本迁到最新");
+        assert!(
+            dir.path().join("i.bak-v1.sqlite").exists(),
+            "迁移前必须生成备份"
+        );
+        assert_eq!(
+            db.get_meta("schema_version").as_deref(),
+            Some("4"),
+            "逐版本迁到最新"
+        );
         // v3 的扫描履历表就绪
         assert!(db.record_scan_run(1, "completed", 1, 3, 1, 0).is_ok());
-        assert_eq!(db.last_scan_run(1).unwrap().map(|(s, w, _)| (s, w)), Some(("completed".into(), 3)));
+        assert_eq!(
+            db.last_scan_run(1).unwrap().map(|(s, w, _)| (s, w)),
+            Some(("completed".into(), 3))
+        );
         let c = db.read().unwrap();
         let status = |id: i64| -> String {
-            c.query_row("SELECT status FROM chunk WHERE id=?", params![id], |r| r.get(0)).unwrap()
+            c.query_row("SELECT status FROM chunk WHERE id=?", params![id], |r| {
+                r.get(0)
+            })
+            .unwrap()
         };
         assert_eq!(status(1), "persisted", "已激活的向量保持 persisted");
         assert_eq!(status(2), "pending", "只预留不落盘的片段要重新嵌入");
         assert_eq!(status(3), "pending", "从未预留的片段要重新嵌入");
-        let clip_status: String = c.query_row("SELECT status FROM clip WHERE id=5", [], |r| r.get(0)).unwrap();
+        let clip_status: String = c
+            .query_row("SELECT status FROM clip WHERE id=5", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(clip_status, "pending");
-        let text: String = c.query_row("SELECT text FROM chunk WHERE id=2", [], |r| r.get(0)).unwrap();
+        let text: String = c
+            .query_row("SELECT text FROM chunk WHERE id=2", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(text, "只有预留的片段", "迁移不得丢数据");
-        assert_eq!(db.file(1).unwrap().state, FileState::Stale, "带未完成单元的 done 文件回队列");
+        assert_eq!(
+            db.file(1).unwrap().state,
+            FileState::Stale,
+            "带未完成单元的 done 文件回队列"
+        );
         assert_eq!(db.file(2).unwrap().state, FileState::Stale);
-        assert_eq!(db.pending(10, &[]).unwrap().len(), 2, "两个文件都要能被重新拾起");
+        assert_eq!(
+            db.pending(10, &[]).unwrap().len(),
+            2,
+            "两个文件都要能被重新拾起"
+        );
     }
 
     /// sync 保留未变单元的状态：文本没变的 chunk 连同它的持久化向量一起保留；
@@ -1571,25 +1895,44 @@ mod tests {
         let db = Db::open(&dir.path().join("i.sqlite")).unwrap();
         let root = db.add_root("/tmp/d", "目录").unwrap();
         let id = upsert(&db, root, "/tmp/d/a.md", Kind::Document);
-        let first = db.sync_chunks(id, &["甲".into(), "乙".into(), "丙".into()]).unwrap();
+        let first = db
+            .sync_chunks(id, &["甲".into(), "乙".into(), "丙".into()])
+            .unwrap();
         let (a, b, c3) = (first[0].0, first[1].0, first[2].0);
         // 模拟乙、丙已持久化
         let rb = db.reserve_vec_row(EmbedRowKind::Chunk, b, id).unwrap();
         db.activate_vec_rows(&[rb]).unwrap();
-        db.mark_units_persisted(&[(EmbedRowKind::Chunk, b)]).unwrap();
+        db.mark_units_persisted(&[(EmbedRowKind::Chunk, b)])
+            .unwrap();
 
-        let second = db.sync_chunks(id, &["甲".into(), "乙改".into(), "丙".into(), "丁".into()]).unwrap();
+        let second = db
+            .sync_chunks(id, &["甲".into(), "乙改".into(), "丙".into(), "丁".into()])
+            .unwrap();
 
         assert_eq!(second.len(), 4);
         assert_eq!(second[0].0, a, "未变的单元保留原 id");
         assert_eq!(second[2].0, c3, "未变的单元保留原 id");
         let st = |cid: i64| -> String {
-            db.read().unwrap().query_row("SELECT status FROM chunk WHERE id=?", params![cid], |r| r.get(0)).unwrap()
+            db.read()
+                .unwrap()
+                .query_row("SELECT status FROM chunk WHERE id=?", params![cid], |r| {
+                    r.get(0)
+                })
+                .unwrap()
         };
         assert_eq!(st(b), "pending", "内容变化的单元回到待嵌入");
         assert_eq!(db.alive_vec_rows().unwrap(), 0, "变化单元的向量行已作废");
         assert_eq!(st(second[3].0), "pending");
-        assert_eq!(db.unit_summary(id, 3).unwrap(), UnitSummary { total: 4, persisted: 0, exhausted: 0, retryable: 0, error: None });
+        assert_eq!(
+            db.unit_summary(id, 3).unwrap(),
+            UnitSummary {
+                total: 4,
+                persisted: 0,
+                exhausted: 0,
+                retryable: 0,
+                error: None
+            }
+        );
     }
 
     /// 目录被删除时按「本路径及子路径」清理：子文件的行、FTS、向量映射随目录
@@ -1605,7 +1948,9 @@ mod tests {
         for id in [child, deep, sibling] {
             db.set_file_state(id, FileState::Done, None).unwrap();
         }
-        let row = db.reserve_vec_row(EmbedRowKind::Image, child, child).unwrap();
+        let row = db
+            .reserve_vec_row(EmbedRowKind::Image, child, child)
+            .unwrap();
         db.activate_vec_rows(&[row]).unwrap();
         assert_eq!(db.alive_vec_rows().unwrap(), 1);
 
@@ -1649,25 +1994,37 @@ mod tests {
         let chunks = db.sync_chunks(id, &["甲".into(), "乙".into()]).unwrap();
         let (a, b) = (chunks[0].0, chunks[1].0);
 
-        db.mark_units_failed(&[(EmbedRowKind::Chunk, b)], "超时").unwrap();
+        db.mark_units_failed(&[(EmbedRowKind::Chunk, b)], "超时")
+            .unwrap();
         let sum = db.unit_summary(id, 3).unwrap();
-        assert_eq!((sum.total, sum.persisted, sum.exhausted, sum.retryable), (2, 0, 0, 1), "一个单元失败且可重试");
+        assert_eq!(
+            (sum.total, sum.persisted, sum.exhausted, sum.retryable),
+            (2, 0, 0, 1),
+            "一个单元失败且可重试"
+        );
         assert_eq!(sum.error.as_deref(), Some("超时"));
 
         // 剩余单元成功后整份文件聚合为 done。
         let ra = db.reserve_vec_row(EmbedRowKind::Chunk, a, id).unwrap();
         db.activate_vec_rows(&[ra]).unwrap();
-        db.mark_units_persisted(&[(EmbedRowKind::Chunk, a)]).unwrap();
+        db.mark_units_persisted(&[(EmbedRowKind::Chunk, a)])
+            .unwrap();
         let rb = db.reserve_vec_row(EmbedRowKind::Chunk, b, id).unwrap();
         db.activate_vec_rows(&[rb]).unwrap();
-        db.mark_units_persisted(&[(EmbedRowKind::Chunk, b)]).unwrap();
+        db.mark_units_persisted(&[(EmbedRowKind::Chunk, b)])
+            .unwrap();
         let sum = db.unit_summary(id, 3).unwrap();
-        assert_eq!((sum.total, sum.persisted, sum.exhausted), (2, 2, 0), "全部持久化");
+        assert_eq!(
+            (sum.total, sum.persisted, sum.exhausted),
+            (2, 2, 0),
+            "全部持久化"
+        );
         assert!(sum.error.is_none(), "成功要清掉旧错误");
 
         // 重试计数到上限即视为耗尽。
         for _ in 0..3 {
-            db.mark_units_failed(&[(EmbedRowKind::Chunk, a)], "持续失败").unwrap();
+            db.mark_units_failed(&[(EmbedRowKind::Chunk, a)], "持续失败")
+                .unwrap();
         }
         let sum = db.unit_summary(id, 3).unwrap();
         assert_eq!((sum.exhausted, sum.retryable), (1, 0));

@@ -4,7 +4,7 @@
 //! like inputs (one torch call for N texts). Row ids are reserved before embedding so
 //! the response key `target:row` maps straight back to a slot in the vector file.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -68,7 +68,10 @@ impl Control {
 }
 
 enum Prepared {
-    Embed { items: Vec<EmbedItem>, keys: Vec<String> },
+    Embed {
+        items: Vec<EmbedItem>,
+        keys: Vec<String>,
+    },
     /// Nothing left to do: text is stored, or the file has no indexable content.
     Indexed,
     /// 关键词索引完成但语义单元未全部持久化（模型不可用期间的 TextOnly 产物）。
@@ -119,7 +122,11 @@ fn key(row: i64, target: EmbedRowKind, ref_id: i64) -> String {
 fn parse_key(k: &str) -> Option<(EmbedRowKind, i64, i64)> {
     let (t, rest) = k.split_once(':')?;
     let (row, ref_id) = rest.split_once(':')?;
-    Some((EmbedRowKind::parse(t), row.parse().ok()?, ref_id.parse().ok()?))
+    Some((
+        EmbedRowKind::parse(t),
+        row.parse().ok()?,
+        ref_id.parse().ok()?,
+    ))
 }
 
 /// `(row, bytes)` pairs destined for the vector file, in response order.
@@ -177,7 +184,14 @@ fn place_vectors(
                 continue;
             }
             let Some(v) = vectors.get(k) else {
-                err = err.or_else(|| Some(errors.get(k).cloned().unwrap_or_else(|| "模型未返回向量".into())));
+                err = err.or_else(|| {
+                    Some(
+                        errors
+                            .get(k)
+                            .cloned()
+                            .unwrap_or_else(|| "模型未返回向量".into()),
+                    )
+                });
                 failed_units.push((target, ref_id));
                 continue;
             };
@@ -197,18 +211,29 @@ fn place_vectors(
             rows.push(row);
             ok_units.push((target, ref_id, row));
         }
-        outcomes.push(FileOutcome { file_id: *file_id, ok_units, failed_units, total: keys.len(), err });
+        outcomes.push(FileOutcome {
+            file_id: *file_id,
+            ok_units,
+            failed_units,
+            total: keys.len(),
+            err,
+        });
     }
     (writes, rows, outcomes)
 }
 
 /// Re-group one bounded request's items by file, preserving response order. Pure so the
 /// splitting behavior is testable without a sidecar.
-fn regroup_keys(group: &[EmbedItem], file_of_key: &std::collections::HashMap<&str, i64>) -> Vec<(i64, Vec<String>)> {
+fn regroup_keys(
+    group: &[EmbedItem],
+    file_of_key: &std::collections::HashMap<&str, i64>,
+) -> Vec<(i64, Vec<String>)> {
     let mut out: Vec<(i64, Vec<String>)> = Vec::new();
     for it in group {
         let key = match it {
-            EmbedItem::Text { key, .. } | EmbedItem::Image { key, .. } | EmbedItem::Video { key, .. } => key,
+            EmbedItem::Text { key, .. }
+            | EmbedItem::Image { key, .. }
+            | EmbedItem::Video { key, .. } => key,
         };
         let fid = file_of_key.get(key.as_str()).copied().unwrap_or(-1);
         match out.last_mut() {
@@ -222,11 +247,17 @@ fn regroup_keys(group: &[EmbedItem], file_of_key: &std::collections::HashMap<&st
 /// Best-effort (target, ref) recovery from a malformed key, so the failure still lands
 /// on some unit instead of being silently dropped.
 fn target_of(key: &str) -> EmbedRowKind {
-    key.split(':').next().map(EmbedRowKind::parse).unwrap_or(EmbedRowKind::Image)
+    key.split(':')
+        .next()
+        .map(EmbedRowKind::parse)
+        .unwrap_or(EmbedRowKind::Image)
 }
 
 fn ref_of(key: &str) -> i64 {
-    key.split(':').nth(2).and_then(|s| s.parse().ok()).unwrap_or(-1)
+    key.split(':')
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(-1)
 }
 
 impl Indexer {
@@ -361,11 +392,25 @@ impl Indexer {
         let mut stats = match scan_result {
             Ok(v) => v,
             Err(Error::Cancelled) => {
-                let _ = self.db.record_scan_run(root_id, "cancelled", seen, candidates, queued, 0);
+                let _ = self.db.record_scan_run(
+                    root_id,
+                    "cancelled",
+                    seen,
+                    candidates as i64,
+                    queued as i64,
+                    0,
+                );
                 return Err(Error::Cancelled);
             }
             Err(e) => {
-                let _ = self.db.record_scan_run(root_id, "failed", seen, candidates, queued, 0);
+                let _ = self.db.record_scan_run(
+                    root_id,
+                    "failed",
+                    seen,
+                    candidates as i64,
+                    queued as i64,
+                    0,
+                );
                 return Err(e);
             }
         };
@@ -377,10 +422,19 @@ impl Indexer {
             0
         };
         let queued_now = self.db.pending_count(&kinds)?;
-        let _ = self.db.record_scan_run(root_id, "completed", seen, stats.walked, queued_now as u64, removed as u64);
+        let _ = self.db.record_scan_run(
+            root_id,
+            "completed",
+            seen,
+            stats.walked as i64,
+            queued_now as i64,
+            removed as i64,
+        );
         progress.discovered = stats.walked;
         progress.queued = queued_now;
-        progress.message = Some(format!("扫描完成：新增 {queued} 个，清理 {removed} 个已删除"));
+        progress.message = Some(format!(
+            "扫描完成：新增 {queued} 个，清理 {removed} 个已删除"
+        ));
         let _ = self.emit.try_send(progress);
         Ok(stats)
     }
@@ -402,7 +456,11 @@ impl Indexer {
         // 冲回 0，跑一整轮都显示「0 / 0 队列为空」。
         let mut live = Progress {
             phase: Phase::Indexing,
-            discovered: self.db.counts().map(|c| c.values().sum::<i64>().max(0) as u64).unwrap_or(0),
+            discovered: self
+                .db
+                .counts()
+                .map(|c| c.values().sum::<i64>().max(0) as u64)
+                .unwrap_or(0),
             queued: self.db.pending_count(&kinds).unwrap_or(0),
             ..Default::default()
         };
@@ -412,7 +470,10 @@ impl Indexer {
                 break;
             }
             while self.control.is_paused() {
-                let _ = self.emit.try_send(Progress { phase: Phase::Paused, ..live.clone() });
+                let _ = self.emit.try_send(Progress {
+                    phase: Phase::Paused,
+                    ..live.clone()
+                });
                 std::thread::sleep(Duration::from_millis(300));
                 if self.control.is_cancelled() {
                     sum.ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -420,7 +481,9 @@ impl Indexer {
                 }
             }
             let processed = sum.done + sum.failed + sum.skipped;
-            let want = max_files.map(|m| (m as u64).saturating_sub(processed)).unwrap_or(usize::MAX as u64) as usize;
+            let want = max_files
+                .map(|m| m.saturating_sub(processed as usize))
+                .unwrap_or(usize::MAX);
             if want == 0 {
                 break;
             }
@@ -447,7 +510,11 @@ impl Indexer {
                     live.skipped = sum.skipped;
                     live.queued = self.db.pending_count(&kinds).unwrap_or(live.queued);
                     live.elapsed_s = ms;
-                    live.images_per_min = if ms > 1.0 { sum.done as f64 / (ms / 60.0) } else { 0.0 };
+                    live.images_per_min = if ms > 1.0 {
+                        sum.done as f64 / (ms / 60.0)
+                    } else {
+                        0.0
+                    };
                 }
                 Err(e) => {
                     if matches!(e, Error::Cancelled) {
@@ -471,7 +538,11 @@ impl Indexer {
             }
         }
         sum.ms = started.elapsed().as_secs_f64() * 1000.0;
-        let per_min = if sum.ms > 1.0 { sum.done as f64 / (sum.ms / 60_000.0) } else { 0.0 };
+        let per_min = if sum.ms > 1.0 {
+            sum.done as f64 / (sum.ms / 60_000.0)
+        } else {
+            0.0
+        };
         let _ = self.emit.try_send(Progress {
             phase: Phase::Idle,
             discovered: live.discovered,
@@ -489,7 +560,10 @@ impl Indexer {
 
     fn process_batch(&self, files: &mut [FileRecord], mode: Mode, live: &Progress) -> Result<Out> {
         // A cancelled or failed embed must be retryable without restarting the app.
-        let _recovery = BatchRecovery { db: &self.db, ids: files.iter().map(|f| f.id).collect() };
+        let _recovery = BatchRecovery {
+            db: &self.db,
+            ids: files.iter().map(|f| f.id).collect(),
+        };
         let mut out = Out::default();
         let want_vectors = mode == Mode::Full && self.client.is_some();
         let mut items: Vec<EmbedItem> = Vec::new();
@@ -526,16 +600,25 @@ impl Indexer {
                     out.done += 1;
                 }
                 Ok(Prepared::KeywordOnly) => {
-                    self.db.set_file_state(f.id, FileState::KeywordOnly, Some("已建立关键词索引；语义索引待模型可用后补齐"))?;
+                    self.db.set_file_state(
+                        f.id,
+                        FileState::KeywordOnly,
+                        Some("已建立关键词索引；语义索引待模型可用后补齐"),
+                    )?;
                     out.done += 1;
                 }
                 Ok(Prepared::Skip(reason)) => {
-                    self.db.set_file_state(f.id, FileState::Skipped, Some(&reason))?;
+                    self.db
+                        .set_file_state(f.id, FileState::Skipped, Some(&reason))?;
                     out.skipped += 1;
                 }
                 Err(e) => {
                     let msg = e.to_string();
-                    let state = if matches!(e, Error::Unsupported(_)) { FileState::Skipped } else { FileState::Failed };
+                    let state = if matches!(e, Error::Unsupported(_)) {
+                        FileState::Skipped
+                    } else {
+                        FileState::Failed
+                    };
                     self.db.set_file_state(f.id, state, Some(&msg))?;
                     if state == FileState::Skipped {
                         out.skipped += 1;
@@ -553,7 +636,10 @@ impl Indexer {
         // 单个请求有界（P1-06 的第一步）：长文档/长视频不再把几百个单元塞进一次
         // 请求——JSON、Python 内存和取消等待都随之有界。每个子批独立落盘、独立
         // 激活、独立记账单元状态：中途崩溃只损失未完成子批，已持久化的单元保留。
-        let client = self.client.as_ref().ok_or_else(|| Error::Infer("推理进程未启动".into()))?;
+        let client = self
+            .client
+            .as_ref()
+            .ok_or_else(|| Error::Infer("推理进程未启动".into()))?;
         let batch = self.settings.infer_batch.max(1);
         let group_size = MAX_EMBED_ITEMS_PER_REQUEST.max(batch);
         // key -> file：place_vectors 需要按文件归组，而分组会被子批切开。
@@ -562,9 +648,12 @@ impl Indexer {
             .flat_map(|(fid, keys)| keys.iter().map(move |k| (k.as_str(), *fid)))
             .collect();
         // 每个文件还有多少 key 未结算：最后一个子批结算完才聚合文件状态。
-        let mut remaining: std::collections::HashMap<i64, usize> =
-            per_file.iter().map(|(fid, keys)| (*fid, keys.len())).collect();
-        let mut first_error: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
+        let mut remaining: std::collections::HashMap<i64, usize> = per_file
+            .iter()
+            .map(|(fid, keys)| (*fid, keys.len()))
+            .collect();
+        let mut first_error: std::collections::HashMap<i64, String> =
+            std::collections::HashMap::new();
 
         for group in items.chunks(group_size) {
             if self.control.is_cancelled() {
@@ -574,8 +663,12 @@ impl Indexer {
             let resp = client.embed(group, batch, timeout)?;
 
             let group_per_file = regroup_keys(group, &file_of_key);
-            let (writes, rows, outcomes) =
-                place_vectors(&resp.vectors, &resp.errors, &group_per_file, self.settings.vector_dim);
+            let (writes, rows, outcomes) = place_vectors(
+                &resp.vectors,
+                &resp.errors,
+                &group_per_file,
+                self.settings.vector_dim,
+            );
             for fo in &outcomes {
                 out.vectors += fo.ok_units.len() as u64;
                 if let Some(err) = &fo.err {
@@ -597,7 +690,8 @@ impl Indexer {
             // Failed units keep their state and get retried individually (P0-03).
             self.db.activate_vec_rows(&rows)?;
             for fo in &outcomes {
-                let ok_units: Vec<(EmbedRowKind, i64)> = fo.ok_units.iter().map(|(t, r, _)| (*t, *r)).collect();
+                let ok_units: Vec<(EmbedRowKind, i64)> =
+                    fo.ok_units.iter().map(|(t, r, _)| (*t, *r)).collect();
                 self.db.mark_units_persisted(&ok_units)?;
                 if !fo.failed_units.is_empty() {
                     let msg = fo.err.clone().unwrap_or_else(|| "模型未返回向量".into());
@@ -627,10 +721,15 @@ impl Indexer {
                 self.db.set_file_state(fo.file_id, state, note.as_deref())?;
             }
             for (k, thumb) in &resp.thumbs {
-                let Some((target, _row, ref_id)) = parse_key(k) else { continue };
+                let Some((target, _row, ref_id)) = parse_key(k) else {
+                    continue;
+                };
                 match target {
                     EmbedRowKind::Clip => self.db.set_clip_thumb(ref_id, thumb)?,
-                    EmbedRowKind::Image => self.db.set_file_meta(ref_id, None, None, None, Some(thumb))?,
+                    EmbedRowKind::Image => {
+                        self.db
+                            .set_file_meta(ref_id, None, None, None, Some(thumb))?
+                    }
                     EmbedRowKind::Chunk => {}
                 }
             }
@@ -646,7 +745,8 @@ impl Indexer {
         }
         if f.width.is_none() {
             if let Some((w, h)) = scan::image_dimensions(Path::new(&f.path)) {
-                self.db.set_file_meta(f.id, None, Some(w as i32), Some(h as i32), None)?;
+                self.db
+                    .set_file_meta(f.id, None, Some(w as i32), Some(h as i32), None)?;
             }
         }
         if !want_vectors {
@@ -662,13 +762,20 @@ impl Indexer {
         let k = key(row, EmbedRowKind::Image, f.id);
         let thumb = self.paths.thumb_path(&f.path);
         Ok(Prepared::Embed {
-            items: vec![EmbedItem::Image { key: k.clone(), path: f.path.clone(), thumb: Some(path_str(&thumb)) }],
+            items: vec![EmbedItem::Image {
+                key: k.clone(),
+                path: f.path.clone(),
+                thumb: Some(path_str(&thumb)),
+            }],
             keys: vec![k],
         })
     }
 
     fn prepare_video(&self, f: &FileRecord, want_vectors: bool) -> Result<Prepared> {
-        let client = self.client.as_ref().ok_or_else(|| Error::Infer("推理进程未启动".into()))?;
+        let client = self
+            .client
+            .as_ref()
+            .ok_or_else(|| Error::Infer("推理进程未启动".into()))?;
         if !Path::new(&f.path).exists() {
             return Err(Error::Unsupported("文件已不存在".into()));
         }
@@ -730,15 +837,24 @@ impl Indexer {
                 .client
                 .as_ref()
                 .ok_or_else(|| Error::Unsupported("PDF 解析需要推理进程".into()))?;
-            let (t, body, cut) = client.extract_pdf(path, (self.settings.max_extract_bytes as usize).max(1 << 20))?;
+            let (t, body, cut) = client.extract_pdf(
+                path,
+                (self.settings.max_extract_bytes as usize).max(1 << 20),
+            )?;
             (t, body, cut)
         } else if extract::native(&ext) {
-            let got = extract::extract(path, &ext, self.settings.max_extract_bytes, self.settings.max_text_store_kb)?;
+            let got = extract::extract(
+                path,
+                &ext,
+                self.settings.max_extract_bytes,
+                self.settings.max_text_store_kb,
+            )?;
             (got.title, got.text, got.truncated)
         } else {
             return Err(Error::Unsupported(format!(".{ext} 暂不支持提取正文")));
         };
-        self.db.store_text(f.id, title.as_deref(), &text, truncated)?;
+        self.db
+            .store_text(f.id, title.as_deref(), &text, truncated)?;
         if !want_vectors || text.trim().is_empty() {
             // TextOnly 不得把「部分语义完成」伪装成完整 Done（P1 修复）：
             // 之前成功过的单元保持原状，缺失的等模型就绪后由 mark_missing_vectors 补。
@@ -764,7 +880,9 @@ impl Indexer {
         let mut items = Vec::with_capacity(todo.len());
         let mut keys = Vec::with_capacity(todo.len());
         for (chunk_id, body) in todo {
-            let row = self.db.reserve_vec_row(EmbedRowKind::Chunk, chunk_id, f.id)?;
+            let row = self
+                .db
+                .reserve_vec_row(EmbedRowKind::Chunk, chunk_id, f.id)?;
             let k = key(row, EmbedRowKind::Chunk, chunk_id);
             items.push(EmbedItem::Text {
                 key: k.clone(),
@@ -805,7 +923,11 @@ const MAX_CHUNKS_PER_FILE: usize = 2048;
 /// note, exhausted failures surface as a diagnosable `failed`. Image files have no unit
 /// rows — their single unit is the file itself, decided by whether this pass produced
 /// its vector.
-fn aggregate_file_state(db: &Db, file_id: i64, fo: &FileOutcome) -> Result<(FileState, Option<String>)> {
+fn aggregate_file_state(
+    db: &Db,
+    file_id: i64,
+    fo: &FileOutcome,
+) -> Result<(FileState, Option<String>)> {
     let sum = db.unit_summary(file_id, UNIT_RETRY_MAX)?;
     let total = sum.total;
     let persisted = sum.persisted;
@@ -813,7 +935,10 @@ fn aggregate_file_state(db: &Db, file_id: i64, fo: &FileOutcome) -> Result<(File
     let unit_err = sum.error;
     if total == 0 {
         return Ok(if fo.ok_units.is_empty() {
-            (FileState::Failed, Some(fo.err.clone().unwrap_or_else(|| "模型未返回向量".into())))
+            (
+                FileState::Failed,
+                Some(fo.err.clone().unwrap_or_else(|| "模型未返回向量".into())),
+            )
         } else {
             (FileState::Done, None)
         });
@@ -822,7 +947,9 @@ fn aggregate_file_state(db: &Db, file_id: i64, fo: &FileOutcome) -> Result<(File
         let detail = unit_err.unwrap_or_else(|| "嵌入失败".into());
         return Ok((
             FileState::Failed,
-            Some(format!("{exhausted}/{total} 个片段重复失败（已重试 {UNIT_RETRY_MAX} 次）：{detail}")),
+            Some(format!(
+                "{exhausted}/{total} 个片段重复失败（已重试 {UNIT_RETRY_MAX} 次）：{detail}"
+            )),
         ));
     }
     if persisted == total {
@@ -832,12 +959,25 @@ fn aggregate_file_state(db: &Db, file_id: i64, fo: &FileOutcome) -> Result<(File
             .doc_char_count(file_id)
             .ok()
             .filter(|chars| *chars > (MAX_CHUNKS_PER_FILE as i64).saturating_mul(900))
-            .map(|_| format!("正文过长，语义索引覆盖前 {MAX_CHUNKS_PER_FILE} 个片段；全文仍可按关键词检索"));
+            .map(|_| {
+                format!(
+                    "正文过长，语义索引覆盖前 {MAX_CHUNKS_PER_FILE} 个片段；全文仍可按关键词检索"
+                )
+            });
         return Ok((FileState::Done, note));
     }
     let waiting = total - persisted;
-    let detail = fo.err.clone().or(unit_err).unwrap_or_else(|| "嵌入失败".into());
-    Ok((FileState::Stale, Some(format!("{persisted}/{total} 个片段已索引，{waiting} 个待重试：{detail}"))))
+    let detail = fo
+        .err
+        .clone()
+        .or(unit_err)
+        .unwrap_or_else(|| "嵌入失败".into());
+    Ok((
+        FileState::Stale,
+        Some(format!(
+            "{persisted}/{total} 个片段已索引，{waiting} 个待重试：{detail}"
+        )),
+    ))
 }
 
 /// Re-pack the vector file, dropping rows of deleted or re-indexed files (P0-01).
@@ -847,7 +987,7 @@ fn aggregate_file_state(db: &Db, file_id: i64, fo: &FileOutcome) -> Result<(File
 /// transaction — that commit is the switch point. Old generations are unlinked after the
 /// commit (compaction holds the run slot and the vector write lock, so nothing is
 /// reading or appending).
-pub fn compact(db: &Db, store_path: &PathBuf, dim: usize) -> Result<usize> {
+pub fn compact(db: &Db, store_path: &Path, dim: usize) -> Result<usize> {
     // A failed or interrupted embed reserves rows that never received bytes. Left alive,
     // they are copied as zero rows forever, and a reservation past the end of the vector
     // file makes compaction abort with 越界. Tombstone them first — nothing is mid-embed
@@ -868,8 +1008,9 @@ pub fn compact(db: &Db, store_path: &PathBuf, dim: usize) -> Result<usize> {
     let kept = mapping.len() as i64;
     let sha = crate::vectors::write_generation(&active, &tmp, dim, &mapping)?;
     let dropped = db.commit_compaction(&mapping, next, mapping.len(), dim, &sha)?;
-    crate::vectors::cleanup_generations(store_path, next)?;
-    tracing::info!("向量压缩：generation {next}，保留 {kept} 行，回收 {dropped} 行");
+    // 旧 Generation 不在此处删除（方案 2.2 延迟清理）：保留到下一次启动校验通过之后，
+    // 给「新代损坏时人工/工具恢复」留一个窗口。mmap 语义下保留旧文件也没有读者风险。
+    tracing::info!("向量压缩：generation {next}，保留 {kept} 行，回收 {dropped} 行；旧代文件延迟到下次启动清理");
     Ok(dropped)
 }
 
@@ -911,14 +1052,20 @@ mod tests {
     }
 
     fn text_settings() -> Settings {
-        let mut st = Settings::default();
-        st.index_images = false;
-        st.index_video = false;
-        st
+        Settings {
+            index_images: false,
+            index_video: false,
+            ..Settings::default()
+        }
     }
 
     fn add_doc(h: &Harness, name: &str, body: &str) -> FileRecord {
-        let root = h.db.list_roots().unwrap().first().map(|r| r.id).unwrap_or(1);
+        let root =
+            h.db.list_roots()
+                .unwrap()
+                .first()
+                .map(|r| r.id)
+                .unwrap_or(1);
         let seen = crate::db::now_ns();
         let p = h.dir.path().join(name);
         std::fs::write(&p, body).unwrap();
@@ -938,24 +1085,32 @@ mod tests {
     #[test]
     fn text_only_indexes_documents_without_vectors() {
         let h = harness();
-        h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
+        h.db.add_root(&h.dir.path().to_string_lossy(), "test")
+            .unwrap();
         add_doc(&h, "note.md", "海边的日落记录，天空很红");
         let (idx, _rx) = indexer(&h, text_settings());
         let sum = idx.run(Mode::TextOnly, None).unwrap();
         assert_eq!(sum.done, 1, "{sum:?}");
         let rec = h.db.pending(10, &[Kind::Document]).unwrap();
         assert!(rec.is_empty());
-        let stored = h.db.file_by_path(&h.dir.path().join("note.md").to_string_lossy()).unwrap();
+        let stored =
+            h.db.file_by_path(&h.dir.path().join("note.md").to_string_lossy())
+                .unwrap();
         assert_eq!(stored.state, FileState::Done);
         assert!(h.db.stored_text(stored.id).unwrap().contains("海边的日落"));
-        assert_eq!(h.db.alive_vec_rows().unwrap(), 0, "text-only must not allocate vectors");
+        assert_eq!(
+            h.db.alive_vec_rows().unwrap(),
+            0,
+            "text-only must not allocate vectors"
+        );
         assert!(!h.paths.vector_path.exists());
     }
 
     #[test]
     fn chunking_creates_one_item_per_chunk() {
         let h = harness();
-        h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
+        h.db.add_root(&h.dir.path().to_string_lossy(), "test")
+            .unwrap();
         let body = "海边的日落。".repeat(200);
         let rec = add_doc(&h, "long.md", &body);
         let mut settings = text_settings();
@@ -965,7 +1120,12 @@ mod tests {
         let rows = h.db.chunk_rows(rec.id).unwrap();
         assert!(rows.is_empty(), "text-only does not chunk");
         let stored = h.db.stored_text(rec.id).unwrap();
-        assert!(stored.len() < body.len(), "{} >= {}", stored.len(), body.len());
+        assert!(
+            stored.len() < body.len(),
+            "{} >= {}",
+            stored.len(),
+            body.len()
+        );
         assert!(
             (1021..=1024).contains(&stored.len()),
             "cap is bytes of UTF-8 cut on a char boundary, got {}",
@@ -978,7 +1138,8 @@ mod tests {
     #[test]
     fn progress_frames_keep_the_running_totals() {
         let h = harness();
-        h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
+        h.db.add_root(&h.dir.path().to_string_lossy(), "test")
+            .unwrap();
         for i in 0..3 {
             add_doc(&h, &format!("n{i}.md"), &format!("第 {i} 篇海边日记"));
         }
@@ -991,22 +1152,35 @@ mod tests {
         for f in &frames {
             assert_eq!(f.discovered, 4, "每一帧都要带总数: {f:?}");
         }
-        let running: Vec<&Progress> = frames.iter().filter(|f| f.phase == Phase::Indexing).collect();
+        let running: Vec<&Progress> = frames
+            .iter()
+            .filter(|f| f.phase == Phase::Indexing)
+            .collect();
         assert!(!running.is_empty(), "索引过程中必须发帧: {frames:?}");
         for f in running {
             assert!(f.queued > 0, "还在跑就不能把队列报成空: {f:?}");
         }
         let last = frames.last().expect("一轮索引至少以收尾帧结束");
         assert_eq!(last.phase, Phase::Idle);
-        assert_eq!((last.done, last.skipped, last.queued), (sum.done, sum.skipped, 0));
-        assert_eq!(h.db.pending_count(&kinds).unwrap(), h.db.pending(usize::MAX, &kinds).unwrap().len() as u64);
-        assert_eq!(h.db.pending_count(&[]).unwrap(), h.db.pending(usize::MAX, &[]).unwrap().len() as u64);
+        assert_eq!(
+            (last.done, last.skipped, last.queued),
+            (sum.done, sum.skipped, 0)
+        );
+        assert_eq!(
+            h.db.pending_count(&kinds).unwrap(),
+            h.db.pending(usize::MAX, &kinds).unwrap().len() as u64
+        );
+        assert_eq!(
+            h.db.pending_count(&[]).unwrap(),
+            h.db.pending(usize::MAX, &[]).unwrap().len() as u64
+        );
     }
 
     #[test]
     fn unsupported_ext_is_skipped_not_failed() {
         let h = harness();
-        h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
+        h.db.add_root(&h.dir.path().to_string_lossy(), "test")
+            .unwrap();
         let rec = add_doc(&h, "x.pdf", "not a pdf");
         let (idx, _rx) = indexer(&h, text_settings());
         let sum = idx.run(Mode::TextOnly, None).unwrap();
@@ -1017,7 +1191,8 @@ mod tests {
     #[test]
     fn binary_document_is_skipped() {
         let h = harness();
-        h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
+        h.db.add_root(&h.dir.path().to_string_lossy(), "test")
+            .unwrap();
         let p = h.dir.path().join("blob.txt");
         std::fs::write(&p, [0u8, 1, 2, 3, 4]).unwrap();
         let seen = crate::db::now_ns();
@@ -1053,8 +1228,10 @@ mod tests {
     #[test]
     fn kinds_follow_settings() {
         let h = harness();
-        let mut st = Settings::default();
-        st.index_code = false;
+        let st = Settings {
+            index_code: false,
+            ..Settings::default()
+        };
         let (idx, _rx) = indexer(&h, st);
         let kinds = idx.kinds_for(Mode::Full);
         assert!(kinds.contains(&Kind::Image));
@@ -1065,7 +1242,8 @@ mod tests {
     #[test]
     fn empty_queue_returns_immediately() {
         let h = harness();
-        h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
+        h.db.add_root(&h.dir.path().to_string_lossy(), "test")
+            .unwrap();
         let (idx, _rx) = indexer(&h, text_settings());
         let sum = idx.run(Mode::TextOnly, None).unwrap();
         assert_eq!(sum.done, 0);
@@ -1074,7 +1252,8 @@ mod tests {
     #[test]
     fn cancel_stops_the_loop() {
         let h = harness();
-        h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
+        h.db.add_root(&h.dir.path().to_string_lossy(), "test")
+            .unwrap();
         for i in 0..5 {
             add_doc(&h, &format!("n{i}.md"), "内容");
         }
@@ -1088,7 +1267,8 @@ mod tests {
     #[test]
     fn max_files_limits_the_pass() {
         let h = harness();
-        h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
+        h.db.add_root(&h.dir.path().to_string_lossy(), "test")
+            .unwrap();
         for i in 0..6 {
             add_doc(&h, &format!("m{i}.md"), "内容内容");
         }
@@ -1110,8 +1290,10 @@ mod tests {
         assert_eq!(stats.indexed_candidates, 2, "{stats:?}");
         let sum = idx.run(Mode::TextOnly, None).unwrap();
         assert_eq!(sum.done, 2);
-        let mut req = crate::SearchRequest::default();
-        req.query = "雾".into();
+        let req = crate::SearchRequest {
+            query: "雾".into(),
+            ..Default::default()
+        };
         let expr = crate::segment::match_expression(&req.query).unwrap();
         let hits = h.db.keyword_search(&expr, &req, 10).unwrap();
         assert_eq!(hits.len(), 1);
@@ -1120,24 +1302,33 @@ mod tests {
     #[test]
     fn text_only_scan_preserves_existing_media_and_vectors() {
         let h = harness();
-        let root = h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
+        let root =
+            h.db.add_root(&h.dir.path().to_string_lossy(), "test")
+                .unwrap();
         let path = h.dir.path().join("photo.jpg");
         std::fs::write(&path, "placeholder").unwrap();
         let (idx, _) = indexer(&h, Settings::default());
         idx.scan_root(root, Mode::Full).unwrap();
         let photo = h.db.file_by_path(&path.to_string_lossy()).unwrap();
-        h.db.set_file_state(photo.id, FileState::Done, None).unwrap();
-        let row = h.db.reserve_vec_row(EmbedRowKind::Image, photo.id, photo.id).unwrap();
+        h.db.set_file_state(photo.id, FileState::Done, None)
+            .unwrap();
+        let row =
+            h.db.reserve_vec_row(EmbedRowKind::Image, photo.id, photo.id)
+                .unwrap();
         h.db.activate_vec_rows(&[row]).unwrap();
         idx.scan_root(root, Mode::TextOnly).unwrap();
-        assert!(h.db.file(photo.id).is_some(), "a text-only pass must not sweep media");
+        assert!(
+            h.db.file(photo.id).is_some(),
+            "a text-only pass must not sweep media"
+        );
         assert_eq!(h.db.alive_vec_rows().unwrap(), 1);
     }
 
     #[test]
     fn embed_failure_requeues_the_batch_without_reopening_the_database() {
         let h = harness();
-        h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
+        h.db.add_root(&h.dir.path().to_string_lossy(), "test")
+            .unwrap();
         let doc = add_doc(&h, "retry.md", "this document must remain retryable");
         let mut settings = text_settings();
         settings.infer_python = Some(h.dir.path().join("missing-python").to_string_lossy().into());
@@ -1154,12 +1345,17 @@ mod tests {
     #[test]
     fn replacing_video_clips_does_not_reuse_old_vector_rows() {
         let h = harness();
-        h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
+        h.db.add_root(&h.dir.path().to_string_lossy(), "test")
+            .unwrap();
         let video = add_doc(&h, "clip.mp4", "placeholder");
         let clips = h.db.sync_clips(video.id, &[(0.0, 1.0)]).unwrap();
-        let old = h.db.reserve_vec_row(EmbedRowKind::Clip, clips[0].0, video.id).unwrap();
+        let old =
+            h.db.reserve_vec_row(EmbedRowKind::Clip, clips[0].0, video.id)
+                .unwrap();
         let replacement = h.db.sync_clips(video.id, &[(0.0, 2.0)]).unwrap();
-        let next = h.db.reserve_vec_row(EmbedRowKind::Clip, replacement[0].0, video.id).unwrap();
+        let next =
+            h.db.reserve_vec_row(EmbedRowKind::Clip, replacement[0].0, video.id)
+                .unwrap();
         assert!(next > old);
         // 预留即 staging（alive=0）：旧行作废 + 新行未激活，两行都还不可搜索。
         assert_eq!(h.db.alive_vec_rows().unwrap(), 0);
@@ -1176,7 +1372,10 @@ mod tests {
         let (idx, _rx) = indexer(&h, text_settings());
         idx.scan_root(root, Mode::TextOnly).unwrap();
         idx.run(Mode::TextOnly, None).unwrap();
-        assert_eq!(h.db.file_by_path(&p.to_string_lossy()).unwrap().state, FileState::Done);
+        assert_eq!(
+            h.db.file_by_path(&p.to_string_lossy()).unwrap().state,
+            FileState::Done
+        );
         std::fs::remove_file(&p).unwrap();
         let stats = idx.scan_root(root, Mode::TextOnly).unwrap();
         assert_eq!(stats.indexed_candidates, 0);
@@ -1186,7 +1385,8 @@ mod tests {
     #[test]
     fn compact_reclaims_dead_rows() {
         let h = harness();
-        h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
+        h.db.add_root(&h.dir.path().to_string_lossy(), "test")
+            .unwrap();
         let seen = crate::db::now_ns();
         let mk = |path: &str| Scanned {
             root_id: 1,
@@ -1221,7 +1421,10 @@ mod tests {
         assert_eq!(rows[0].file_id, b);
         let view = crate::vectors::MmapView::open(&active).unwrap().unwrap();
         let hits = view.search(&[0.0, 1.0], &rows, 4);
-        assert!((hits[0].1 - 1.0).abs() < 1e-6, "row pointers must follow compaction");
+        assert!(
+            (hits[0].1 - 1.0).abs() < 1e-6,
+            "row pointers must follow compaction"
+        );
     }
 
     /// 重建（不清空向量文件）不得让旧行字节冒充新向量：reindex_all 清掉映射后，
@@ -1230,7 +1433,8 @@ mod tests {
     #[test]
     fn rebuilding_without_wiping_never_serves_stale_row_bytes() {
         let h = harness();
-        h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
+        h.db.add_root(&h.dir.path().to_string_lossy(), "test")
+            .unwrap();
         let seen = crate::db::now_ns();
         let mk = |path: &str| Scanned {
             root_id: 1,
@@ -1257,7 +1461,10 @@ mod tests {
         let row = h.db.reserve_vec_row(EmbedRowKind::Image, a, a).unwrap();
         assert_eq!(row, old_row, "新一轮从同一行号重新分配");
         // 这轮推理失败：字节没写、映射没激活。
-        assert!(h.db.vec_candidates(&[]).unwrap().is_empty(), "旧行字节不得冒充本轮向量");
+        assert!(
+            h.db.vec_candidates(&[]).unwrap().is_empty(),
+            "旧行字节不得冒充本轮向量"
+        );
         assert_eq!(h.db.alive_vec_rows().unwrap(), 0);
 
         // 推理成功：新字节落盘并激活后才可见。
@@ -1269,9 +1476,14 @@ mod tests {
         h.db.set_file_state(a, FileState::Done, None).unwrap();
         let rows = h.db.vec_candidates(&[]).unwrap();
         assert_eq!(rows.len(), 1);
-        let view = crate::vectors::MmapView::open(&h.paths.vector_path).unwrap().unwrap();
+        let view = crate::vectors::MmapView::open(&h.paths.vector_path)
+            .unwrap()
+            .unwrap();
         let hits = view.search(&[0.0, 1.0], &rows, 4);
-        assert!((hits[0].1 - 1.0).abs() < 1e-6, "可见的必须是本轮新向量，不是旧字节");
+        assert!(
+            (hits[0].1 - 1.0).abs() < 1e-6,
+            "可见的必须是本轮新向量，不是旧字节"
+        );
     }
 
     /// 嵌入失败只预留了行、字节没落盘：这些行必须被压缩回收。修复前它们被当作
@@ -1279,7 +1491,8 @@ mod tests {
     #[test]
     fn compact_reclaims_rows_reserved_by_failed_embeds() {
         let h = harness();
-        h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
+        h.db.add_root(&h.dir.path().to_string_lossy(), "test")
+            .unwrap();
         let seen = crate::db::now_ns();
         let mk = |path: &str| Scanned {
             root_id: 1,
@@ -1304,7 +1517,8 @@ mod tests {
         store.flush().unwrap();
         drop(store);
         h.db.activate_vec_rows(&[r_ok]).unwrap();
-        h.db.set_file_state(bad, FileState::Failed, Some("嵌入失败")).unwrap();
+        h.db.set_file_state(bad, FileState::Failed, Some("嵌入失败"))
+            .unwrap();
 
         let dropped = compact(&h.db, &h.paths.vector_path, 2).unwrap();
 
@@ -1319,7 +1533,8 @@ mod tests {
     #[test]
     fn compact_survives_reservations_beyond_the_vector_file() {
         let h = harness();
-        h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
+        h.db.add_root(&h.dir.path().to_string_lossy(), "test")
+            .unwrap();
         let seen = crate::db::now_ns();
         let s = Scanned {
             root_id: 1,
@@ -1333,7 +1548,8 @@ mod tests {
         let id = h.db.upsert_file(&s, seen).unwrap().0;
         h.db.set_file_state(id, FileState::Done, None).unwrap();
         h.db.reserve_vec_row(EmbedRowKind::Image, id, id).unwrap();
-        h.db.set_file_state(id, FileState::Failed, Some("嵌入失败")).unwrap();
+        h.db.set_file_state(id, FileState::Failed, Some("嵌入失败"))
+            .unwrap();
         assert!(!h.paths.vector_path.exists(), "该场景下向量文件尚未建立");
 
         let dropped = compact(&h.db, &h.paths.vector_path, 2).unwrap();
@@ -1350,7 +1566,8 @@ mod tests {
     #[test]
     fn staged_rows_stay_invisible_until_their_bytes_are_persisted() {
         let h = harness();
-        h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
+        h.db.add_root(&h.dir.path().to_string_lossy(), "test")
+            .unwrap();
         let seen = crate::db::now_ns();
         let s = Scanned {
             root_id: 1,
@@ -1394,7 +1611,10 @@ mod tests {
         let mut errors = std::collections::HashMap::new();
         errors.insert(kf(1, EmbedRowKind::Image, 2), "解码失败".to_string());
         let per_file = vec![
-            (11, vec![kf(0, EmbedRowKind::Image, 1), kf(1, EmbedRowKind::Image, 2)]),
+            (
+                11,
+                vec![kf(0, EmbedRowKind::Image, 1), kf(1, EmbedRowKind::Image, 2)],
+            ),
             (12, vec![kf(2, EmbedRowKind::Image, 3)]),
         ];
 
@@ -1402,8 +1622,26 @@ mod tests {
 
         assert_eq!(writes, vec![(0, vec![1.0, 0.0])]);
         assert_eq!(rows, vec![0]);
-        assert_eq!(outcomes[0], FileOutcome { file_id: 11, ok_units: vec![(EmbedRowKind::Image, 1, 0)], failed_units: vec![(EmbedRowKind::Image, 2)], total: 2, err: Some("解码失败".into()) });
-        assert_eq!(outcomes[1], FileOutcome { file_id: 12, ok_units: vec![], failed_units: vec![(EmbedRowKind::Image, 3)], total: 1, err: Some("模型未返回向量".into()) });
+        assert_eq!(
+            outcomes[0],
+            FileOutcome {
+                file_id: 11,
+                ok_units: vec![(EmbedRowKind::Image, 1, 0)],
+                failed_units: vec![(EmbedRowKind::Image, 2)],
+                total: 2,
+                err: Some("解码失败".into())
+            }
+        );
+        assert_eq!(
+            outcomes[1],
+            FileOutcome {
+                file_id: 12,
+                ok_units: vec![],
+                failed_units: vec![(EmbedRowKind::Image, 3)],
+                total: 1,
+                err: Some("模型未返回向量".into())
+            }
+        );
     }
 
     #[test]
@@ -1415,9 +1653,15 @@ mod tests {
         vectors.insert(kf(3, EmbedRowKind::Image, 4), vec![1.0, 0.0]);
         vectors.insert(kf(4, EmbedRowKind::Image, 5), vec![0.5, 0.5]);
         let per_file = vec![
-            (21, vec![kf(0, EmbedRowKind::Image, 1), kf(1, EmbedRowKind::Image, 2)]),
+            (
+                21,
+                vec![kf(0, EmbedRowKind::Image, 1), kf(1, EmbedRowKind::Image, 2)],
+            ),
             (22, vec![kf(2, EmbedRowKind::Image, 3)]),
-            (23, vec![kf(3, EmbedRowKind::Image, 4), kf(4, EmbedRowKind::Image, 5)]),
+            (
+                23,
+                vec![kf(3, EmbedRowKind::Image, 4), kf(4, EmbedRowKind::Image, 5)],
+            ),
             (24, vec![kf(2, EmbedRowKind::Chunk, 3)]), // 与文件 22 抢同一行
         ];
 
@@ -1462,7 +1706,8 @@ mod tests {
     #[test]
     fn prepare_text_queues_only_unpersisted_chunks() {
         let h = harness();
-        h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
+        h.db.add_root(&h.dir.path().to_string_lossy(), "test")
+            .unwrap();
         let doc = add_doc(&h, "big.md", &"海边的日落。".repeat(300));
         let (idx, _rx) = indexer(&h, text_settings());
         let rec = h.db.file(doc.id).unwrap();
@@ -1475,12 +1720,20 @@ mod tests {
 
         // 全部持久化后再 prepare：无事可做。
         let units: Vec<(EmbedRowKind, i64)> =
-            h.db.chunk_rows(doc.id).unwrap().into_iter().map(|(id, _)| (EmbedRowKind::Chunk, id)).collect();
+            h.db.chunk_rows(doc.id)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| (EmbedRowKind::Chunk, id))
+                .collect();
         h.db.mark_units_persisted(&units).unwrap();
-        assert!(matches!(idx.prepare_text(&rec, true).unwrap(), Prepared::Indexed));
+        assert!(matches!(
+            idx.prepare_text(&rec, true).unwrap(),
+            Prepared::Indexed
+        ));
 
         // 只让一个片段失败：下一次 prepare 只包含它。
-        h.db.mark_units_failed(&[(EmbedRowKind::Chunk, units[0].1)], "超时").unwrap();
+        h.db.mark_units_failed(&[(EmbedRowKind::Chunk, units[0].1)], "超时")
+            .unwrap();
         let Prepared::Embed { items, keys } = idx.prepare_text(&rec, true).unwrap() else {
             panic!("有失败片段时应该产出嵌入任务");
         };
@@ -1490,20 +1743,39 @@ mod tests {
 
     #[test]
     fn regroup_keys_keeps_files_together_in_response_order() {
-        let item = |key: &str| EmbedItem::Text { key: key.into(), text: "x".into(), title: None, role: "document".into() };
+        let item = |key: &str| EmbedItem::Text {
+            key: key.into(),
+            text: "x".into(),
+            title: None,
+            role: "document".into(),
+        };
         let mut map = std::collections::HashMap::new();
         map.insert("chunk:1:11", 100i64);
         map.insert("chunk:2:12", 100i64);
         map.insert("chunk:3:13", 200i64);
         map.insert("chunk:4:14", 200i64);
-        let group = vec![item("chunk:1:11"), item("chunk:2:12"), item("chunk:3:13"), item("chunk:4:14")];
+        let group = vec![
+            item("chunk:1:11"),
+            item("chunk:2:12"),
+            item("chunk:3:13"),
+            item("chunk:4:14"),
+        ];
 
         let grouped = regroup_keys(&group, &map);
 
         // 相邻同文件合并，跨文件边界不合并；未知 key 落到 -1 兜底。
-        assert_eq!(grouped, vec![(100, vec!["chunk:1:11".into(), "chunk:2:12".into()]), (200, vec!["chunk:3:13".into(), "chunk:4:14".into()])]);
+        assert_eq!(
+            grouped,
+            vec![
+                (100, vec!["chunk:1:11".into(), "chunk:2:12".into()]),
+                (200, vec!["chunk:3:13".into(), "chunk:4:14".into()])
+            ]
+        );
         let unknown = vec![item("bogus")];
-        assert_eq!(regroup_keys(&unknown, &map), vec![(-1, vec!["bogus".into()])]);
+        assert_eq!(
+            regroup_keys(&unknown, &map),
+            vec![(-1, vec!["bogus".into()])]
+        );
     }
 
     /// 长文档不再被 24 片静默截断：片段按上限同步并全部进入嵌入队列；
@@ -1511,7 +1783,8 @@ mod tests {
     #[test]
     fn long_document_gets_full_chunks_and_an_honest_truncation_note() {
         let h = harness();
-        h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
+        h.db.add_root(&h.dir.path().to_string_lossy(), "test")
+            .unwrap();
         let body = "x".repeat(MAX_CHUNKS_PER_FILE * 900 + 4096); // 超出片段预算
         let doc = add_doc(&h, "huge.txt", &body);
         let mut st = text_settings();
@@ -1522,18 +1795,32 @@ mod tests {
         let Prepared::Embed { items, keys } = idx.prepare_text(&rec, true).unwrap() else {
             panic!("长文档应当产出嵌入任务");
         };
-        assert_eq!(items.len(), MAX_CHUNKS_PER_FILE, "按片段预算截断，而不是 24");
+        assert_eq!(
+            items.len(),
+            MAX_CHUNKS_PER_FILE,
+            "按片段预算截断，而不是 24"
+        );
         assert_eq!(keys.len(), MAX_CHUNKS_PER_FILE);
 
         // 全部持久化 → done + 截断说明
-        let rows: Vec<i64> = keys.iter().filter_map(|k| parse_key(k).map(|(_, r, _)| r)).collect();
+        let rows: Vec<i64> = keys
+            .iter()
+            .filter_map(|k| parse_key(k).map(|(_, r, _)| r))
+            .collect();
         h.db.activate_vec_rows(&rows).unwrap();
         let units: Vec<(EmbedRowKind, i64)> =
-            h.db.chunk_rows(doc.id).unwrap().into_iter().map(|(id, _)| (EmbedRowKind::Chunk, id)).collect();
+            h.db.chunk_rows(doc.id)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| (EmbedRowKind::Chunk, id))
+                .collect();
         h.db.mark_units_persisted(&units).unwrap();
         let outcome = FileOutcome {
             file_id: doc.id,
-            ok_units: units.iter().map(|(_, id)| (EmbedRowKind::Chunk, *id, *id)).collect(),
+            ok_units: units
+                .iter()
+                .map(|(_, id)| (EmbedRowKind::Chunk, *id, *id))
+                .collect(),
             failed_units: vec![],
             total: units.len(),
             err: None,
@@ -1546,20 +1833,33 @@ mod tests {
         // 正常长度文档：单片段持久化后 done 且无说明。
         let small = add_doc(&h, "small.txt", "很短的内容");
         let small_rec = h.db.file(small.id).unwrap();
-        let Prepared::Embed { keys: small_keys, .. } = idx.prepare_text(&small_rec, true).unwrap() else {
+        let Prepared::Embed {
+            keys: small_keys, ..
+        } = idx.prepare_text(&small_rec, true).unwrap()
+        else {
             panic!("小文档也应产出嵌入任务");
         };
-        let small_rows: Vec<i64> = small_keys.iter().filter_map(|k| parse_key(k).map(|(_, r, _)| r)).collect();
+        let small_rows: Vec<i64> = small_keys
+            .iter()
+            .filter_map(|k| parse_key(k).map(|(_, r, _)| r))
+            .collect();
         h.db.activate_vec_rows(&small_rows).unwrap();
         let small_units: Vec<(EmbedRowKind, i64)> =
-            h.db.chunk_rows(small.id).unwrap().into_iter().map(|(id, _)| (EmbedRowKind::Chunk, id)).collect();
+            h.db.chunk_rows(small.id)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| (EmbedRowKind::Chunk, id))
+                .collect();
         h.db.mark_units_persisted(&small_units).unwrap();
         let (state, note) = aggregate_file_state(
             &h.db,
             small.id,
             &FileOutcome {
                 file_id: small.id,
-                ok_units: small_units.iter().map(|(_, id)| (EmbedRowKind::Chunk, *id, *id)).collect(),
+                ok_units: small_units
+                    .iter()
+                    .map(|(_, id)| (EmbedRowKind::Chunk, *id, *id))
+                    .collect(),
                 failed_units: vec![],
                 total: small_units.len(),
                 err: None,
@@ -1578,7 +1878,8 @@ mod tests {
     #[test]
     fn compaction_keeps_persisted_units_of_an_incomplete_file() {
         let h = harness();
-        h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
+        h.db.add_root(&h.dir.path().to_string_lossy(), "test")
+            .unwrap();
         let doc = add_doc(&h, "part.md", &"海边的日落。".repeat(450));
         let rec = h.db.file(doc.id).unwrap();
         let (idx, _rx) = indexer(&h, text_settings());
@@ -1587,7 +1888,10 @@ mod tests {
         };
         assert_eq!(items.len(), 3, "3 个片段");
         // 模拟：前 2 个成功（落盘+激活+persisted），第 3 个失败（只预留 staging 行）
-        let rows: Vec<i64> = keys.iter().filter_map(|k| parse_key(k).map(|(_, r, _)| r)).collect();
+        let rows: Vec<i64> = keys
+            .iter()
+            .filter_map(|k| parse_key(k).map(|(_, r, _)| r))
+            .collect();
         let mut store = Store::open(&h.paths.vector_path, 512).unwrap();
         for (i, r) in rows[..2].iter().enumerate() {
             let mut v = vec![0.0f32; 512];
@@ -1597,26 +1901,31 @@ mod tests {
         store.flush().unwrap();
         drop(store);
         h.db.activate_vec_rows(&rows[..2]).unwrap();
-        h.db
-            .mark_units_persisted(&[
-                (EmbedRowKind::Chunk, chunk_id_of(&h.db, doc.id, 0)),
-                (EmbedRowKind::Chunk, chunk_id_of(&h.db, doc.id, 1)),
-            ])
+        h.db.mark_units_persisted(&[
+            (EmbedRowKind::Chunk, chunk_id_of(&h.db, doc.id, 0)),
+            (EmbedRowKind::Chunk, chunk_id_of(&h.db, doc.id, 1)),
+        ])
+        .unwrap();
+        h.db.mark_units_failed(
+            &[(EmbedRowKind::Chunk, chunk_id_of(&h.db, doc.id, 2))],
+            "超时",
+        )
+        .unwrap();
+        h.db.set_file_state(doc.id, FileState::Stale, Some("1 个片段待重试"))
             .unwrap();
-        h.db.mark_units_failed(&[(EmbedRowKind::Chunk, chunk_id_of(&h.db, doc.id, 2))], "超时").unwrap();
-        h.db.set_file_state(doc.id, FileState::Stale, Some("1 个片段待重试")).unwrap();
         assert_eq!(h.db.alive_vec_rows().unwrap(), 2);
 
         // 压缩：绝不能把前 2 条有效映射一起回收
         let dropped = compact(&h.db, &h.paths.vector_path, 512).unwrap();
         assert_eq!(dropped, 1, "只回收失败片段的 staging 行");
         assert_eq!(h.db.alive_vec_rows().unwrap(), 2, "已持久化的向量必须保留");
-        let cs = h.db.chunk_rows(doc.id).unwrap();
         let sum = h.db.unit_summary(doc.id, UNIT_RETRY_MAX).unwrap();
         assert_eq!((sum.total, sum.persisted), (3, 2), "单元状态不受压缩影响");
 
         // 第 3 个片段重试成功 → 整份文件完成、三个向量全部可搜
-        let row3 = h.db.reserve_vec_row(EmbedRowKind::Chunk, chunk_id_of(&h.db, doc.id, 2), doc.id).unwrap();
+        let row3 =
+            h.db.reserve_vec_row(EmbedRowKind::Chunk, chunk_id_of(&h.db, doc.id, 2), doc.id)
+                .unwrap();
         let active = crate::vectors::active_vector_path(&h.paths.vector_path, &h.db).unwrap();
         let mut store = Store::open(&active, 512).unwrap();
         let mut v = vec![0.0f32; 512];
@@ -1625,7 +1934,8 @@ mod tests {
         store.flush().unwrap();
         drop(store);
         h.db.activate_vec_rows(&[row3]).unwrap();
-        h.db.mark_units_persisted(&[(EmbedRowKind::Chunk, chunk_id_of(&h.db, doc.id, 2))]).unwrap();
+        h.db.mark_units_persisted(&[(EmbedRowKind::Chunk, chunk_id_of(&h.db, doc.id, 2))])
+            .unwrap();
         h.db.set_file_state(doc.id, FileState::Done, None).unwrap();
 
         let candidates = h.db.vec_candidates(&[]).unwrap();
@@ -1634,7 +1944,10 @@ mod tests {
         let mut q = vec![0.0f32; 512];
         q[1] = 1.0;
         let hits = view.search(&q, &candidates, 5);
-        assert!((hits[0].1 - 1.0).abs() < 1e-6, "压缩后旧向量内容必须原样可读");
+        assert!(
+            (hits[0].1 - 1.0).abs() < 1e-6,
+            "压缩后旧向量内容必须原样可读"
+        );
         let _ = idx;
     }
 
@@ -1644,82 +1957,152 @@ mod tests {
     #[test]
     fn text_only_marks_partial_semantics_keyword_only_and_backfills_later() {
         let h = harness();
-        h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
+        h.db.add_root(&h.dir.path().to_string_lossy(), "test")
+            .unwrap();
         let doc = add_doc(&h, "half.md", &"山间的雾。".repeat(450));
         let rec = h.db.file(doc.id).unwrap();
         let (idx, _rx) = indexer(&h, text_settings());
         let Prepared::Embed { keys, .. } = idx.prepare_text(&rec, true).unwrap() else {
             panic!("应产出嵌入任务");
         };
-        let chunk_ids: Vec<i64> = h.db.chunk_rows(doc.id).unwrap().into_iter().map(|(id, _)| id).collect();
+        let chunk_ids: Vec<i64> =
+            h.db.chunk_rows(doc.id)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
         // 前 2 个成功、第 3 个失败 → 文件 stale
-        h.db.activate_vec_rows(&keys.iter().filter_map(|k| parse_key(k).map(|(_, r, _)| r)).take(2).collect::<Vec<_>>()).unwrap();
-        h.db.mark_units_persisted(&[(EmbedRowKind::Chunk, chunk_ids[0]), (EmbedRowKind::Chunk, chunk_ids[1])]).unwrap();
-        h.db.mark_units_failed(&[(EmbedRowKind::Chunk, chunk_ids[2])], "超时").unwrap();
-        h.db.set_file_state(doc.id, FileState::Stale, Some("1 个片段待重试")).unwrap();
+        h.db.activate_vec_rows(
+            &keys
+                .iter()
+                .filter_map(|k| parse_key(k).map(|(_, r, _)| r))
+                .take(2)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        h.db.mark_units_persisted(&[
+            (EmbedRowKind::Chunk, chunk_ids[0]),
+            (EmbedRowKind::Chunk, chunk_ids[1]),
+        ])
+        .unwrap();
+        h.db.mark_units_failed(&[(EmbedRowKind::Chunk, chunk_ids[2])], "超时")
+            .unwrap();
+        h.db.set_file_state(doc.id, FileState::Stale, Some("1 个片段待重试"))
+            .unwrap();
 
         // 模型暂时不可用：TextOnly 一轮
         let rec = h.db.file(doc.id).unwrap();
-        assert!(matches!(idx.prepare_text(&rec, false).unwrap(), Prepared::KeywordOnly));
-        h.db.set_file_state(doc.id, FileState::KeywordOnly, None).unwrap();
+        assert!(matches!(
+            idx.prepare_text(&rec, false).unwrap(),
+            Prepared::KeywordOnly
+        ));
+        h.db.set_file_state(doc.id, FileState::KeywordOnly, None)
+            .unwrap();
 
         // 旧逻辑此时会把文件留在 Done、永不补齐；新逻辑：模型就绪后按单元完整性回队列
-        assert_eq!(h.db.mark_missing_vectors().unwrap(), 1, "部分失败的文件必须回队列");
+        assert_eq!(
+            h.db.mark_missing_vectors().unwrap(),
+            1,
+            "部分失败的文件必须回队列"
+        );
         assert_eq!(h.db.file(doc.id).unwrap().state, FileState::Stale);
         assert!(h.db.has_incomplete_units(doc.id).unwrap());
         // 语义完整的文件不被误伤：所有片段 persisted 且映射有效
         let done_full = add_doc(&h, "full.md", "短的正文");
         let rec2 = h.db.file(done_full.id).unwrap();
-        let Prepared::Embed { keys: full_keys, .. } = idx.prepare_text(&rec2, true).unwrap() else {
+        let Prepared::Embed {
+            keys: full_keys, ..
+        } = idx.prepare_text(&rec2, true).unwrap()
+        else {
             panic!("应产出嵌入任务");
         };
-        h.db.activate_vec_rows(&full_keys.iter().filter_map(|k| parse_key(k).map(|(_, r, _)| r)).collect::<Vec<_>>()).unwrap();
+        h.db.activate_vec_rows(
+            &full_keys
+                .iter()
+                .filter_map(|k| parse_key(k).map(|(_, r, _)| r))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
         let full_chunks: Vec<(EmbedRowKind, i64)> =
-            h.db.chunk_rows(done_full.id).unwrap().into_iter().map(|(id, _)| (EmbedRowKind::Chunk, id)).collect();
+            h.db.chunk_rows(done_full.id)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| (EmbedRowKind::Chunk, id))
+                .collect();
         h.db.mark_units_persisted(&full_chunks).unwrap();
-        h.db.set_file_state(done_full.id, FileState::Done, None).unwrap();
-        assert_eq!(h.db.mark_missing_vectors().unwrap(), 0, "语义完整的文件不需要回队列");
+        h.db.set_file_state(done_full.id, FileState::Done, None)
+            .unwrap();
+        assert_eq!(
+            h.db.mark_missing_vectors().unwrap(),
+            0,
+            "语义完整的文件不需要回队列"
+        );
     }
 
     #[test]
     fn file_state_aggregates_from_units() {
         let h = harness();
-        h.db.add_root(&h.dir.path().to_string_lossy(), "test").unwrap();
+        h.db.add_root(&h.dir.path().to_string_lossy(), "test")
+            .unwrap();
         let doc = add_doc(&h, "agg.md", &"山间的雾。".repeat(80));
-        let chunks = h.db.sync_chunks(doc.id, &["一".into(), "二".into(), "三".into()]).unwrap();
+        let chunks =
+            h.db.sync_chunks(doc.id, &["一".into(), "二".into(), "三".into()])
+                .unwrap();
         let ids: Vec<i64> = chunks.iter().map(|(id, _)| *id).collect();
         let outcome = |ok: usize| FileOutcome {
             file_id: doc.id,
-            ok_units: ids[..ok].iter().map(|id| (EmbedRowKind::Chunk, *id, *id)).collect(),
-            failed_units: ids[ok..].iter().map(|id| (EmbedRowKind::Chunk, *id)).collect(),
+            ok_units: ids[..ok]
+                .iter()
+                .map(|id| (EmbedRowKind::Chunk, *id, *id))
+                .collect(),
+            failed_units: ids[ok..]
+                .iter()
+                .map(|id| (EmbedRowKind::Chunk, *id))
+                .collect(),
             total: ids.len(),
             err: Some("解码失败".into()),
         };
 
         // 0 成功 + 全部可重试 → stale，note 说明进度与原因
-        h.db
-            .mark_units_failed(&[(EmbedRowKind::Chunk, ids[0]), (EmbedRowKind::Chunk, ids[1]), (EmbedRowKind::Chunk, ids[2])], "解码失败")
-            .unwrap();
+        h.db.mark_units_failed(
+            &[
+                (EmbedRowKind::Chunk, ids[0]),
+                (EmbedRowKind::Chunk, ids[1]),
+                (EmbedRowKind::Chunk, ids[2]),
+            ],
+            "解码失败",
+        )
+        .unwrap();
         let (state, note) = aggregate_file_state(&h.db, doc.id, &outcome(0)).unwrap();
         assert_eq!(state, FileState::Stale);
-        assert!(note.as_deref().unwrap_or_default().contains("0/3"), "{note:?}");
+        assert!(
+            note.as_deref().unwrap_or_default().contains("0/3"),
+            "{note:?}"
+        );
 
         // 全部持久化 → done
-        h.db
-            .mark_units_persisted(&[(EmbedRowKind::Chunk, ids[0]), (EmbedRowKind::Chunk, ids[1]), (EmbedRowKind::Chunk, ids[2])])
-            .unwrap();
+        h.db.mark_units_persisted(&[
+            (EmbedRowKind::Chunk, ids[0]),
+            (EmbedRowKind::Chunk, ids[1]),
+            (EmbedRowKind::Chunk, ids[2]),
+        ])
+        .unwrap();
         let (state, note) = aggregate_file_state(&h.db, doc.id, &outcome(3)).unwrap();
         assert_eq!(state, FileState::Done);
         assert!(note.is_none());
 
         // 重试耗尽 → failed，带稳定原因
         for _ in 0..UNIT_RETRY_MAX {
-            h.db.mark_units_failed(&[(EmbedRowKind::Chunk, ids[0])], "持续超时").unwrap();
+            h.db.mark_units_failed(&[(EmbedRowKind::Chunk, ids[0])], "持续超时")
+                .unwrap();
         }
         let (state, note) = aggregate_file_state(&h.db, doc.id, &outcome(2)).unwrap();
         assert_eq!(state, FileState::Failed);
         let note = note.unwrap_or_default();
-        assert!(note.contains("重复失败") && note.contains("持续超时"), "{note}");
+        assert!(
+            note.contains("重复失败") && note.contains("持续超时"),
+            "{note}"
+        );
 
         // 图片：没有单元行，本轮产出向量即 done，否则 failed。
         let img = add_doc(&h, "p.jpg", "placeholder");
@@ -1730,7 +2113,10 @@ mod tests {
             total: 1,
             err: None,
         };
-        assert_eq!(aggregate_file_state(&h.db, img.id, &ok_img).unwrap().0, FileState::Done);
+        assert_eq!(
+            aggregate_file_state(&h.db, img.id, &ok_img).unwrap().0,
+            FileState::Done
+        );
         let bad_img = FileOutcome {
             file_id: img.id,
             ok_units: vec![],

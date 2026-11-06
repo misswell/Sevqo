@@ -19,7 +19,11 @@ use crate::state::AppState;
 /// range when it needs more, exactly like a streaming server.
 const CHUNK: u64 = 8 << 20;
 
-pub fn handle<R: Runtime>(ctx: UriSchemeContext<'_, R>, req: Request<Vec<u8>>, responder: UriSchemeResponder) {
+pub fn handle<R: Runtime>(
+    ctx: UriSchemeContext<'_, R>,
+    req: Request<Vec<u8>>,
+    responder: UriSchemeResponder,
+) {
     let state = ctx.app_handle().state::<Arc<AppState>>().inner().clone();
     let Some(id) = parse_id(req.uri().path()) else {
         return responder.respond(status(StatusCode::BAD_REQUEST, "路径格式错误"));
@@ -42,7 +46,13 @@ fn serve(state: &AppState, id: i64, range: &str) -> Response<Vec<u8>> {
     }
     let allowed = rec
         .root_id
-        .and_then(|rid| state.db.list_roots().ok().map(|roots| roots.iter().any(|r| r.id == rid && r.enabled)))
+        .and_then(|rid| {
+            state
+                .db
+                .list_roots()
+                .ok()
+                .map(|roots| roots.iter().any(|r| r.id == rid && r.enabled))
+        })
         .unwrap_or(false);
     if !allowed {
         return status(StatusCode::FORBIDDEN, "所属目录已停用或被删除");
@@ -73,13 +83,16 @@ fn serve(state: &AppState, id: i64, range: &str) -> Response<Vec<u8>> {
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::CONTENT_LENGTH, buf.len().to_string());
     builder = if partial {
-        builder
-            .status(StatusCode::PARTIAL_CONTENT)
-            .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{total}"))
+        builder.status(StatusCode::PARTIAL_CONTENT).header(
+            header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{total}"),
+        )
     } else {
         builder.status(StatusCode::OK)
     };
-    builder.body(buf).unwrap_or_else(|_| Response::new(Vec::new()))
+    builder
+        .body(buf)
+        .unwrap_or_else(|_| Response::new(Vec::new()))
 }
 
 /// `/video/<id>` — the `#t=` fragment never reaches the handler, so the start time is
@@ -105,15 +118,23 @@ fn span(raw: &str, total: u64) -> Option<(u64, u64)> {
     if head.is_empty() {
         // open start: the last N bytes
         let n = tail.parse::<u64>().ok()?.min(total).min(CHUNK);
-        if n == 0 { return None; }
+        if n == 0 {
+            return None;
+        }
         return Some((total - n, last));
     }
     let start = head.parse::<u64>().ok()?;
     if start > last {
         return None;
     }
-    let wanted = if tail.trim().is_empty() { last } else { tail.trim().parse::<u64>().ok()?.min(last) };
-    if wanted < start { return None; }
+    let wanted = if tail.trim().is_empty() {
+        last
+    } else {
+        tail.trim().parse::<u64>().ok()?.min(last)
+    };
+    if wanted < start {
+        return None;
+    }
     Some((start, wanted.min(start.saturating_add(CHUNK - 1))))
 }
 
@@ -185,7 +206,10 @@ mod tests {
     #[test]
     fn suffix_ranges_cannot_allocate_the_whole_video() {
         let total = 1 << 30;
-        assert_eq!(span("bytes=-1073741824", total), Some((total - CHUNK, total - 1)));
+        assert_eq!(
+            span("bytes=-1073741824", total),
+            Some((total - CHUNK, total - 1))
+        );
     }
 
     #[test]
@@ -193,7 +217,10 @@ mod tests {
         for range in ["bytes=10-1", "bytes=-0", "bytes=0-oops"] {
             assert_eq!(span(range, 100), None);
         }
-        assert_eq!(span("bytes=18446744073709551612-", u64::MAX), Some((u64::MAX - 3, u64::MAX - 1)));
+        assert_eq!(
+            span("bytes=18446744073709551612-", u64::MAX),
+            Some((u64::MAX - 3, u64::MAX - 1))
+        );
     }
 
     #[test]

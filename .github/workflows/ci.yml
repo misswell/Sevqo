@@ -26,11 +26,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo test
         run: cargo test --workspace
+      # 存量已于 2026-11-07 清零（含 --all-targets），现在两项都是阻塞门禁。
       - name: cargo clippy
-        continue-on-error: true # 存量警告清零后转为阻塞
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo fmt --check
-        continue-on-error: true # 全仓一次性 normalize 后转为阻塞
         run: cargo fmt --check
 
   frontend:

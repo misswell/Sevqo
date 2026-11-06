@@ -16,20 +16,22 @@ impl Kind {
     pub fn from_ext(ext: &str) -> Kind {
         let e = ext.to_ascii_lowercase();
         match e.as_str() {
-            "jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp" | "tif" | "tiff" | "heic" | "heif" | "avif" | "dng" => {
-                Kind::Image
-            }
-            "mp4" | "mov" | "m4v" | "mkv" | "avi" | "webm" | "wmv" | "flv" | "mpg" | "mpeg" | "3gp" | "mts"
-            | "m2ts" => Kind::Video,
+            "jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp" | "tif" | "tiff" | "heic" | "heif"
+            | "avif" | "dng" => Kind::Image,
+            "mp4" | "mov" | "m4v" | "mkv" | "avi" | "webm" | "wmv" | "flv" | "mpg" | "mpeg"
+            | "3gp" | "mts" | "m2ts" => Kind::Video,
             // 注意 ".ts" 不能加进视频表：它是 TypeScript 源码的主流扩展名，归成视频会让
             // probe 失败、正文丢失。MPEG-TS 素材一般用 .mts/.m2ts。
-            "pdf" | "doc" | "docx" | "rtf" | "odt" | "txt" | "md" | "markdown" | "mdx" | "epub" | "pptx" | "xlsx"
-            | "csv" | "tsv" | "org" | "rst" | "log" => Kind::Document,
-            "rs" | "go" | "py" | "ts" | "tsx" | "js" | "jsx" | "java" | "kt" | "swift" | "c" | "h" | "cpp" | "hpp"
-            | "cc" | "rb" | "php" | "sql" | "sh" | "zsh" | "bash" | "json" | "json5" | "yaml" | "yml" | "toml"
-            | "ini" | "xml" | "html" | "css" | "scss" | "vue" | "lua" | "r" | "m" | "mm" | "dart" | "scala"
-            | "gradle" | "dockerfile" | "tf" | "proto" => Kind::Code,
-            "mp3" | "wav" | "m4a" | "aac" | "flac" | "ogg" | "oga" | "opus" | "wma" | "aiff" => Kind::Audio,
+            "pdf" | "doc" | "docx" | "rtf" | "odt" | "txt" | "md" | "markdown" | "mdx" | "epub"
+            | "pptx" | "xlsx" | "csv" | "tsv" | "org" | "rst" | "log" => Kind::Document,
+            "rs" | "go" | "py" | "ts" | "tsx" | "js" | "jsx" | "java" | "kt" | "swift" | "c"
+            | "h" | "cpp" | "hpp" | "cc" | "rb" | "php" | "sql" | "sh" | "zsh" | "bash"
+            | "json" | "json5" | "yaml" | "yml" | "toml" | "ini" | "xml" | "html" | "css"
+            | "scss" | "vue" | "lua" | "r" | "m" | "mm" | "dart" | "scala" | "gradle"
+            | "dockerfile" | "tf" | "proto" => Kind::Code,
+            "mp3" | "wav" | "m4a" | "aac" | "flac" | "ogg" | "oga" | "opus" | "wma" | "aiff" => {
+                Kind::Audio
+            }
             _ => Kind::Other,
         }
     }
@@ -270,9 +272,19 @@ pub struct VecRow {
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum EmbedItem {
     #[serde(rename_all = "camelCase")]
-    Text { key: String, text: String, title: Option<String>, role: String },
+    Text {
+        key: String,
+        text: String,
+        title: Option<String>,
+        role: String,
+    },
     #[serde(rename_all = "camelCase")]
-    Image { key: String, path: String, #[serde(skip_serializing_if = "Option::is_none")] thumb: Option<String> },
+    Image {
+        key: String,
+        path: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thumb: Option<String>,
+    },
     #[serde(rename_all = "camelCase")]
     Video {
         key: String,

@@ -25,7 +25,10 @@ impl Paths {
             .join("Sevqo");
         let model_dir = match model_home {
             Some(p) if !p.is_empty() => PathBuf::from(p),
-            _ => cache_dir.join("models").join("google").join("embeddinggemma-2"),
+            _ => cache_dir
+                .join("models")
+                .join("google")
+                .join("embeddinggemma-2"),
         };
         let thumb_dir = cache_dir.join("thumbs");
         Ok(Paths {

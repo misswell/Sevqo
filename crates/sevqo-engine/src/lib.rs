@@ -3,6 +3,7 @@ pub mod db;
 pub mod error;
 pub mod extract;
 pub mod infer;
+pub mod integrity;
 pub mod jobs;
 pub mod model;
 pub mod net;

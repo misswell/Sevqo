@@ -91,7 +91,11 @@ pub fn python_binary(settings: &Settings, preferred: Option<&str>) -> Option<Pat
         for rel in ["../inference", "inference"] {
             let manifest = root.join(rel);
             if manifest.join("sevqo_embed").is_dir() {
-                for py in [".venv/bin/python", ".venv/Scripts/python.exe", "venv/bin/python"] {
+                for py in [
+                    ".venv/bin/python",
+                    ".venv/Scripts/python.exe",
+                    "venv/bin/python",
+                ] {
                     let c = root.join(py);
                     if c.exists() {
                         return Some(c);
@@ -128,10 +132,7 @@ fn package_root(paths: &Paths) -> Option<PathBuf> {
     package_root_in(candidate_roots(), paths)
 }
 
-fn package_root_in(
-    roots: impl IntoIterator<Item = PathBuf>,
-    paths: &Paths,
-) -> Option<PathBuf> {
+fn package_root_in(roots: impl IntoIterator<Item = PathBuf>, paths: &Paths) -> Option<PathBuf> {
     for root in roots {
         for rel in ["../inference", "inference", "../../inference"] {
             let dir = root.join(rel);
@@ -153,8 +154,14 @@ impl Client {
         if let Some(root) = package_root(paths) {
             env.insert("PYTHONPATH".into(), root.to_string_lossy().to_string());
         }
-        env.insert("SEVQO_MODEL_HOME".into(), paths.model_dir.to_string_lossy().to_string());
-        env.insert("OMP_NUM_THREADS".into(), settings.infer_threads.max(1).to_string());
+        env.insert(
+            "SEVQO_MODEL_HOME".into(),
+            paths.model_dir.to_string_lossy().to_string(),
+        );
+        env.insert(
+            "OMP_NUM_THREADS".into(),
+            settings.infer_threads.max(1).to_string(),
+        );
         Client {
             inner: Arc::new(Mutex::new(None)),
             pid: AtomicU32::new(0),
@@ -210,8 +217,14 @@ impl Client {
                 args[0]
             ))
         })?;
-        let stdin = child.stdin.take().ok_or_else(|| Error::Infer("缺少 stdin".into()))?;
-        let stdout = child.stdout.take().ok_or_else(|| Error::Infer("缺少 stdout".into()))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| Error::Infer("缺少 stdin".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::Infer("缺少 stdout".into()))?;
         let (tx, rx) = crossbeam_channel::unbounded();
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
@@ -232,7 +245,10 @@ impl Client {
     }
 
     fn session(&self) -> Result<std::sync::MutexGuard<'_, Option<Session>>> {
-        let mut guard = self.inner.lock().map_err(|_| Error::Infer("锁中毒".into()))?;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| Error::Infer("锁中毒".into()))?;
         if guard.is_none() {
             let s = self.start()?;
             self.pid.store(s.child.id(), Ordering::Relaxed);
@@ -269,7 +285,9 @@ impl Client {
         let line = serde_json::to_string(&Value::Object(req))?;
 
         let attempt = |guard: &mut Option<Session>| -> Result<Value> {
-            let s = guard.as_mut().ok_or_else(|| Error::Infer("进程未启动".into()))?;
+            let s = guard
+                .as_mut()
+                .ok_or_else(|| Error::Infer("进程未启动".into()))?;
             s.stdin.write_all(line.as_bytes())?;
             s.stdin.write_all(b"\n")?;
             s.stdin.flush()?;
@@ -308,14 +326,28 @@ impl Client {
         let v = self.request(json!({"cmd": "info"}), Duration::from_secs(600))?;
         if v.get("ok").and_then(Value::as_bool) != Some(true) {
             return Err(Error::Infer(
-                v.get("error").and_then(Value::as_str).unwrap_or("模型加载失败").to_string(),
+                v.get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("模型加载失败")
+                    .to_string(),
             ));
         }
         Ok(RuntimeInfo {
-            device: v.get("device").and_then(Value::as_str).unwrap_or("?").to_string(),
-            dtype: v.get("dtype").and_then(Value::as_str).unwrap_or("?").to_string(),
+            device: v
+                .get("device")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .to_string(),
+            dtype: v
+                .get("dtype")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .to_string(),
             dim: v.get("dim").and_then(Value::as_u64).unwrap_or(0) as usize,
-            params_millions: v.get("params_millions").and_then(Value::as_f64).unwrap_or(0.0),
+            params_millions: v
+                .get("params_millions")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0),
             load_seconds: v.get("load_seconds").and_then(Value::as_f64).unwrap_or(0.0),
             vision: v.get("vision").and_then(Value::as_bool).unwrap_or(false),
             audio: v.get("audio").and_then(Value::as_bool).unwrap_or(false),
@@ -326,7 +358,12 @@ impl Client {
 
     /// Embed one batch. Query-role text takes the search-instruction prefix, documents
     /// take the `title: … | text: …` form; media items take no prefix.
-    pub fn embed(&self, items: &[EmbedItem], batch: usize, timeout: Duration) -> Result<EmbedResponse> {
+    pub fn embed(
+        &self,
+        items: &[EmbedItem],
+        batch: usize,
+        timeout: Duration,
+    ) -> Result<EmbedResponse> {
         if items.is_empty() {
             return Ok(EmbedResponse::default());
         }
@@ -338,7 +375,10 @@ impl Client {
         let v = self.request(payload, timeout)?;
         if v.get("ok").and_then(Value::as_bool) == Some(false) && v.get("vectors").is_none() {
             return Err(Error::Infer(
-                v.get("error").and_then(Value::as_str).unwrap_or("嵌入失败").to_string(),
+                v.get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("嵌入失败")
+                    .to_string(),
             ));
         }
         let mut resp: EmbedResponse = serde_json::from_value(v.clone()).unwrap_or_default();
@@ -363,10 +403,16 @@ impl Client {
     }
 
     pub fn probe(&self, path: &Path, timeout: Duration) -> Result<ProbeInfo> {
-        let v = self.request(json!({"cmd": "probe", "path": path.to_string_lossy()}), timeout)?;
+        let v = self.request(
+            json!({"cmd": "probe", "path": path.to_string_lossy()}),
+            timeout,
+        )?;
         if v.get("ok").and_then(Value::as_bool) != Some(true) {
             return Err(Error::Infer(
-                v.get("error").and_then(Value::as_str).unwrap_or("无法解析媒体").to_string(),
+                v.get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("无法解析媒体")
+                    .to_string(),
             ));
         }
         Ok(ProbeInfo {
@@ -379,19 +425,31 @@ impl Client {
         })
     }
 
-    pub fn extract_pdf(&self, path: &Path, max_chars: usize) -> Result<(Option<String>, String, bool)> {
+    pub fn extract_pdf(
+        &self,
+        path: &Path,
+        max_chars: usize,
+    ) -> Result<(Option<String>, String, bool)> {
         let v = self.request(
             json!({"cmd": "text", "path": path.to_string_lossy(), "maxChars": max_chars}),
             Duration::from_secs(120),
         )?;
         if v.get("ok").and_then(Value::as_bool) != Some(true) {
             return Err(Error::Unsupported(
-                v.get("error").and_then(Value::as_str).unwrap_or("PDF 解析失败").to_string(),
+                v.get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("PDF 解析失败")
+                    .to_string(),
             ));
         }
         Ok((
-            v.get("title").and_then(Value::as_str).map(|s| s.to_string()),
-            v.get("text").and_then(Value::as_str).unwrap_or("").to_string(),
+            v.get("title")
+                .and_then(Value::as_str)
+                .map(|s| s.to_string()),
+            v.get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
             v.get("truncated").and_then(Value::as_bool).unwrap_or(false),
         ))
     }
@@ -430,9 +488,13 @@ impl Client {
 /// Kill a child whose `Child` handle is unreachable because a request owns the mutex.
 fn terminate(pid: u32) {
     #[cfg(unix)]
-    let _ = Command::new("/bin/kill").args(["-9", &pid.to_string()]).status();
+    let _ = Command::new("/bin/kill")
+        .args(["-9", &pid.to_string()])
+        .status();
     #[cfg(windows)]
-    let _ = Command::new("taskkill").args(["/PID", &pid.to_string(), "/F"]).status();
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F"])
+        .status();
 }
 
 trait WaitTimeout {
@@ -475,8 +537,10 @@ mod tests {
     fn program_line_targets_the_sidecar_module() {
         let dir = tempfile::tempdir().unwrap();
         let paths = paths_in(&dir);
-        let mut st = Settings::default();
-        st.infer_python = Some("/opt/py/bin/python".into());
+        let st = Settings {
+            infer_python: Some("/opt/py/bin/python".into()),
+            ..Settings::default()
+        };
         let c = Client::new(&paths, &st);
         assert_eq!(c.program[0], "/opt/py/bin/python");
         assert!(c.program.iter().any(|a| a == "serve"));
@@ -516,7 +580,10 @@ mod tests {
         let paths = paths_in(&dir);
         let st = Settings::default();
         let c = Client::new(&paths, &st);
-        assert!(!c.args().iter().any(|a| a == "--text-only"), "media on by default");
+        assert!(
+            !c.args().iter().any(|a| a == "--text-only"),
+            "media on by default"
+        );
         c.set_needs_vision(false);
         assert!(c.args().iter().any(|a| a == "--text-only"));
         c.set_needs_vision(true);
@@ -527,8 +594,10 @@ mod tests {
     fn missing_python_reports_actionable_error() {
         let dir = tempfile::tempdir().unwrap();
         let paths = paths_in(&dir);
-        let mut st = Settings::default();
-        st.infer_python = Some("/nonexistent/python".into());
+        let st = Settings {
+            infer_python: Some("/nonexistent/python".into()),
+            ..Settings::default()
+        };
         let c = Client::new(&paths, &st);
         let err = c.load().unwrap_err().to_string();
         assert!(err.contains("Python") || err.contains("启动"), "{err}");

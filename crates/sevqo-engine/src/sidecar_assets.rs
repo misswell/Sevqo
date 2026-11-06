@@ -111,7 +111,10 @@ mod tests {
             .filter(|n| n.ends_with(".py"))
             .collect::<Vec<_>>();
         on_disk.sort();
-        let mut embedded = MODULES.iter().map(|(n, _)| n.to_string()).collect::<Vec<_>>();
+        let mut embedded = MODULES
+            .iter()
+            .map(|(n, _)| n.to_string())
+            .collect::<Vec<_>>();
         embedded.sort();
         assert_eq!(embedded, on_disk, "inference/sevqo_embed changed shape");
     }
@@ -121,7 +124,10 @@ mod tests {
     /// import, so it runs on demand: `SEVQO_TEST_PYTHON=.venv/bin/python cargo test -p sevqo-engine`.
     #[test]
     fn staged_package_imports() {
-        let Some(py) = std::env::var("SEVQO_TEST_PYTHON").ok().filter(|s| !s.is_empty()) else {
+        let Some(py) = std::env::var("SEVQO_TEST_PYTHON")
+            .ok()
+            .filter(|s| !s.is_empty())
+        else {
             return;
         };
         let dir = tempfile::tempdir().unwrap();

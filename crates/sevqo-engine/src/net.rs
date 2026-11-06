@@ -86,7 +86,11 @@ mod tests {
             proxy_authority("http://user:pw@proxy.local:8080/with/path"),
             Some(("proxy.local".into(), 8080))
         );
-        assert_eq!(proxy_authority("http://127.0.0.1"), None, "a port is required");
+        assert_eq!(
+            proxy_authority("http://127.0.0.1"),
+            None,
+            "a port is required"
+        );
         assert_eq!(proxy_authority(""), None);
         assert_eq!(proxy_authority("http://host:notaport"), None);
     }

@@ -21,7 +21,8 @@ use sevqo_engine::search::Searcher;
 use sevqo_engine::vectors;
 use sevqo_engine::watch::{apply_change_with_options, Applied, Change, WatcherHandle};
 use sevqo_engine::{
-    FileRecord, Filters, Hit, Kind, Moment, Paths, Phase, Progress, Root, SearchRequest, SearchResponse, Settings,
+    FileRecord, Filters, Hit, Kind, Moment, Paths, Phase, Progress, Root, SearchRequest,
+    SearchResponse, Settings,
 };
 
 use crate::state::AppState;
@@ -226,11 +227,14 @@ pub async fn set_settings(app: AppHandle, next: Settings) -> Res<Settings> {
             return Err(format!("当前版本仅支持模型 {}", model::MODEL_REPO));
         }
         let dim_changed = old.vector_dim != cfg.vector_dim;
-        let runtime_changed = dim_changed || old.infer_python != cfg.infer_python
+        let runtime_changed = dim_changed
+            || old.infer_python != cfg.infer_python
             || old.infer_threads != cfg.infer_threads
             || (old.index_images || old.index_video) != (cfg.index_images || cfg.index_video);
         if dim_changed && st.db.alive_vec_rows().map_err(es)? > 0 {
-            return Err("修改向量维度需要重建索引：确认后会清空现有向量并重新编码全部文件。".to_string());
+            return Err(
+                "修改向量维度需要重建索引：确认后会清空现有向量并重新编码全部文件。".to_string(),
+            );
         }
         if dim_changed {
             vectors::wipe(&st.vector_path, &st.db).map_err(es)?;
@@ -238,11 +242,15 @@ pub async fn set_settings(app: AppHandle, next: Settings) -> Res<Settings> {
         }
         let shortcut_changed = old.global_shortcut != cfg.global_shortcut;
         if shortcut_changed {
-            app.global_shortcut().register(cfg.global_shortcut.as_str()).map_err(es)?;
+            app.global_shortcut()
+                .register(cfg.global_shortcut.as_str())
+                .map_err(es)?;
         }
         if let Err(e) = cfg.save(&st.paths.settings_path) {
             if shortcut_changed {
-                let _ = app.global_shortcut().unregister(cfg.global_shortcut.as_str());
+                let _ = app
+                    .global_shortcut()
+                    .unregister(cfg.global_shortcut.as_str());
             }
             return Err(es(e));
         }
@@ -259,7 +267,9 @@ pub async fn set_settings(app: AppHandle, next: Settings) -> Res<Settings> {
             st.configure_client(&cfg);
         }
         if shortcut_changed {
-            let _ = app.global_shortcut().unregister(old.global_shortcut.as_str());
+            let _ = app
+                .global_shortcut()
+                .unregister(old.global_shortcut.as_str());
         }
         let _ = st.db.set_meta("vector_dim", &cfg.vector_dim.to_string());
         if exclusions_changed {
@@ -302,18 +312,29 @@ fn purge_excluded_files(st: &Arc<AppState>) -> Res<usize> {
 /// 向量空间来自另一个模型，维度相同也绝不能混用——清空向量与单元状态，保留 FTS，
 /// 由下一轮 Full 对账重建语义索引。
 pub(crate) fn ensure_model_revision_compat(st: &Arc<AppState>, expected: &str) -> Res<()> {
-    match st.db.get_meta("model_revision") {
+    ensure_model_revision_compat_db(&st.db, &st.vector_path, expected)
+}
+
+/// 核心逻辑与 AppState 解耦，启动序列在 AppState 构建前也能调用。
+pub(crate) fn ensure_model_revision_compat_db(
+    db: &Db,
+    vector_base: &Path,
+    expected: &str,
+) -> Res<()> {
+    match db.get_meta("model_revision") {
         Some(prev) if prev != expected => {
-            tracing::warn!("模型 revision 变更（{prev} → {expected}）：重置语义索引（保留关键词索引）");
-            sevqo_engine::vectors::wipe(&st.vector_path, &st.db).map_err(es)?;
-            st.db.reset_vectors().map_err(es)?;
-            st.db.mark_missing_vectors().map_err(es)?;
-            st.db.set_meta("model_revision", expected).map_err(es)?;
+            tracing::warn!(
+                "模型 revision 变更（{prev} → {expected}）：重置语义索引（保留关键词索引）"
+            );
+            sevqo_engine::vectors::wipe(vector_base, db).map_err(es)?;
+            db.reset_vectors().map_err(es)?;
+            db.mark_missing_vectors().map_err(es)?;
+            db.set_meta("model_revision", expected).map_err(es)?;
         }
         Some(_) => {}
         None => {
             // 首次运行：尚无向量归属记录，只登记当前 revision。
-            st.db.set_meta("model_revision", expected).map_err(es)?;
+            db.set_meta("model_revision", expected).map_err(es)?;
         }
     }
     Ok(())
@@ -365,7 +386,11 @@ pub async fn add_root(app: AppHandle, path: String, label: Option<String>) -> Re
         }
         // 父子目录不得同时作为根目录（P1）：文件归属是单值的，删除父目录会连带清掉
         // 实际属于子目录范围的索引。用 canonicalize 比较，绕过符号链接与 ../ 的障眼法。
-        let norm = |p: &std::path::Path| p.canonicalize().map(|c| c.to_string_lossy().into_owned()).unwrap_or_else(|_| p.to_string_lossy().into_owned());
+        let norm = |p: &std::path::Path| {
+            p.canonicalize()
+                .map(|c| c.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| p.to_string_lossy().into_owned())
+        };
         let new_norm = norm(&expanded);
         for r in &existing {
             let old_norm = norm(&expand(&r.path));
@@ -378,9 +403,17 @@ pub async fn add_root(app: AppHandle, path: String, label: Option<String>) -> Re
                 ));
             }
         }
-        let name = label.filter(|l| !l.trim().is_empty()).unwrap_or_else(|| dir_label(&expanded));
+        let name = label
+            .filter(|l| !l.trim().is_empty())
+            .unwrap_or_else(|| dir_label(&expanded));
         let id = st.db.add_root(&s, &name).map_err(es)?;
-        let root = st.db.list_roots().map_err(es)?.into_iter().find(|r| r.id == id).ok_or("无法读取新建目录")?;
+        let root = st
+            .db
+            .list_roots()
+            .map_err(es)?
+            .into_iter()
+            .find(|r| r.id == id)
+            .ok_or("无法读取新建目录")?;
         let _ = restart_watcher(&st, &handle);
         Ok(root)
     })
@@ -437,7 +470,8 @@ pub async fn rescan(app: AppHandle, root_id: Option<i64>) -> Res<ScanReport> {
         let _permit = st.try_begin_index().ok_or("请先停止正在运行的索引或扫描")?;
         st.control.reset();
         scan_all(&st, root_id)
-    }).await
+    })
+    .await
 }
 
 fn scan_all(st: &Arc<AppState>, root_id: Option<i64>) -> Res<ScanReport> {
@@ -445,7 +479,8 @@ fn scan_all(st: &Arc<AppState>, root_id: Option<i64>) -> Res<ScanReport> {
     let mode = auto_mode(st);
     let (tx, _rx) = crossbeam_channel::unbounded::<Progress>();
     // a scan-only indexer: no client, so nothing is embedded here
-    let idx = Indexer::new(st.db.clone(), st.paths.clone(), st.settings(), None, tx).with_control(st.control.clone());
+    let idx = Indexer::new(st.db.clone(), st.paths.clone(), st.settings(), None, tx)
+        .with_control(st.control.clone());
     let roots: Vec<Root> = st
         .db
         .list_roots()
@@ -491,7 +526,12 @@ fn scan_all(st: &Arc<AppState>, root_id: Option<i64>) -> Res<ScanReport> {
 // ------------------------------------------------------------------ indexing
 
 #[tauri::command]
-pub fn index_start(app: AppHandle, mode: Option<String>, max_files: Option<usize>, scan: Option<bool>) -> Res<()> {
+pub fn index_start(
+    app: AppHandle,
+    mode: Option<String>,
+    max_files: Option<usize>,
+    scan: Option<bool>,
+) -> Res<()> {
     let st = app_state(&app);
     let m = match mode.as_deref() {
         Some("text") | Some("textOnly") | Some("text_only") => Mode::TextOnly,
@@ -517,7 +557,9 @@ pub(crate) fn spawn_index_thread(
         .name("sevqo-index".into())
         .spawn(move || {
             let _permit = permit;
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_index(&app2, &st2, mode, max_files, scan_first)));
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_index(&app2, &st2, mode, max_files, scan_first)
+            }));
             let failure: Option<String> = match outcome {
                 Err(_) => {
                     tracing::error!("索引线程异常终止");
@@ -529,7 +571,15 @@ pub(crate) fn spawn_index_thread(
             if let Some(message) = failure {
                 // 带上累计值：清零会让界面上的数字在这一帧凭空消失。
                 let last = st2.progress_snapshot();
-                emit_progress(&st2, &app2, Progress { phase: Phase::Failed, message: Some(message), ..last });
+                emit_progress(
+                    &st2,
+                    &app2,
+                    Progress {
+                        phase: Phase::Failed,
+                        message: Some(message),
+                        ..last
+                    },
+                );
             }
         })
         .map_err(es)?;
@@ -549,7 +599,13 @@ pub fn index_progress(app: AppHandle) -> Progress {
     app_state(&app).progress_snapshot()
 }
 
-fn run_index(app: &AppHandle, st: &Arc<AppState>, mode: Mode, max_files: Option<usize>, scan_first: bool) -> Res<()> {
+fn run_index(
+    app: &AppHandle,
+    st: &Arc<AppState>,
+    mode: Mode,
+    max_files: Option<usize>,
+    scan_first: bool,
+) -> Res<()> {
     let (tx, rx) = crossbeam_channel::unbounded::<Progress>();
     let fwd = {
         let app = app.clone();
@@ -567,18 +623,38 @@ fn run_index(app: &AppHandle, st: &Arc<AppState>, mode: Mode, max_files: Option<
     } else {
         Some(st.client())
     };
-    let idx = Indexer::new(st.db.clone(), st.paths.clone(), cfg, client, tx.clone()).with_control(st.control.clone());
+    let idx = Indexer::new(st.db.clone(), st.paths.clone(), cfg, client, tx.clone())
+        .with_control(st.control.clone());
     let result = (|| -> Res<IndexReport> {
         if mode == Mode::Full {
             st.db.mark_missing_vectors().map_err(es)?;
         }
         if scan_first {
             // 新一轮开始：计数从零起，别把上一轮的残留带进来。
-            emit_progress(st, app, Progress { phase: Phase::Scanning, message: Some("正在扫描目录".into()), ..Default::default() });
+            emit_progress(
+                st,
+                app,
+                Progress {
+                    phase: Phase::Scanning,
+                    message: Some("正在扫描目录".into()),
+                    ..Default::default()
+                },
+            );
             let rep = scan_all(st, None)?;
-            tracing::info!("扫描完成：{} 个候选，排队 {} 个", rep.candidates, rep.queued);
+            tracing::info!(
+                "扫描完成：{} 个候选，排队 {} 个",
+                rep.candidates,
+                rep.queued
+            );
         }
-        emit_progress(st, app, Progress { phase: Phase::Indexing, ..Default::default() });
+        emit_progress(
+            st,
+            app,
+            Progress {
+                phase: Phase::Indexing,
+                ..Default::default()
+            },
+        );
         let sum = idx.run(mode, max_files).map_err(es)?;
         Ok(IndexReport {
             done: sum.done,
@@ -586,16 +662,33 @@ fn run_index(app: &AppHandle, st: &Arc<AppState>, mode: Mode, max_files: Option<
             skipped: sum.skipped,
             vectors: sum.vectors,
             ms: sum.ms,
-            mode: if mode == Mode::Full { "full".into() } else { "text".into() },
+            mode: if mode == Mode::Full {
+                "full".into()
+            } else {
+                "text".into()
+            },
         })
     })();
     close_progress(idx, tx, fwd);
     match &result {
         // 收尾那一帧由 Indexer 自己发（它手上才有累计值），这里再发一帧只会把计数冲掉。
-        Ok(rep) => tracing::info!("索引一轮完成：{} 成功 / {} 失败 / {} 跳过", rep.done, rep.failed, rep.skipped),
+        Ok(rep) => tracing::info!(
+            "索引一轮完成：{} 成功 / {} 失败 / {} 跳过",
+            rep.done,
+            rep.failed,
+            rep.skipped
+        ),
         Err(msg) => {
             let last = st.progress_snapshot();
-            emit_progress(st, app, Progress { phase: Phase::Failed, message: Some(msg.clone()), ..last });
+            emit_progress(
+                st,
+                app,
+                Progress {
+                    phase: Phase::Failed,
+                    message: Some(msg.clone()),
+                    ..last
+                },
+            );
         }
     }
     result.map(|_| ())
@@ -646,12 +739,16 @@ pub async fn compact_vectors(app: AppHandle) -> Res<usize> {
     block(move || {
         let _permit = st.try_begin_index().ok_or("请等待索引完成后再压缩向量")?;
         let _vectors = st.vector_access.write().map_err(es)?;
-        Ok(compact(&st.db, &st.vector_path, st.vector_dim()).map_err(es)?)
+        compact(&st.db, &st.vector_path, st.vector_dim()).map_err(es)
     })
     .await
 }
 
-fn close_progress(idx: Indexer, tx: crossbeam_channel::Sender<Progress>, fwd: std::thread::JoinHandle<()>) {
+fn close_progress(
+    idx: Indexer,
+    tx: crossbeam_channel::Sender<Progress>,
+    fwd: std::thread::JoinHandle<()>,
+) {
     // The indexer also owns a sender; dropping only `tx` leaves recv() waiting forever.
     drop(idx);
     drop(tx);
@@ -682,11 +779,19 @@ pub async fn search_keyword(app: AppHandle, req: SearchRequest) -> Res<SearchRes
 /// 以图搜图 / 以视频片段搜视频: the query is a media file, so only the semantic channel
 /// applies. The file's own kind decides which way it is encoded and what it is matched against.
 #[tauri::command]
-pub async fn search_media(app: AppHandle, path: String, limit: Option<usize>, kinds: Option<Vec<Kind>>, filters: Option<Filters>) -> Res<SearchResponse> {
+pub async fn search_media(
+    app: AppHandle,
+    path: String,
+    limit: Option<usize>,
+    kinds: Option<Vec<Kind>>,
+    filters: Option<Filters>,
+) -> Res<SearchResponse> {
     let st = app_state(&app);
     block(move || {
         if !st.can_infer() {
-            return Err("媒体检索需要先下载模型权重（约 1.49 GB），点「下载模型」即可开始".to_string());
+            return Err(
+                "媒体检索需要先下载模型权重（约 1.49 GB），点「下载模型」即可开始".to_string(),
+            );
         }
         let s = st.settings();
         if !(s.index_images || s.index_video) {
@@ -697,11 +802,22 @@ pub async fn search_media(app: AppHandle, path: String, limit: Option<usize>, ki
         if !p.is_file() {
             return Err(format!("文件不存在：{}", p.display()));
         }
-        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
         let kind = Kind::from_ext(&ext);
         let v = match kind {
-            Kind::Image => sevqo_engine::search::query_vector_from_image(&st.client(), &p, s.infer_batch),
-            Kind::Video => sevqo_engine::search::query_vector_from_video(&st.client(), &p, s.video_window_s, s.infer_batch),
+            Kind::Image => {
+                sevqo_engine::search::query_vector_from_image(&st.client(), &p, s.infer_batch)
+            }
+            Kind::Video => sevqo_engine::search::query_vector_from_video(
+                &st.client(),
+                &p,
+                s.video_window_s,
+                s.infer_batch,
+            ),
             _ => return Err(format!("不支持用 .{ext} 作为查询，支持图片与视频文件")),
         }
         .map_err(es)?;
@@ -750,35 +866,59 @@ pub async fn moments(app: AppHandle, file_id: i64) -> Res<Vec<Moment>> {
             .cloned()
             .unwrap_or_default()
             .into_iter()
-            .map(|(clip_id, start_ms, end_ms, score, thumb)| Moment { clip_id, start_ms, end_ms, score, thumb })
+            .map(|(clip_id, start_ms, end_ms, score, thumb)| Moment {
+                clip_id,
+                start_ms,
+                end_ms,
+                score,
+                thumb,
+            })
             .collect())
     })
     .await
 }
 
 /// Query embedding is best-effort: a dead sidecar must not turn into a failed search.
-fn resolve_query_vector(st: &Arc<AppState>, searcher: &Searcher, req: &SearchRequest) -> (Option<Vec<f32>>, Option<String>) {
+fn resolve_query_vector(
+    st: &Arc<AppState>,
+    searcher: &Searcher,
+    req: &SearchRequest,
+) -> (Option<Vec<f32>>, Option<String>) {
     if !req.semantic {
         return (None, None);
     }
     let dim = searcher.vector_dim();
     if dim == 0 {
-        return (None, Some("还没有语义索引，仅按文件名与正文匹配".to_string()));
+        return (
+            None,
+            Some("还没有语义索引，仅按文件名与正文匹配".to_string()),
+        );
     }
     if !st.can_infer() {
         return (None, Some("模型未就绪，仅按文件名与正文匹配".to_string()));
     }
-    match sevqo_engine::search::query_vector(&st.client(), req.query.trim(), st.settings().infer_batch) {
+    match sevqo_engine::search::query_vector(
+        &st.client(),
+        req.query.trim(),
+        st.settings().infer_batch,
+    ) {
         Ok(v) if v.len() == dim => (Some(v), None),
         Ok(v) => (
             None,
-            Some(format!("查询向量维度 {} 与索引维度 {dim} 不一致，需要重建索引", v.len())),
+            Some(format!(
+                "查询向量维度 {} 与索引维度 {dim} 不一致，需要重建索引",
+                v.len()
+            )),
         ),
         Err(e) => (None, Some(format!("语义检索暂不可用：{e}"))),
     }
 }
 
-fn run_search(st: &Arc<AppState>, mut req: SearchRequest, injected: Option<Vec<f32>>) -> Res<SearchResponse> {
+fn run_search(
+    st: &Arc<AppState>,
+    mut req: SearchRequest,
+    injected: Option<Vec<f32>>,
+) -> Res<SearchResponse> {
     let _vectors = st.vector_access.read().map_err(es)?;
     req.limit = req.limit.clamp(1, 500);
     // 纯关键词请求不碰向量文件：向量库损坏时 FTS 必须照常可用（P2-04）。
@@ -790,7 +930,10 @@ fn run_search(st: &Arc<AppState>, mut req: SearchRequest, injected: Option<Vec<f
         Some(v) => {
             let dim = searcher.vector_dim();
             if dim != 0 && v.len() != dim {
-                (None, Some(format!("查询向量维度 {} 与索引维度 {dim} 不一致", v.len())))
+                (
+                    None,
+                    Some(format!("查询向量维度 {} 与索引维度 {dim} 不一致", v.len())),
+                )
             } else if dim == 0 {
                 (None, Some("还没有语义索引，无法按图片检索".to_string()))
             } else {
@@ -817,13 +960,22 @@ fn data_url(path: &Path) -> Option<String> {
     if bytes.is_empty() {
         return None;
     }
-    let mime = match path.extension().and_then(|e| e.to_str()).unwrap_or("jpg").to_ascii_lowercase().as_str() {
+    let mime = match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("jpg")
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "png" => "image/png",
         "webp" => "image/webp",
         "heic" | "heif" => "image/heif",
         _ => "image/jpeg",
     };
-    Some(format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes)))
+    Some(format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    ))
 }
 
 #[tauri::command]
@@ -831,7 +983,10 @@ pub async fn thumb(app: AppHandle, file_id: i64) -> Res<Option<String>> {
     let st = app_state(&app);
     block(move || {
         let thumb = st.db.file(file_id).and_then(|f| f.thumb);
-        Ok(thumb.as_deref().map(PathBuf::from).and_then(|p| data_url(&p)))
+        Ok(thumb
+            .as_deref()
+            .map(PathBuf::from)
+            .and_then(|p| data_url(&p)))
     })
     .await
 }
@@ -841,8 +996,14 @@ pub async fn clip_thumb(app: AppHandle, file_id: i64, clip_id: i64) -> Res<Optio
     let st = app_state(&app);
     block(move || {
         let rows = st.db.clip_rows(file_id).map_err(es)?;
-        let path = rows.into_iter().find(|(id, ..)| *id == clip_id).and_then(|(_, _, _, _, thumb)| thumb);
-        Ok(path.as_deref().map(PathBuf::from).and_then(|p| data_url(&p)))
+        let path = rows
+            .into_iter()
+            .find(|(id, ..)| *id == clip_id)
+            .and_then(|(_, _, _, _, thumb)| thumb);
+        Ok(path
+            .as_deref()
+            .map(PathBuf::from)
+            .and_then(|p| data_url(&p)))
     })
     .await
 }
@@ -986,9 +1147,16 @@ pub fn spawn_model_download(st: Arc<AppState>, app: AppHandle, announce: bool) -
                     );
                     (true, "模型已就绪，可以开始语义检索".to_string(), false)
                 }
-                Err(e) => (false, e.to_string(), matches!(e, sevqo_engine::Error::Cancelled)),
+                Err(e) => (
+                    false,
+                    e.to_string(),
+                    matches!(e, sevqo_engine::Error::Cancelled),
+                ),
             };
-            let _ = app2.emit(EV_MODEL_STATE, serde_json::json!({ "ready": ready, "note": note, "cancelled": cancelled }));
+            let _ = app2.emit(
+                EV_MODEL_STATE,
+                serde_json::json!({ "ready": ready, "note": note, "cancelled": cancelled }),
+            );
         })
         .map_err(|e| {
             spawn_state.end_download();
@@ -999,7 +1167,9 @@ pub fn spawn_model_download(st: Arc<AppState>, app: AppHandle, announce: bool) -
 
 #[tauri::command]
 pub fn model_download_cancel(app: AppHandle) {
-    app_state(&app).download_cancel.store(true, Ordering::SeqCst);
+    app_state(&app)
+        .download_cancel
+        .store(true, Ordering::SeqCst);
 }
 
 /// Warm the sidecar and report what it actually loaded (device, dtype, RAM).
@@ -1049,13 +1219,20 @@ mod review_tests {
         let (_dir, state) = crate::state::test_state();
         let (tx, rx) = crossbeam_channel::unbounded::<Progress>();
         let fwd = std::thread::spawn(move || while rx.recv().is_ok() {});
-        let idx = Indexer::new(state.db.clone(), state.paths.clone(), state.settings(), None, tx.clone());
+        let idx = Indexer::new(
+            state.db.clone(),
+            state.paths.clone(),
+            state.settings(),
+            None,
+            tx.clone(),
+        );
         let (done, wait) = crossbeam_channel::bounded(1);
         std::thread::spawn(move || {
             close_progress(idx, tx, fwd);
             done.send(()).unwrap();
         });
-        wait.recv_timeout(std::time::Duration::from_secs(2)).expect("progress sender held by Indexer must be dropped before join");
+        wait.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("progress sender held by Indexer must be dropped before join");
     }
 
     /// 排除规则收紧后，已排除文件的索引（FTS/正文/向量）必须立刻消失（P1，隐私）。
@@ -1064,7 +1241,10 @@ mod review_tests {
         let (dir, st) = crate::state::test_state();
         let root_path = dir.path().join("proj");
         std::fs::create_dir_all(root_path.join("private")).unwrap();
-        let root = st.db.add_root(&root_path.to_string_lossy(), "项目").unwrap();
+        let root = st
+            .db
+            .add_root(&root_path.to_string_lossy(), "项目")
+            .unwrap();
         let seen = sevqo_engine::db::now_ns();
         let mk = |path: &std::path::Path| sevqo_engine::scan::Scanned {
             root_id: root,
@@ -1080,12 +1260,15 @@ mod review_tests {
         let a = st.db.upsert_file(&mk(&pub_file), seen).unwrap().0;
         let b = st.db.upsert_file(&mk(&secret), seen).unwrap().0;
         for id in [a, b] {
-            st.db.set_file_state(id, sevqo_engine::FileState::Done, None).unwrap();
+            st.db
+                .set_file_state(id, sevqo_engine::FileState::Done, None)
+                .unwrap();
         }
         // 排除 private/：模拟设置变更
         {
             let mut cfg = st.settings();
-            cfg.exclude_path_prefixes.push(root_path.join("private").to_string_lossy().into());
+            cfg.exclude_path_prefixes
+                .push(root_path.join("private").to_string_lossy().into());
             *st.settings.lock().unwrap() = cfg;
         }
         let purged = purge_excluded_files(&st).unwrap();
@@ -1098,17 +1281,29 @@ mod review_tests {
     #[test]
     fn model_revision_change_resets_semantic_index_but_keeps_fts() {
         let (dir, st) = crate::state::test_state();
-        let root = st.db.add_root(&dir.path().join("d").to_string_lossy(), "d").unwrap();
+        let root = st
+            .db
+            .add_root(&dir.path().join("d").to_string_lossy(), "d")
+            .unwrap();
         let seen = sevqo_engine::db::now_ns();
         let s = sevqo_engine::scan::Scanned {
-            root_id: root, path: dir.path().join("d").join("a.md").to_string_lossy().into(),
-            name: "a.md".into(), ext: "md".into(), kind: sevqo_engine::Kind::Document,
-            size: 1, mtime_ns: seen,
+            root_id: root,
+            path: dir.path().join("d").join("a.md").to_string_lossy().into(),
+            name: "a.md".into(),
+            ext: "md".into(),
+            kind: sevqo_engine::Kind::Document,
+            size: 1,
+            mtime_ns: seen,
         };
         let id = st.db.upsert_file(&s, seen).unwrap().0;
         st.db.store_text(id, None, "海边的日落", false).unwrap();
-        st.db.set_file_state(id, sevqo_engine::FileState::Done, None).unwrap();
-        let row = st.db.reserve_vec_row(sevqo_engine::EmbedRowKind::Chunk, id, id).unwrap();
+        st.db
+            .set_file_state(id, sevqo_engine::FileState::Done, None)
+            .unwrap();
+        let row = st
+            .db
+            .reserve_vec_row(sevqo_engine::EmbedRowKind::Chunk, id, id)
+            .unwrap();
         st.db.activate_vec_rows(&[row]).unwrap();
         st.db.set_meta("model_revision", "rev-old").unwrap();
 
@@ -1117,7 +1312,11 @@ mod review_tests {
         assert_eq!(st.db.alive_vec_rows().unwrap(), 0, "旧向量空间必须清空");
         assert_eq!(st.db.get_meta("model_revision").as_deref(), Some("rev-new"));
         let rec = st.db.file(id).unwrap();
-        assert_eq!(rec.state, sevqo_engine::FileState::Stale, "文件回队列等新模型重建");
+        assert_eq!(
+            rec.state,
+            sevqo_engine::FileState::Stale,
+            "文件回队列等新模型重建"
+        );
         assert!(st.db.stored_text(id).is_some(), "关键词索引保留");
     }
 
@@ -1136,7 +1335,8 @@ mod review_tests {
         let new_norm = norm(&child);
         let overlap = existing.iter().any(|r| {
             let old_norm = norm(std::path::Path::new(&r.path));
-            new_norm.starts_with(&format!("{old_norm}/")) || old_norm.starts_with(&format!("{new_norm}/"))
+            new_norm.starts_with(&format!("{old_norm}/"))
+                || old_norm.starts_with(&format!("{new_norm}/"))
         });
         assert!(overlap, "子目录必须被判定为与父目录重叠");
     }
@@ -1145,16 +1345,25 @@ mod review_tests {
     #[test]
     fn keyword_search_survives_a_corrupt_vector_store() {
         let (dir, st) = crate::state::test_state();
-        let root = st.db.add_root(&dir.path().join("d").to_string_lossy(), "d").unwrap();
+        let root = st
+            .db
+            .add_root(&dir.path().join("d").to_string_lossy(), "d")
+            .unwrap();
         let seen = sevqo_engine::db::now_ns();
         let s = sevqo_engine::scan::Scanned {
-            root_id: root, path: dir.path().join("d").join("a.md").to_string_lossy().into(),
-            name: "a.md".into(), ext: "md".into(), kind: sevqo_engine::Kind::Document,
-            size: 1, mtime_ns: seen,
+            root_id: root,
+            path: dir.path().join("d").join("a.md").to_string_lossy().into(),
+            name: "a.md".into(),
+            ext: "md".into(),
+            kind: sevqo_engine::Kind::Document,
+            size: 1,
+            mtime_ns: seen,
         };
         let id = st.db.upsert_file(&s, seen).unwrap().0;
         st.db.store_text(id, None, "海边的日落", false).unwrap();
-        st.db.set_file_state(id, sevqo_engine::FileState::Done, None).unwrap();
+        st.db
+            .set_file_state(id, sevqo_engine::FileState::Done, None)
+            .unwrap();
         std::fs::write(&st.vector_path, [b'X'; 32]).unwrap(); // 坏 magic
 
         assert!(sevqo_engine::search::Searcher::new(st.db.clone(), &st.vector_path).is_err());
@@ -1323,8 +1532,19 @@ fn incremental_pass(st: &Arc<AppState>, app: &AppHandle) -> Res<bool> {
         })
     };
     let mode = auto_mode(st);
-    let client = if mode == Mode::Full && st.can_infer() { Some(st.client()) } else { None };
-    let idx = Indexer::new(st.db.clone(), st.paths.clone(), st.settings(), client, tx.clone()).with_control(st.control.clone());
+    let client = if mode == Mode::Full && st.can_infer() {
+        Some(st.client())
+    } else {
+        None
+    };
+    let idx = Indexer::new(
+        st.db.clone(),
+        st.paths.clone(),
+        st.settings(),
+        client,
+        tx.clone(),
+    )
+    .with_control(st.control.clone());
     let out = idx.run(mode, Some(64));
     let kinds = idx.kinds_for(mode);
     close_progress(idx, tx, fwd);

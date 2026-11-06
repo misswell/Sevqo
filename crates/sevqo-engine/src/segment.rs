@@ -6,7 +6,10 @@
 //! express a CJK query as an FTS5 phrase, which gives exact-substring semantics —
 //! the behaviour people expect from a file search tool.
 
-const CJK_PUNCT: &[char] = &['，', '。', '、', '；', '：', '？', '！', '（', '）', '「', '」', '『', '』', '·', '—', '…', '《', '》', '【', '】'];
+const CJK_PUNCT: &[char] = &[
+    '，', '。', '、', '；', '：', '？', '！', '（', '）', '「', '」', '『', '』', '·', '—', '…',
+    '《', '》', '【', '】',
+];
 
 pub fn is_cjk(c: char) -> bool {
     matches!(u32::from(c),
@@ -16,9 +19,40 @@ pub fn is_cjk(c: char) -> bool {
 
 fn is_break(c: char) -> bool {
     c.is_whitespace()
-        || matches!(c,
-            '.' | ',' | '/' | '-' | '_' | ':' | ';' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}'
-            | '@' | '#' | '$' | '%' | '^' | '&' | '*' | '+' | '=' | '~' | '`' | '|' | '\\' | '!' | '?' | '<' | '>')
+        || matches!(
+            c,
+            '.' | ','
+                | '/'
+                | '-'
+                | '_'
+                | ':'
+                | ';'
+                | '"'
+                | '\''
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '@'
+                | '#'
+                | '$'
+                | '%'
+                | '^'
+                | '&'
+                | '*'
+                | '+'
+                | '='
+                | '~'
+                | '`'
+                | '|'
+                | '\\'
+                | '!'
+                | '?'
+                | '<'
+                | '>'
+        )
         || CJK_PUNCT.contains(&c)
 }
 
@@ -172,19 +206,30 @@ mod tests {
 
     #[test]
     fn query_becomes_phrases() {
-        assert_eq!(match_expression("海边 日落").as_deref(), Some("\"海 边\" AND \"日 落\""));
+        assert_eq!(
+            match_expression("海边 日落").as_deref(),
+            Some("\"海 边\" AND \"日 落\"")
+        );
         assert_eq!(match_expression("redis").as_deref(), Some("\"redis\""));
         assert_eq!(match_expression("！！！").as_deref(), None);
     }
 
     #[test]
     fn loose_expands_to_or() {
-        assert_eq!(match_expression_loose("海边").as_deref(), Some("\"海\" OR \"边\""));
+        assert_eq!(
+            match_expression_loose("海边").as_deref(),
+            Some("\"海\" OR \"边\"")
+        );
     }
 
     #[test]
     fn snippet_cuts_on_char_boundaries() {
-        let s = snippet("这是一个关于Redis分布式锁的实现说明，很长很长很长", "分布式", 4).unwrap();
+        let s = snippet(
+            "这是一个关于Redis分布式锁的实现说明，很长很长很长",
+            "分布式",
+            4,
+        )
+        .unwrap();
         assert!(s.contains("分布式"));
     }
 }

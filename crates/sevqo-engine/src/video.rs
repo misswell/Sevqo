@@ -9,7 +9,9 @@ pub fn plan_clips(duration_s: f64, settings: &Settings) -> Vec<(f64, f64)> {
     if duration_s <= 0.0 || !duration_s.is_finite() {
         return Vec::new();
     }
-    let window = settings.video_window_s.clamp(2.0, 32.0 / settings.video_fps.max(0.1));
+    let window = settings
+        .video_window_s
+        .clamp(2.0, 32.0 / settings.video_fps.max(0.1));
     let step = settings.video_step_s.clamp(1.0, window);
     let mut out = Vec::new();
     let mut start = 0.0f64;
@@ -35,7 +37,10 @@ pub fn clip_count_for(duration_s: f64, settings: &Settings) -> usize {
 
 /// Seconds of media per inference call, for progress estimates.
 pub fn estimate_video_seconds(duration_s: f64, settings: &Settings) -> f64 {
-    plan_clips(duration_s, settings).iter().map(|(a, b)| b - a).sum()
+    plan_clips(duration_s, settings)
+        .iter()
+        .map(|(a, b)| b - a)
+        .sum()
 }
 
 pub fn format_ms(ms: i64) -> String {
@@ -53,10 +58,12 @@ mod tests {
     use super::*;
 
     fn s(window: f64, step: f64, fps: f64) -> Settings {
-        let mut st = Settings::default();
-        st.video_window_s = window;
-        st.video_step_s = step;
-        st.video_fps = fps;
+        let mut st = Settings {
+            video_window_s: window,
+            video_step_s: step,
+            video_fps: fps,
+            ..Settings::default()
+        };
         st.validate();
         st
     }
@@ -98,7 +105,11 @@ mod tests {
     fn window_respects_frame_cap() {
         // 32 frames at 1 fps => 32 s is the widest window that keeps full coverage
         let st = s(60.0, 30.0, 1.0);
-        assert!(st.video_window_s <= 32.0, "validate() must clamp: {:?}", st.video_window_s);
+        assert!(
+            st.video_window_s <= 32.0,
+            "validate() must clamp: {:?}",
+            st.video_window_s
+        );
         let clips = plan_clips(300.0, &st);
         assert!(clips.iter().all(|(a, b)| b - a <= 32.0 + f64::EPSILON));
     }

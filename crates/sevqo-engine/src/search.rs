@@ -13,7 +13,9 @@ use std::time::Instant;
 use crate::db::Db;
 use crate::segment;
 use crate::vectors::{active_vector_path, MmapView};
-use crate::{Channel, EmbedItem, Error, FileRecord, Hit, Moment, Result, SearchRequest, SearchResponse};
+use crate::{
+    Channel, EmbedItem, Error, FileRecord, Hit, Moment, Result, SearchRequest, SearchResponse,
+};
 
 const RRF_K: f64 = 60.0;
 
@@ -33,13 +35,21 @@ impl Searcher {
     pub fn new(db: Arc<Db>, vector_base: &Path) -> Result<Searcher> {
         let path = active_vector_path(vector_base, &db)?;
         let view = MmapView::open(&path)?;
-        Ok(Searcher { db, base: vector_base.to_path_buf(), view })
+        Ok(Searcher {
+            db,
+            base: vector_base.to_path_buf(),
+            view,
+        })
     }
 
     /// Keyword-only searcher (P2-04)：不加载、不校验向量文件。向量库损坏时
     /// FTS 与文件列表必须照常可用，而不是跟着语义通道一起失败。
     pub fn new_keyword_only(db: Arc<Db>) -> Searcher {
-        Searcher { db, base: PathBuf::new(), view: None }
+        Searcher {
+            db,
+            base: PathBuf::new(),
+            view: None,
+        }
     }
 
     /// Re-resolve the active generation (a compaction may have switched files) and remap.
@@ -59,7 +69,12 @@ impl Searcher {
 
     /// Keyword channel only — no inference, so this is what keystroke-level instant
     /// results use while the model is still loading.
-    pub fn keyword(&self, req: &SearchRequest, query: &str, limit: usize) -> Result<Vec<(i64, f64)>> {
+    pub fn keyword(
+        &self,
+        req: &SearchRequest,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<(i64, f64)>> {
         let expr = match segment::match_expression(query) {
             Some(e) => e,
             None => return Ok(Vec::new()),
@@ -79,7 +94,7 @@ impl Searcher {
         req: &SearchRequest,
         query: &[f32],
         limit: usize,
-    ) -> Result<Vec<(i64, f32, Vec<(i64, i64, i64, f32, Option<String>)>)>> {
+    ) -> Result<Vec<(i64, f32, Vec<crate::db::MomentRow>)>> {
         let view = match self.view.as_ref() {
             Some(v) => v,
             None => return Ok(Vec::new()),
@@ -104,7 +119,7 @@ impl Searcher {
 
         // (file_id, best_score) plus a bounded set of the file's best clips.
         let mut files: Vec<(i64, f32)> = Vec::new();
-        let mut clips: std::collections::HashMap<i64, Vec<(i64, i64, i64, f32, Option<String>)>> =
+        let mut clips: std::collections::HashMap<i64, Vec<crate::db::MomentRow>> =
             std::collections::HashMap::new();
         let mut best: std::collections::HashMap<i64, f32> = std::collections::HashMap::new();
         for (row, score) in scored {
@@ -180,7 +195,10 @@ impl Searcher {
             // No text and no image: browse instead of search. Filters still apply, so
             // "图片 + 空输入" shows the latest pictures rather than everything.
             let rows = self.db.recent_files(req, limit)?;
-            resp.hits = rows.into_iter().map(|f| hit_from_file(f, 0.0, Channel::Keyword)).collect();
+            resp.hits = rows
+                .into_iter()
+                .map(|f| hit_from_file(f, 0.0, Channel::Keyword))
+                .collect();
             resp.total = resp.hits.len();
             resp.keyword_ms = started.elapsed().as_secs_f64() * 1000.0;
             return Ok(resp);
@@ -188,7 +206,11 @@ impl Searcher {
 
         // 1. keyword
         let kw_start = Instant::now();
-        let kw = if query.is_empty() { Vec::new() } else { self.keyword(req, query, limit * 3)? };
+        let kw = if query.is_empty() {
+            Vec::new()
+        } else {
+            self.keyword(req, query, limit * 3)?
+        };
         resp.keyword_ms = kw_start.elapsed().as_secs_f64() * 1000.0;
 
         // 2. semantic — a vector is enough on its own: 以图搜图 has no query text
@@ -232,14 +254,17 @@ impl Searcher {
         // When both channels ran, keep their agreement as the tie-break so a file that
         // matched by name *and* meaning outranks one that only scraped into a list.
         fused.sort_by(|a, b| {
-            b.1.total_cmp(&a.1)
-                .then_with(|| (a.2.is_some() as u8 + a.3.is_some() as u8).cmp(&(b.2.is_some() as u8 + b.3.is_some() as u8)).reverse())
+            b.1.total_cmp(&a.1).then_with(|| {
+                (a.2.is_some() as u8 + a.3.is_some() as u8)
+                    .cmp(&(b.2.is_some() as u8 + b.3.is_some() as u8))
+                    .reverse()
+            })
         });
         fused.truncate(limit);
 
         let ids: Vec<i64> = fused.iter().map(|f| f.0).collect();
         let records = self.db.files_by_ids(&ids)?;
-        let moments_by_file: std::collections::HashMap<i64, Vec<(i64, i64, i64, f32, Option<String>)>> =
+        let moments_by_file: std::collections::HashMap<i64, Vec<crate::db::MomentRow>> =
             sem.into_iter().map(|(id, _, m)| (id, m)).collect();
 
         let mut hits = Vec::with_capacity(fused.len());
@@ -310,11 +335,7 @@ fn hit_from_file(f: FileRecord, score: f64, channel: Channel) -> Hit {
 
 /// One text query → one vector. The search-instruction prefix is what the model was
 /// trained with, so omitting it measurably costs precision.
-pub fn query_vector(
-    client: &crate::infer::Client,
-    text: &str,
-    batch: usize,
-) -> Result<Vec<f32>> {
+pub fn query_vector(client: &crate::infer::Client, text: &str, batch: usize) -> Result<Vec<f32>> {
     let item = EmbedItem::Text {
         key: "q".into(),
         text: text.to_owned(),
@@ -322,24 +343,36 @@ pub fn query_vector(
         role: "query".into(),
     };
     let resp = client.embed(&[item], batch, std::time::Duration::from_secs(90))?;
-    resp.vectors
-        .get("q")
-        .cloned()
-        .ok_or_else(|| Error::Infer(resp.errors.get("q").cloned().unwrap_or_else(|| "查询编码失败".into())))
+    resp.vectors.get("q").cloned().ok_or_else(|| {
+        Error::Infer(
+            resp.errors
+                .get("q")
+                .cloned()
+                .unwrap_or_else(|| "查询编码失败".into()),
+        )
+    })
 }
 
 /// Image-similarity search: the query is a picture, not a sentence.
-pub fn query_vector_from_image(client: &crate::infer::Client, path: &Path, batch: usize) -> Result<Vec<f32>> {
+pub fn query_vector_from_image(
+    client: &crate::infer::Client,
+    path: &Path,
+    batch: usize,
+) -> Result<Vec<f32>> {
     let item = EmbedItem::Image {
         key: "q".into(),
         path: path.to_string_lossy().to_string(),
         thumb: None,
     };
     let resp = client.embed(&[item], batch, std::time::Duration::from_secs(90))?;
-    resp.vectors
-        .get("q")
-        .cloned()
-        .ok_or_else(|| Error::Infer(resp.errors.get("q").cloned().unwrap_or_else(|| "图片编码失败".into())))
+    resp.vectors.get("q").cloned().ok_or_else(|| {
+        Error::Infer(
+            resp.errors
+                .get("q")
+                .cloned()
+                .unwrap_or_else(|| "图片编码失败".into()),
+        )
+    })
 }
 
 /// Search by a video clip. The query is encoded from its first `window_s` seconds, which
@@ -363,10 +396,14 @@ pub fn query_vector_from_video(
         thumb: None,
     };
     let resp = client.embed(&[item], batch, std::time::Duration::from_secs(180))?;
-    resp.vectors
-        .get("q")
-        .cloned()
-        .ok_or_else(|| Error::Infer(resp.errors.get("q").cloned().unwrap_or_else(|| "视频编码失败".into())))
+    resp.vectors.get("q").cloned().ok_or_else(|| {
+        Error::Infer(
+            resp.errors
+                .get("q")
+                .cloned()
+                .unwrap_or_else(|| "视频编码失败".into()),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -403,8 +440,20 @@ mod tests {
         for id in [beach, code, vid] {
             db.set_file_state(id, crate::FileState::Done, None).unwrap();
         }
-        db.store_text(beach, Some("海边日落"), "照片记录了一次海边日落，天空很红", false).unwrap();
-        db.store_text(code, Some("parser.rs"), "Rust parser for the search index", false).unwrap();
+        db.store_text(
+            beach,
+            Some("海边日落"),
+            "照片记录了一次海边日落，天空很红",
+            false,
+        )
+        .unwrap();
+        db.store_text(
+            code,
+            Some("parser.rs"),
+            "Rust parser for the search index",
+            false,
+        )
+        .unwrap();
         db.sync_clips(vid, &[(0.0, 12.0), (12.0, 24.0)]).unwrap();
         let clips = db.clip_rows(vid).unwrap();
         let mut reserved: Vec<i64> = Vec::new();
@@ -417,11 +466,17 @@ mod tests {
             })
             .collect();
         // image + chunk vectors
-        let img_row = db.reserve_vec_row(EmbedRowKind::Image, beach, beach).unwrap();
+        let img_row = db
+            .reserve_vec_row(EmbedRowKind::Image, beach, beach)
+            .unwrap();
         reserved.push(img_row);
         let chunk_row = {
-            let cs = db.sync_chunks(code, &["Rust parser for the search index".into()]).unwrap();
-            let r = db.reserve_vec_row(EmbedRowKind::Chunk, cs[0].0, code).unwrap();
+            let cs = db
+                .sync_chunks(code, &["Rust parser for the search index".into()])
+                .unwrap();
+            let r = db
+                .reserve_vec_row(EmbedRowKind::Chunk, cs[0].0, code)
+                .unwrap();
             reserved.push(r);
             r
         };
@@ -435,10 +490,16 @@ mod tests {
             let _ = i;
             x
         };
-        st.put(img_row as usize, &e(0, vec![1.0, 0.0, 0.0, 0.0])).unwrap();
-        st.put(chunk_row as usize, &e(1, vec![0.0, 1.0, 0.0, 0.0])).unwrap();
+        st.put(img_row as usize, &e(0, vec![1.0, 0.0, 0.0, 0.0]))
+            .unwrap();
+        st.put(chunk_row as usize, &e(1, vec![0.0, 1.0, 0.0, 0.0]))
+            .unwrap();
         for (idx, (_cid, row)) in clip_rows.iter().enumerate() {
-            let v = if idx == 0 { vec![0.0, 0.0, 1.0, 0.0] } else { vec![0.0, 0.0, 0.0, 1.0] };
+            let v = if idx == 0 {
+                vec![0.0, 0.0, 1.0, 0.0]
+            } else {
+                vec![0.0, 0.0, 0.0, 1.0]
+            };
             st.put(*row, &e(idx, v)).unwrap();
         }
         st.flush().unwrap();
@@ -449,7 +510,12 @@ mod tests {
     }
 
     fn req(q: &str) -> SearchRequest {
-        SearchRequest { query: q.into(), limit: 20, filters: Filters::default(), semantic: true }
+        SearchRequest {
+            query: q.into(),
+            limit: 20,
+            filters: Filters::default(),
+            semantic: true,
+        }
     }
 
     #[test]
@@ -498,10 +564,14 @@ mod tests {
         db.set_root_enabled(root, false).unwrap();
         let s = Searcher::new(Arc::new(db), &vp).unwrap();
         assert!(s.keyword(&req("海边"), "海边", 10).unwrap().is_empty());
-        assert!(s.semantic(&req("x"), &[1.0, 0.0, 0.0, 0.0], 10).unwrap().is_empty());
+        assert!(s
+            .semantic(&req("x"), &[1.0, 0.0, 0.0, 0.0], 10)
+            .unwrap()
+            .is_empty());
         assert!(s.run(&req(""), None).unwrap().hits.is_empty());
         let file = s.db.file_by_path("/tmp/photos/parser.rs").unwrap();
-        s.db.set_file_state(file.id, crate::FileState::Pending, None).unwrap();
+        s.db.set_file_state(file.id, crate::FileState::Pending, None)
+            .unwrap();
         assert!(s.db.pending(10, &[]).unwrap().is_empty());
     }
 
@@ -511,16 +581,38 @@ mod tests {
         let s = Searcher::new(Arc::new(db), &vp).unwrap();
         let query = [1.0, 1.0, 0.0, 0.0];
         for filters in [
-            Filters { root_id: Some(9999), ..Default::default() },
-            Filters { min_size: Some(1025), ..Default::default() },
-            Filters { max_size: Some(1023), ..Default::default() },
-            Filters { after_ns: Some(i64::MAX), ..Default::default() },
-            Filters { before_ns: Some(0), ..Default::default() },
-            Filters { kinds: vec![Kind::Document], ..Default::default() },
+            Filters {
+                root_id: Some(9999),
+                ..Default::default()
+            },
+            Filters {
+                min_size: Some(1025),
+                ..Default::default()
+            },
+            Filters {
+                max_size: Some(1023),
+                ..Default::default()
+            },
+            Filters {
+                after_ns: Some(i64::MAX),
+                ..Default::default()
+            },
+            Filters {
+                before_ns: Some(0),
+                ..Default::default()
+            },
+            Filters {
+                kinds: vec![Kind::Document],
+                ..Default::default()
+            },
         ] {
             let mut r = req("x");
             r.filters = filters;
-            assert!(s.semantic(&r, &query, 10).unwrap().is_empty(), "{:?}", r.filters);
+            assert!(
+                s.semantic(&r, &query, 10).unwrap().is_empty(),
+                "{:?}",
+                r.filters
+            );
         }
         let mut r = req("x");
         r.filters.kinds = vec![Kind::Code];
@@ -548,7 +640,10 @@ mod tests {
         let res = s.semantic(&req("海边"), &q, 10).unwrap();
         assert_eq!(res.len(), 1);
         let moments = &res[0].2;
-        assert!(!moments.is_empty(), "clip rows must become jumpable moments");
+        assert!(
+            !moments.is_empty(),
+            "clip rows must become jumpable moments"
+        );
         assert_eq!(moments[0].1, 0);
         assert_eq!(moments[0].2, 12_000);
     }
@@ -597,16 +692,25 @@ mod tests {
         let mut r = req("海边日落");
         r.filters.kinds = vec![Kind::Code];
         let resp = s.run(&r, Some(&[1.0, 0.0, 0.0, 0.0])).unwrap();
-        assert!(resp.hits.iter().all(|h| h.kind == Kind::Code), "{:?}", resp.hits);
+        assert!(
+            resp.hits.iter().all(|h| h.kind == Kind::Code),
+            "{:?}",
+            resp.hits
+        );
     }
 
     #[test]
     fn empty_query_lists_recent() {
         let (_d, db, vp) = setup(4);
         let s = Searcher::new(Arc::new(db), &vp).unwrap();
-        let mut r = SearchRequest::default();
-        r.query = "".into();
-        r.filters.kinds = vec![Kind::Image];
+        let r = SearchRequest {
+            query: "".into(),
+            filters: Filters {
+                kinds: vec![Kind::Image],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         let resp = s.run(&r, None).unwrap();
         assert_eq!(resp.hits.len(), 1);
     }
@@ -652,7 +756,8 @@ mod tests {
             let id = db.upsert_file(&s, seen).unwrap().0;
             db.set_file_state(id, crate::FileState::Done, None).unwrap();
             if clips > 0 {
-                let windows: Vec<(f64, f64)> = (0..clips).map(|i| (i as f64, i as f64 + 1.0)).collect();
+                let windows: Vec<(f64, f64)> =
+                    (0..clips).map(|i| (i as f64, i as f64 + 1.0)).collect();
                 let inserted = db.sync_clips(id, &windows).unwrap();
                 for (cid, _) in inserted {
                     let r = db.reserve_vec_row(EmbedRowKind::Clip, cid, id).unwrap();
@@ -665,12 +770,18 @@ mod tests {
             id
         };
         let long = push_file("long.mp4", Kind::Video, 300);
-        let photos: Vec<i64> = (0..3).map(|i| push_file(&format!("p{i}.jpg"), Kind::Image, 0)).collect();
+        let photos: Vec<i64> = (0..3)
+            .map(|i| push_file(&format!("p{i}.jpg"), Kind::Image, 0))
+            .collect();
 
         let mut store = Store::open(&vec_path, 4).unwrap();
         for (i, r) in rows.iter().enumerate() {
             // 视频切片与查询完全一致；图片稍弱但同样相关
-            let v = if i < 300 { vec![1.0, 0.0, 0.0, 0.0] } else { vec![0.8, 0.6, 0.0, 0.0] };
+            let v = if i < 300 {
+                vec![1.0, 0.0, 0.0, 0.0]
+            } else {
+                vec![0.8, 0.6, 0.0, 0.0]
+            };
             store.put(*r as usize, &v).unwrap();
         }
         store.flush().unwrap();
@@ -685,11 +796,20 @@ mod tests {
         assert_eq!(hits.len(), 4, "四个文件都要在结果里: {hits:?}");
         assert_eq!(hits[0].0, long, "视频按最佳切片排第一");
         for id in &photos {
-            assert!(hits.iter().any(|(fid, _, _)| fid == id), "相关图片不得被长视频挤掉");
+            assert!(
+                hits.iter().any(|(fid, _, _)| fid == id),
+                "相关图片不得被长视频挤掉"
+            );
         }
         let video_moments = &hits[0].2;
-        assert!(video_moments.len() <= CLIPS_PER_FILE_IN_RESULT, "单文件片段数必须有上界");
-        assert!((video_moments[0].3 - 1.0).abs() < 1e-6, "命中片段要带真实相似度");
+        assert!(
+            video_moments.len() <= CLIPS_PER_FILE_IN_RESULT,
+            "单文件片段数必须有上界"
+        );
+        assert!(
+            (video_moments[0].3 - 1.0).abs() < 1e-6,
+            "命中片段要带真实相似度"
+        );
     }
 
     #[test]

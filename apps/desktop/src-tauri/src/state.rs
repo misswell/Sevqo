@@ -1,13 +1,13 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
 use std::sync::Arc;
+use std::sync::{Mutex, RwLock};
 
 use sevqo_engine::db::Db;
 use sevqo_engine::infer::Client;
 use sevqo_engine::jobs::Control;
 use sevqo_engine::watch::WatcherHandle;
-use sevqo_engine::{Phase, Progress, Paths, Settings};
+use sevqo_engine::{Paths, Phase, Progress, Settings};
 
 /// Everything the commands share. Kept behind `Arc`/`Mutex` because Tauri hands state
 /// to a worker thread on every command call.
@@ -43,7 +43,6 @@ pub struct AppState {
 impl AppState {
     pub fn new(paths: Paths, settings: Settings, db: Arc<Db>) -> AppState {
         let has_python = sevqo_engine::infer::python_binary(&settings, None).is_some();
-        let need_vision = settings.index_images || settings.index_video;
         let client = Client::new(&paths, &settings);
         // P0-04：model_ready 不再由文件尺寸决定——启动后台完整性校验（哈希比对可信
         // manifest）通过后才会置位；在那之前推理入口保持关闭，避免对损坏权重发起推理。
@@ -86,14 +85,18 @@ impl AppState {
         let next = Arc::new(Client::new(&self.paths, cfg));
         let old = std::mem::replace(&mut *self.client.lock().expect("推理配置锁已中毒"), next);
         old.shutdown();
-        self.has_python.store(sevqo_engine::infer::python_binary(cfg, None).is_some(), Ordering::Relaxed);
+        self.has_python.store(
+            sevqo_engine::infer::python_binary(cfg, None).is_some(),
+            Ordering::Relaxed,
+        );
         // model_ready 不在这里按尺寸翻转：它只由完整性校验或下载成功置位（P0-04）。
     }
 
     pub fn set_model_ready(&self, v: bool) {
         let st = self.settings();
         self.model_ready.store(v, Ordering::Relaxed);
-        self.vision_ready.store(v && (st.index_images || st.index_video), Ordering::Relaxed);
+        self.vision_ready
+            .store(v && (st.index_images || st.index_video), Ordering::Relaxed);
     }
 
     pub fn indexing(&self) -> bool {
@@ -108,12 +111,20 @@ impl AppState {
 
     /// 没在跑却停在运行中的相位，说明那是上一轮的残留事件：降级成空闲再交给界面。
     pub fn progress_snapshot(&self) -> Progress {
-        let p = self.last_progress.lock().map(|g| g.clone()).unwrap_or_default();
+        let p = self
+            .last_progress
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
         if self.indexing() {
             return p;
         }
         match p.phase {
-            Phase::Scanning | Phase::Indexing | Phase::Paused => Progress { phase: Phase::Idle, current: None, ..p },
+            Phase::Scanning | Phase::Indexing | Phase::Paused => Progress {
+                phase: Phase::Idle,
+                current: None,
+                ..p
+            },
             _ => p,
         }
     }
@@ -197,10 +208,14 @@ impl Drop for IndexGuard {
 pub(crate) fn test_state() -> (tempfile::TempDir, Arc<AppState>) {
     let dir = tempfile::tempdir().unwrap();
     let paths = Paths {
-        data_dir: dir.path().into(), cache_dir: dir.path().into(),
-        model_dir: dir.path().join("models"), thumb_dir: dir.path().join("thumbs"),
-        clip_thumb_dir: dir.path().join("clip-thumbs"), db_path: dir.path().join("index.sqlite"),
-        vector_path: dir.path().join("vectors.f32"), settings_path: dir.path().join("settings.json"),
+        data_dir: dir.path().into(),
+        cache_dir: dir.path().into(),
+        model_dir: dir.path().join("models"),
+        thumb_dir: dir.path().join("thumbs"),
+        clip_thumb_dir: dir.path().join("clip-thumbs"),
+        db_path: dir.path().join("index.sqlite"),
+        vector_path: dir.path().join("vectors.f32"),
+        settings_path: dir.path().join("settings.json"),
         log_dir: dir.path().join("logs"),
     };
     paths.ensure().unwrap();
@@ -237,10 +252,18 @@ mod tests {
         });
         let snap = state.progress_snapshot();
         assert_eq!(snap.phase, Phase::Idle, "空闲时不能把运行中的残留帧交出去");
-        assert_eq!((snap.done, snap.queued), (3, 7), "降级相位不该抹掉已经发生的事实");
+        assert_eq!(
+            (snap.done, snap.queued),
+            (3, 7),
+            "降级相位不该抹掉已经发生的事实"
+        );
         assert!(snap.current.is_none(), "没有正在处理的文件却报着文件名");
         let _permit = state.try_begin_index().unwrap();
-        assert_eq!(state.progress_snapshot().phase, Phase::Indexing, "真的在跑就原样报出来");
+        assert_eq!(
+            state.progress_snapshot().phase,
+            Phase::Indexing,
+            "真的在跑就原样报出来"
+        );
     }
 
     #[test]
@@ -256,6 +279,10 @@ mod tests {
         let current = state.client();
         assert!(!Arc::ptr_eq(&previous, &current));
         assert_eq!(state.vector_dim(), 256);
-        assert!(current.load().unwrap_err().to_string().contains("missing-python"));
+        assert!(current
+            .load()
+            .unwrap_err()
+            .to_string()
+            .contains("missing-python"));
     }
 }
