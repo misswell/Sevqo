@@ -3644,7 +3644,7 @@ dependencies = [
 
 [[package]]
 name = "sevqo-desktop"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "base64 0.22.1",
  "crossbeam-channel",
@@ -3666,7 +3666,7 @@ dependencies = [
 
 [[package]]
 name = "sevqo-engine"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "blake3",
  "chrono",

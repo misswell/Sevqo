@@ -282,3 +282,14 @@
 | 发布门禁 | **属实** | release.yml verify 补齐 clippy/fmt/pytest/ruff，与 CI 同一硬门槛 |
 
 测试：引擎 143（新增 3 条）/ 桌面 17 / 前端全过；`clippy --workspace --all-targets -D warnings` 与 `fmt --check` 全过。
+
+## 2026-11-07 第七轮：内容指纹落地（方案 B/D 批核心项）
+
+| 方案条目 | 实现 |
+| --- | --- |
+| 5.2 BLAKE3 内容指纹 | `file.content_hash` 列（migration v5）；`scan::content_fingerprint` 流式计算，前后元数据校验防「计算期间被改」；prepare_* 索引时补齐；旧行为 NULL 时 size+mtime 快速路径保持不变 |
+| 4.1 检测策略 2 | Watcher 明确 Modified 事件即使 size+mtime 未变也强制重算比对，变化即失效旧派生数据回队列（同尺寸覆盖/rsync 场景回归测试） |
+| 3.2 scope_rules_hash | 影响资格的全部设置统一指纹并持久化；set_settings 落库；启动指纹不一致才自愈清理（保存后崩溃可恢复），一致则跳过 |
+| 9.3 截断状态透出 | `doc_meta` 命令 + 详情页显示「已索引正文 N 字符 / 正文较长已索引前 N 字符」 |
+
+**仍未完成（下一批，如实）**：file_revision 全量表机制（当前以 purge→rebuild + 单元状态承担等价语义，旧数据不保留）；视频批量推理与 sidecar 取消协议；RAM Budget 调度；搜索 Top-K；Office/EPUB 解析器。
