@@ -72,7 +72,7 @@ jobs:
           python3 -m venv .venv-ci
           .venv-ci/bin/pip install --quiet numpy pillow pypdf pytest ruff
           .venv-ci/bin/ruff check inference --select E9,F
-          .venv-ci/bin/python -m pytest inference/tests -q
+          cd inference && ../.venv-ci/bin/python -m pytest tests -q
       - name: 标签版本与配置版本是否一致
         env:
           PUBLISH: ${{ github.event_name == 'workflow_dispatch' && inputs.publish || 'false' }}
