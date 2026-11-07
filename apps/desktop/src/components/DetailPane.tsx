@@ -46,6 +46,7 @@ export function DetailPane({
   const [error, setError] = useState<string | null>(null);
   const fileId = hit?.fileId ?? null;
   const timeline = useMoments(fileId);
+  const [docMeta, setDocMeta] = useState<{ chars: number; truncated: boolean } | null>(null);
   // 本次查询命中的片段来自 Hit.moments（带真实相似度，服务端已按相关度排序）；
   // 完整时间轴另取一次，按时间排序、不带分数（P2-02）。
   const hitMoments = useMemo(
@@ -59,7 +60,11 @@ export function DetailPane({
     let alive = true;
     setError(null);
     setRecord(null);
+    setDocMeta(null);
     if (fileId == null) return;
+    void api.docMeta(fileId).then((r) => {
+      if (alive) setDocMeta(r);
+    });
     void api
       .fileInfo(fileId)
       .then((r) => {
@@ -136,6 +141,9 @@ export function DetailPane({
         </div>
 
         {hit.snippet ? <p className="pane-snippet">{hit.snippet}</p> : null}
+        {docMeta != null && docMeta.chars > 0 ? (
+          <p className="muted">{labels.detail.textCoverage(docMeta.chars, docMeta.truncated)}</p>
+        ) : null}
 
         {showsMoments ? (
           <section className="pane-block">

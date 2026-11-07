@@ -783,6 +783,7 @@ impl Indexer {
     }
 
     fn prepare_video(&self, f: &FileRecord, want_vectors: bool) -> Result<Prepared> {
+        self.note_fingerprint(f);
         let client = self
             .client
             .as_ref()
@@ -850,6 +851,7 @@ impl Indexer {
         if !path.exists() {
             return Err(Error::Unsupported(ERR_MISSING.into()));
         }
+        self.note_fingerprint(f);
         let ext = f.ext.to_ascii_lowercase();
         let (title, text, truncated) = if ext == "pdf" {
             let client = self
@@ -923,6 +925,22 @@ fn chunk_id_of(db: &Db, file_id: i64, ord: usize) -> i64 {
 /// 「文件暂时不存在」的稳定错误码（P2-01）：只有带这个标记的 Skipped 才会被
 /// `requeue_skipped_existing` 重新排队；格式不支持等永久原因不会被反复重试。
 pub const ERR_MISSING: &str = "[missing] 文件已不存在";
+
+impl Indexer {
+    /// 索引时补齐内容指纹（方案 5.2）：size+mtime 之后唯一的内容事实来源。
+    /// 失败只记日志——指纹缺失只影响后续 Modified 事件的判定精度。
+    fn note_fingerprint(&self, f: &FileRecord) {
+        match scan::content_fingerprint(Path::new(&f.path)) {
+            Ok(Some(h)) => {
+                if let Err(e) = self.db.set_content_hash(f.id, &h) {
+                    tracing::warn!("记录内容指纹失败 {}: {e}", f.path);
+                }
+            }
+            Ok(None) => tracing::info!("指纹计算期间文件仍在变化，跳过：{}", f.path),
+            Err(e) => tracing::warn!("读取内容指纹失败 {}: {e}", f.path),
+        }
+    }
+}
 
 fn path_str(p: &Path) -> String {
     p.to_string_lossy().to_string()

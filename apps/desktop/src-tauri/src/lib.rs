@@ -115,6 +115,7 @@ pub fn run() {
             commands::search_media,
             commands::recent,
             commands::moments,
+            commands::doc_meta,
             commands::thumb,
             commands::clip_thumb,
             commands::file_info,
@@ -188,12 +189,12 @@ pub fn run() {
                         tracing::info!("启动对账：重排 {n} 个此前被跳过的任务");
                     }
                 }
-                // 方案 6.1：排除清理若曾中断（崩溃在保存设置之后、清理完成之前），
-                // 每次启动对账都按当前规则再对一遍——幂等且能自愈。
-                if let Ok(n) = commands::purge_excluded_files(&state) {
-                    if n > 0 {
-                        tracing::info!("启动对账：清理 {n} 个当前规则已排除的文件");
-                    }
+                // 方案 3.2：scope_rules_hash 不一致说明上次对账未完成（保存后崩溃），
+                // 此处自愈；一致则跳过，不重复全库扫描。
+                match commands::reconcile_scope_if_stale(&state) {
+                    Ok(true) => tracing::info!("启动对账：索引范围规则已重新对齐"),
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!("启动对账的范围清理失败: {e}"),
                 }
                 match commands::spawn_index_thread(
                     &handle,

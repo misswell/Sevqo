@@ -232,6 +232,8 @@ export const labels = {
     momentsEmpty: '没有定位到具体时间点',
     timeline: '完整时间轴',
     timelineHint: '按时间排序的全部片段，不带相似度',
+    textCoverage: (chars: number, truncated: boolean): string =>
+      truncated ? `正文较长，已索引前 ${chars.toLocaleString()} 个字符` : `已索引正文 ${chars.toLocaleString()} 个字符`,
     playFrom: '从这里播放',
     playerUnavailable: '无法播放：可能缺少该编码的解码器（如 HEVC），或文件已移动',
     openFolder: '打开所在文件夹',

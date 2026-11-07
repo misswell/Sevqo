@@ -357,12 +357,30 @@ pub fn apply_change_with_options(
         size: meta.len() as i64,
         mtime_ns: mtime_ns(&meta),
     };
-    let (_, needs) = db.upsert_file(&scanned, seen)?;
-    Ok(if needs {
-        Applied::NeedsIndex
-    } else {
-        Applied::Unchanged
-    })
+    let (id, needs) = db.upsert_file(&scanned, seen)?;
+    if needs {
+        return Ok(Applied::NeedsIndex);
+    }
+    // 方案 4.1 检测策略 2：Watcher 明确报告修改时，即使 size+mtime 相同也要重算
+    // 内容指纹——rsync 保留时间戳、原地覆盖都靠这里兜底。已有指纹才可比对。
+    if matches!(change, Change::Modified(_)) {
+        if let Some(rec) = db.file(id) {
+            if let Some(stored) = db.content_hash(rec.id)? {
+                match crate::scan::content_fingerprint(path) {
+                    Ok(Some(fresh)) if fresh != stored => {
+                        db.mark_content_changed(rec.id)?;
+                        db.set_content_hash(rec.id, &fresh)?;
+                        return Ok(Applied::NeedsIndex);
+                    }
+                    Ok(Some(fresh)) => {
+                        db.set_content_hash(rec.id, &fresh)?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(Applied::Unchanged)
 }
 
 /// The enabled root that contains `path`, longest match winning.
@@ -419,6 +437,58 @@ mod tests {
         assert_eq!(
             apply_change_with_options(&db, &Change::Modified(path), &opts).unwrap(),
             Applied::NeedsIndex
+        );
+    }
+
+    /// 同尺寸、同 mtime、不同内容（rsync/原地覆盖场景，方案 4.1）：Watcher 的
+    /// Modified 事件必须重算指纹并触发重索引，不能被 size+mtime 快速路径吞掉。
+    #[test]
+    fn modified_event_rehashes_same_metadata_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open(&dir.path().join("index.sqlite")).unwrap();
+        let _root_id = db.add_root(&dir.path().to_string_lossy(), "test").unwrap();
+        let kinds = [crate::Kind::Document];
+        let opts = crate::scan::ScanOptions {
+            kinds: &kinds,
+            max_file_bytes: 1024,
+            exclude_dirs: &[],
+            exclude_prefixes: &[],
+        };
+        let path = dir.path().join("note.txt");
+        std::fs::write(&path, b"AAAA").unwrap();
+        assert_eq!(
+            apply_change_with_options(&db, &Change::Modified(path.clone()), &opts).unwrap(),
+            Applied::NeedsIndex
+        );
+        let id = db.file_by_path(&path.to_string_lossy()).unwrap().id;
+        db.set_file_state(id, crate::FileState::Done, None).unwrap();
+        let stored = crate::scan::content_fingerprint(&path).unwrap().unwrap();
+        db.set_content_hash(id, &stored).unwrap();
+
+        // 同长度覆盖 + 恢复原 mtime：size/mtime 快速路径完全不变
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, b"BBBB").unwrap();
+        std::fs::File::options()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), 4);
+        assert_eq!(meta.modified().unwrap(), mtime);
+
+        assert_eq!(
+            apply_change_with_options(&db, &Change::Modified(path.clone()), &opts).unwrap(),
+            Applied::NeedsIndex,
+            "内容变了必须重索引"
+        );
+        assert_eq!(db.file(id).unwrap().state, crate::FileState::Pending);
+        // 内容没变的 Modified 事件不再触发重索引
+        db.set_file_state(id, crate::FileState::Done, None).unwrap();
+        assert_eq!(
+            apply_change_with_options(&db, &Change::Modified(path.clone()), &opts).unwrap(),
+            Applied::Unchanged
         );
     }
 

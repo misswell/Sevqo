@@ -120,6 +120,7 @@ export const api = {
     }),
   recent: (limit?: number) => call<Hit[]>('recent', { limit: limit && limit > 0 ? limit : null }),
   moments: (fileId: number) => call<Moment[]>('moments', { fileId }),
+  docMeta: (fileId: number) => call<{ chars: number; truncated: boolean } | null>('doc_meta', { fileId }),
 
   // media & detail
   thumb: (fileId: number) => call<string | null>('thumb', { fileId }),

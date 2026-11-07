@@ -89,6 +89,14 @@ const MIGRATIONS: &[(i64, &str)] = &[
     CREATE INDEX IF NOT EXISTS vec_map_alive ON vec_map(alive);
     "#,
     ),
+    (
+        5,
+        // v5: 文件内容指纹（方案 5.1/5.2）。旧行为 NULL：size+mtime 快速路径继续生效，
+        // 指纹在文件首次（重）索引时补齐；Watcher 的明确修改事件会强制重算。
+        r#"
+    ALTER TABLE file ADD COLUMN content_hash TEXT;
+    "#,
+    ),
 ];
 
 const DDL: &str = r#"
@@ -117,7 +125,8 @@ CREATE TABLE IF NOT EXISTS file(
   state TEXT NOT NULL DEFAULT 'pending',
   error TEXT,
   indexed_ns INTEGER NOT NULL DEFAULT 0,
-  thumb TEXT
+  thumb TEXT,
+  content_hash TEXT
 );
 CREATE INDEX IF NOT EXISTS file_state ON file(state, kind);
 CREATE INDEX IF NOT EXISTS file_kind ON file(kind, state);
@@ -827,6 +836,17 @@ impl Db {
         Ok(n)
     }
 
+    /// 正文索引元信息（方案 9.3）：提取字符数与是否截断，供详情页展示。
+    pub fn doc_meta(&self, file_id: i64) -> Option<(i64, bool)> {
+        let g = self.write.lock().ok()?;
+        g.query_row(
+            "SELECT chars,truncated FROM doc WHERE file_id=?",
+            params![file_id],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? != 0)),
+        )
+        .ok()
+    }
+
     pub fn doc_title(&self, file_id: i64) -> Option<String> {
         let g = self.write.lock().ok()?;
         g.query_row(
@@ -1352,6 +1372,38 @@ impl Db {
         Ok(n)
     }
 
+    /// 记录内容指纹（方案 5.2）。size+mtime 之后只作快速筛选。
+    pub fn set_content_hash(&self, id: i64, hash: &str) -> Result<()> {
+        let g = self.write.lock().unwrap();
+        g.execute(
+            "UPDATE file SET content_hash=? WHERE id=?",
+            params![hash, id],
+        )?;
+        Ok(())
+    }
+
+    /// Watcher 明确报告修改但 size/mtime 未变：内容可能已被原地覆盖。
+    /// 使旧派生数据失效并回队列；指纹由调用方重算后记录（方案 5.2）。
+    pub fn mark_content_changed(&self, id: i64) -> Result<()> {
+        let g = self.write.lock().unwrap();
+        g.execute(
+            "UPDATE file SET state='pending',error=NULL WHERE id=?",
+            params![id],
+        )?;
+        purge_derived(&g, id)?;
+        Ok(())
+    }
+
+    pub fn content_hash(&self, id: i64) -> Result<Option<String>> {
+        let g = self.write.lock().unwrap();
+        let v: Option<String> = g.query_row(
+            "SELECT content_hash FROM file WHERE id=?",
+            params![id],
+            |r| r.get(0),
+        )?;
+        Ok(v)
+    }
+
     /// 把「文件已重新出现」的历史 skipped 任务重新排队（方案 5.4：临时离线不得
     /// 变成永久跳过）。路径仍不存在的保持 skipped。返回重排数量。
     pub fn requeue_skipped_existing(&self) -> Result<usize> {
@@ -1854,7 +1906,7 @@ mod tests {
         );
         assert_eq!(
             db.get_meta("schema_version").as_deref(),
-            Some("4"),
+            Some("5"),
             "逐版本迁到最新"
         );
         // v3 的扫描履历表就绪

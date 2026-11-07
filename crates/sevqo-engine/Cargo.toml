@@ -25,6 +25,7 @@ encoding_rs = { workspace = true }
 tracing = { workspace = true }
 sha2 = "0.10"
 tempfile = { workspace = true }
+blake3 = "1.8.7"
 
 [dev-dependencies]
 tempfile = { workspace = true }

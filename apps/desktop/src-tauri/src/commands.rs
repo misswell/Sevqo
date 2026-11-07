@@ -259,12 +259,14 @@ pub async fn set_settings(app: AppHandle, next: Settings) -> Res<Settings> {
         *st.settings.lock().map_err(|_| "设置锁已中毒".to_string())? = cfg.clone();
         // 排除规则收紧后，已被排除的文件必须立刻从索引里消失（P1，隐私相关）：
         // FTS、正文、chunk/clip、向量映射一起清，再跑一轮对账把其余内容补齐。
-        let exclusions_changed = old.exclude_dirs != cfg.exclude_dirs
-            || old.exclude_path_prefixes != cfg.exclude_path_prefixes
-            || old.max_file_bytes != cfg.max_file_bytes;
+        // 方案 3.2：所有影响资格的设置统一进 scope_rules_hash。
+        let exclusions_changed = scope_rules_hash(&old) != scope_rules_hash(&cfg);
         if exclusions_changed {
             let purged = purge_excluded_files(&st)?;
             tracing::info!("索引范围变更：清理 {purged} 个不再符合条件的文件");
+            let _ = st
+                .db
+                .set_meta("scope_rules_hash", &scope_rules_hash(&cfg).to_string());
         }
         if runtime_changed {
             st.configure_client(&cfg);
@@ -312,6 +314,37 @@ pub(crate) fn purge_excluded_files(st: &Arc<AppState>) -> Res<usize> {
     let n = ids.len();
     st.db.purge_by_ids(&ids).map_err(es)?;
     Ok(n)
+}
+
+/// 索引范围规则的指纹（方案 3.2）：变更即需要对账。持久化到 DB，
+/// 设置保存后立刻崩溃也能在下次启动时识别未完成的对账。
+fn scope_rules_hash(cfg: &Settings) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    cfg.exclude_dirs.hash(&mut h);
+    cfg.exclude_path_prefixes.hash(&mut h);
+    cfg.max_file_bytes.hash(&mut h);
+    cfg.index_images.hash(&mut h);
+    cfg.index_video.hash(&mut h);
+    cfg.index_documents.hash(&mut h);
+    cfg.index_code.hash(&mut h);
+    h.finish()
+}
+
+/// 比对 DB 里的 applied 指纹；不一致则清理并更新，返回是否发生了对账动作。
+pub(crate) fn reconcile_scope_if_stale(st: &Arc<AppState>) -> Res<bool> {
+    let cfg = st.settings();
+    let want = scope_rules_hash(&cfg);
+    let applied = st.db.get_meta("scope_rules_hash");
+    if applied.as_deref() == Some(&want.to_string()) {
+        return Ok(false);
+    }
+    let purged = purge_excluded_files(st)?;
+    tracing::info!("索引范围指纹变化：清理 {purged} 个不再符合条件的文件");
+    st.db
+        .set_meta("scope_rules_hash", &want.to_string())
+        .map_err(es)?;
+    Ok(true)
 }
 
 /// 模型版本与向量库绑定（P1）：数据库记录上次校验通过的模型 revision；不一致说明
@@ -1014,6 +1047,26 @@ pub async fn clip_thumb(app: AppHandle, file_id: i64, clip_id: i64) -> Res<Optio
 pub async fn file_info(app: AppHandle, file_id: i64) -> Res<Option<FileRecord>> {
     let st = app_state(&app);
     block(move || Ok(st.db.file(file_id))).await
+}
+
+/// 正文索引覆盖范围（方案 9.3）：chars = 实际索引的字符数，truncated = 是否截断。
+#[tauri::command]
+pub async fn doc_meta(app: AppHandle, file_id: i64) -> Res<Option<DocMeta>> {
+    let st = app_state(&app);
+    block(move || {
+        Ok(st
+            .db
+            .doc_meta(file_id)
+            .map(|(chars, truncated)| DocMeta { chars, truncated }))
+    })
+    .await
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocMeta {
+    pub chars: i64,
+    pub truncated: bool,
 }
 
 // ------------------------------------------------------------------ opening files

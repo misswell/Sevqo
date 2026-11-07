@@ -91,6 +91,28 @@ pub fn excluded_path(root: &Path, path: &Path, opts: &ScanOptions) -> bool {
     })
 }
 
+/// 流式 BLAKE3 内容指纹（方案 5.2）：不整文件读入内存；计算前后各查一次
+/// 元数据，发现计算期间文件被改动就放弃本次结果（由调用方重排）。
+pub fn content_fingerprint(path: &Path) -> crate::Result<Option<String>> {
+    use std::io::Read;
+    let before = std::fs::metadata(path)?;
+    let mut f = std::fs::File::open(path)?;
+    let mut h = blake3::Hasher::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    let after = std::fs::metadata(path)?;
+    if before.len() != after.len() || mtime_ns(&before) != mtime_ns(&after) {
+        return Ok(None); // 读取期间被修改：指纹不可信
+    }
+    Ok(Some(h.finalize().to_string()))
+}
+
 /// Walk one root, emitting candidate files. `seen_ns` stamps every emitted file so a
 /// later sweep can tell "not present" from "not yet visited".
 pub fn scan<F>(
