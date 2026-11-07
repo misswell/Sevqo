@@ -217,7 +217,9 @@ pub async fn get_settings(app: AppHandle) -> Res<Settings> {
 #[tauri::command]
 pub async fn set_settings(app: AppHandle, next: Settings) -> Res<Settings> {
     let st = app_state(&app);
-    block(move || {
+    let app2 = app.clone();
+    let st2 = st.clone();
+    let result = block(move || {
         let _permit = st.try_begin_index().ok_or("请先停止正在运行的索引或扫描")?;
         let _vectors = st.vector_access.write().map_err(es)?;
         let mut cfg = next.clone();
@@ -258,10 +260,11 @@ pub async fn set_settings(app: AppHandle, next: Settings) -> Res<Settings> {
         // 排除规则收紧后，已被排除的文件必须立刻从索引里消失（P1，隐私相关）：
         // FTS、正文、chunk/clip、向量映射一起清，再跑一轮对账把其余内容补齐。
         let exclusions_changed = old.exclude_dirs != cfg.exclude_dirs
-            || old.exclude_path_prefixes != cfg.exclude_path_prefixes;
+            || old.exclude_path_prefixes != cfg.exclude_path_prefixes
+            || old.max_file_bytes != cfg.max_file_bytes;
         if exclusions_changed {
             let purged = purge_excluded_files(&st)?;
-            tracing::info!("排除规则变更：清理 {purged} 个已排除文件的索引");
+            tracing::info!("索引范围变更：清理 {purged} 个不再符合条件的文件");
         }
         if runtime_changed {
             st.configure_client(&cfg);
@@ -272,19 +275,22 @@ pub async fn set_settings(app: AppHandle, next: Settings) -> Res<Settings> {
                 .unregister(old.global_shortcut.as_str());
         }
         let _ = st.db.set_meta("vector_dim", &cfg.vector_dim.to_string());
-        if exclusions_changed {
-            if let Err(e) = spawn_index_thread(&app, &st, auto_mode(&st), None, true) {
-                tracing::warn!("排除规则变更后的对账未启动：{e}");
-            }
-        }
-        Ok(cfg)
+        Ok((cfg, exclusions_changed))
     })
-    .await
+    .await?;
+    // 两阶段（P1-02 修复）：许可在 block 闭包结束时已释放，这里启动对账不再自锁。
+    let (cfg, exclusions_changed) = result;
+    if exclusions_changed {
+        if let Err(e) = spawn_index_thread(&app2, &st2, auto_mode(&st2), None, true) {
+            tracing::warn!("索引范围变更后的对账未启动：{e}");
+        }
+    }
+    Ok(cfg)
 }
 
 /// Remove every indexed file that now falls under the exclusion rules. Uses the same
 /// matcher as the scanner so scope stays consistent between walk, watcher and purge.
-fn purge_excluded_files(st: &Arc<AppState>) -> Res<usize> {
+pub(crate) fn purge_excluded_files(st: &Arc<AppState>) -> Res<usize> {
     let cfg = st.settings();
     let roots = st.db.list_roots().map_err(es)?;
     let mut ids = Vec::new();
@@ -386,17 +392,13 @@ pub async fn add_root(app: AppHandle, path: String, label: Option<String>) -> Re
         }
         // 父子目录不得同时作为根目录（P1）：文件归属是单值的，删除父目录会连带清掉
         // 实际属于子目录范围的索引。用 canonicalize 比较，绕过符号链接与 ../ 的障眼法。
-        let norm = |p: &std::path::Path| {
-            p.canonicalize()
-                .map(|c| c.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| p.to_string_lossy().into_owned())
-        };
+        let norm = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
         let new_norm = norm(&expanded);
         for r in &existing {
             let old_norm = norm(&expand(&r.path));
-            if new_norm.starts_with(&format!("{old_norm}/"))
-                || old_norm.starts_with(&format!("{new_norm}/"))
-            {
+            // 用 Path::starts_with 做组件级比较：字符串前缀在「根目录为 /」等边界
+            // 下会误判（P2-03）。
+            if new_norm.starts_with(&old_norm) || old_norm.starts_with(&new_norm) {
                 return Err(format!(
                     "与已有目录「{}」重叠（父子关系），请只保留其中一层",
                     r.label
@@ -1330,13 +1332,11 @@ mod review_tests {
         // 直接走数据库 + 判定逻辑的等价路径：重叠检查在 add_root 命令内，
         // 这里验证判定本身的两个方向。
         st.db.add_root(&parent.to_string_lossy(), "父").unwrap();
-        let norm = |p: &std::path::Path| p.to_string_lossy().into_owned();
         let existing = st.db.list_roots().unwrap();
-        let new_norm = norm(&child);
+        let new_norm = child.canonicalize().unwrap();
         let overlap = existing.iter().any(|r| {
-            let old_norm = norm(std::path::Path::new(&r.path));
-            new_norm.starts_with(&format!("{old_norm}/"))
-                || old_norm.starts_with(&format!("{new_norm}/"))
+            let old_norm = std::path::Path::new(&r.path).canonicalize().unwrap();
+            new_norm.starts_with(&old_norm) || old_norm.starts_with(&new_norm)
         });
         assert!(overlap, "子目录必须被判定为与父目录重叠");
     }

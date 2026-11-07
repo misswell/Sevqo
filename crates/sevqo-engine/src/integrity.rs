@@ -41,12 +41,44 @@ pub fn check_and_repair(db: &Db) -> Result<IntegrityReport> {
     // 1) persisted 单元没有有效映射：状态撒了谎，回 pending 让补齐轮重建。
     report.fixed_stale_units += g.execute(
         "UPDATE chunk SET status='pending',retry_count=0,error=NULL \
-         WHERE status='persisted' AND (vec_row IS NULL OR vec_row NOT IN (SELECT row_id FROM vec_map WHERE alive=1))",
+         WHERE status='persisted' AND (
+            vec_row IS NULL
+            OR vec_row NOT IN (SELECT row_id FROM vec_map WHERE alive=1
+                               AND target_kind='chunk' AND ref_id=chunk.id AND file_id=chunk.file_id))",
         [],
     )?;
     report.fixed_stale_units += g.execute(
         "UPDATE clip SET status='pending',retry_count=0,error=NULL 
-         WHERE status='persisted' AND (vec_row IS NULL OR vec_row NOT IN (SELECT row_id FROM vec_map WHERE alive=1))",
+         WHERE status='persisted' AND (
+            vec_row IS NULL
+            OR vec_row NOT IN (SELECT row_id FROM vec_map WHERE alive=1
+                               AND target_kind='clip' AND ref_id=clip.id AND file_id=clip.file_id))",
+        [],
+    )?;
+
+    // 1b) image 单元 = 文件本身：活映射必须 ref_id=file_id 且文件仍存在。
+    report.fixed_stale_units += g.execute(
+        "UPDATE vec_map SET alive=0 WHERE alive=1 AND target_kind='image' AND (
+            ref_id != file_id OR file_id NOT IN (SELECT id FROM file))",
+        [],
+    )?;
+    // 1c) 同一 (target,ref) 挂多条活映射：无法确定哪条为真，全部失效并让单元重嵌。
+    report.fixed_stale_units += g.execute(
+        "UPDATE vec_map SET alive=0 WHERE alive=1 AND target_kind!='image' AND (
+            SELECT count(*) FROM vec_map v2 WHERE v2.alive=1
+              AND v2.target_kind=vec_map.target_kind AND v2.ref_id=vec_map.ref_id) > 1",
+        [],
+    )?;
+    report.fixed_stale_units += g.execute(
+        "UPDATE chunk SET status='pending',retry_count=0,error=NULL WHERE status='persisted'
+          AND id IN (SELECT ref_id FROM vec_map WHERE alive=0 AND target_kind='chunk'
+                     AND ref_id IN (SELECT ref_id FROM vec_map WHERE alive=1 AND target_kind='chunk'))",
+        [],
+    )?;
+    report.fixed_stale_units += g.execute(
+        "UPDATE clip SET status='pending',retry_count=0,error=NULL WHERE status='persisted'
+          AND id IN (SELECT ref_id FROM vec_map WHERE alive=0 AND target_kind='clip'
+                     AND ref_id IN (SELECT ref_id FROM vec_map WHERE alive=1 AND target_kind='clip'))",
         [],
     )?;
 
@@ -67,9 +99,25 @@ pub fn check_and_repair(db: &Db) -> Result<IntegrityReport> {
             OR id IN (SELECT file_id FROM clip WHERE status!='persisted') )",
         [],
     )?;
+    // image 的单元就是文件本身：done 却没有任何有效映射 = 完整性缺口。
+    report.fixed_incomplete_done += g.execute(
+        "UPDATE file SET state='stale' WHERE state='done' AND kind='image' 
+         AND id NOT IN (SELECT file_id FROM vec_map WHERE alive=1 AND target_kind='image')",
+        [],
+    )?;
 
     // 4) 无法自动修复的：done 文件的向量映射行号越界之类，交给启动的
     //    generation 校验报告；这里只记录双向一致性的可疑信号。
+    let unknown_kind: i64 = g.query_row(
+        "SELECT count(*) FROM vec_map WHERE target_kind NOT IN ('image','clip','chunk')",
+        [],
+        |r| r.get(0),
+    )?;
+    if unknown_kind > 0 {
+        report.problems.push(format!(
+            "{unknown_kind} 条映射的 target_kind 无法识别，需要人工检查"
+        ));
+    }
     let suspicious: i64 = g.query_row(
         "SELECT count(*) FROM vec_map WHERE alive=1 
          AND ( (target_kind='chunk' AND ref_id IN (SELECT id FROM chunk WHERE status!='persisted')) 
@@ -158,6 +206,45 @@ mod tests {
         assert_eq!(db.alive_vec_rows().unwrap(), 0);
     }
 
+    /// 归属校验（P1-04）：Chunk A 指向的 row 虽然存在活映射，但那映射属于
+    /// Chunk B——必须判 A 失联，而不是把 B 的向量当成 A 的。
+    #[test]
+    fn persisted_unit_with_wrong_owner_map_is_requeued() {
+        let (_d, db, id) = doc_db();
+        let chunks = db.sync_chunks(id, &["甲".into(), "乙".into()]).unwrap();
+        db.set_file_state(id, FileState::Done, None).unwrap();
+        let (a, b) = (chunks[0].0, chunks[1].0);
+        // 乙先正常入库
+        let row_b = db.reserve_vec_row(EmbedRowKind::Chunk, b, id).unwrap();
+        db.activate_vec_rows(&[row_b]).unwrap();
+        db.mark_units_persisted(&[(EmbedRowKind::Chunk, b)])
+            .unwrap();
+        // 甲谎称 persisted，但 vec_row 指向乙的映射行
+        db.read()
+            .unwrap()
+            .execute(
+                "UPDATE chunk SET status='persisted',vec_row=? WHERE id=?",
+                params_like2(row_b, a),
+            )
+            .unwrap();
+
+        let report = check_and_repair(&db).unwrap();
+
+        assert!(report.fixed_stale_units >= 1, "{report:?}");
+        let status_a: String = db
+            .read()
+            .unwrap()
+            .query_row("SELECT status FROM chunk WHERE id=?", [a], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status_a, "pending", "归属错误的单元必须重新嵌入");
+        let status_b: String = db
+            .read()
+            .unwrap()
+            .query_row("SELECT status FROM chunk WHERE id=?", [b], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status_b, "persisted", "归属正确的单元不受影响");
+    }
+
     #[test]
     fn clean_state_reports_nothing() {
         let (_d, db, id) = doc_db();
@@ -177,5 +264,9 @@ mod tests {
 
     fn params_like(v: i64) -> [i64; 1] {
         [v]
+    }
+
+    fn params_like2(a: i64, b: i64) -> [i64; 2] {
+        [a, b]
     }
 }

@@ -59,6 +59,23 @@ jobs:
           npm run build
       - name: Rust 测试
         run: cargo test -q --workspace
+      # 完整回归门禁（方案十三）：Release 与 CI 同一套硬门槛，缺一不发。
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: clippy（阻塞）
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: rustfmt（阻塞）
+        run: cargo fmt --check
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Python 测试与 ruff
+        run: |
+          python -m pip install --quiet numpy pillow pypdf pytest ruff
+          ruff check inference --select E9,F
+          python -m pytest inference/tests -q
+        working-directory: ./
       - name: 标签版本与配置版本是否一致
         env:
           PUBLISH: ${{ github.event_name == 'workflow_dispatch' && inputs.publish || 'false' }}

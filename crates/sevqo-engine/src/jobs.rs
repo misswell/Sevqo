@@ -659,6 +659,17 @@ impl Indexer {
             if self.control.is_cancelled() {
                 return Err(Error::Cancelled);
             }
+            // 暂停在子批边界生效（P1-06）：等待解除，而不是让整批跑完才停。
+            while self.control.is_paused() {
+                let _ = self.emit.try_send(Progress {
+                    phase: Phase::Paused,
+                    ..live.clone()
+                });
+                std::thread::sleep(Duration::from_millis(300));
+                if self.control.is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
+            }
             let timeout = Duration::from_secs(180 + 60 * (group.len() / batch) as u64);
             let resp = client.embed(group, batch, timeout)?;
 
@@ -741,7 +752,7 @@ impl Indexer {
 
     fn prepare_image(&self, f: &FileRecord, want_vectors: bool) -> Result<Prepared> {
         if !Path::new(&f.path).exists() {
-            return Err(Error::Unsupported("文件已不存在".into()));
+            return Err(Error::Unsupported(ERR_MISSING.into()));
         }
         if f.width.is_none() {
             if let Some((w, h)) = scan::image_dimensions(Path::new(&f.path)) {
@@ -777,7 +788,7 @@ impl Indexer {
             .as_ref()
             .ok_or_else(|| Error::Infer("推理进程未启动".into()))?;
         if !Path::new(&f.path).exists() {
-            return Err(Error::Unsupported("文件已不存在".into()));
+            return Err(Error::Unsupported(ERR_MISSING.into()));
         }
         let probe = client.probe(Path::new(&f.path), Duration::from_secs(60))?;
         if !probe.has_video || probe.duration_s <= 0.0 {
@@ -797,7 +808,15 @@ impl Indexer {
                 Prepared::Indexed
             });
         }
-        let clips = plan_clips(probe.duration_s, &self.settings);
+        let mut clips = plan_clips(probe.duration_s, &self.settings);
+        if clips.len() > MAX_CLIPS_PER_VIDEO {
+            let total = clips.len();
+            clips.truncate(MAX_CLIPS_PER_VIDEO);
+            tracing::warn!(
+                "视频 {} 切片数 {total} 超上限，仅处理前 {MAX_CLIPS_PER_VIDEO} 个",
+                f.name
+            );
+        }
         if clips.is_empty() {
             return Ok(Prepared::Skip("时长过短".into()));
         }
@@ -829,7 +848,7 @@ impl Indexer {
     fn prepare_text(&self, f: &FileRecord, want_vectors: bool) -> Result<Prepared> {
         let path = Path::new(&f.path);
         if !path.exists() {
-            return Err(Error::Unsupported("文件已不存在".into()));
+            return Err(Error::Unsupported(ERR_MISSING.into()));
         }
         let ext = f.ext.to_ascii_lowercase();
         let (title, text, truncated) = if ext == "pdf" {
@@ -901,6 +920,10 @@ fn chunk_id_of(db: &Db, file_id: i64, ord: usize) -> i64 {
     db.chunk_rows(file_id).unwrap()[ord].0
 }
 
+/// 「文件暂时不存在」的稳定错误码（P2-01）：只有带这个标记的 Skipped 才会被
+/// `requeue_skipped_existing` 重新排队；格式不支持等永久原因不会被反复重试。
+pub const ERR_MISSING: &str = "[missing] 文件已不存在";
+
 fn path_str(p: &Path) -> String {
     p.to_string_lossy().to_string()
 }
@@ -912,6 +935,10 @@ const UNIT_RETRY_MAX: i64 = 3;
 /// Upper bound of one inference request: keeps the JSON payload, the sidecar's memory
 /// and the cancel-wait bounded no matter how many chunks a long document produced.
 const MAX_EMBED_ITEMS_PER_REQUEST: usize = 256;
+
+/// 单个视频的最大切片数（方案 7.2）：异常元数据或超长视频不得产生无限任务。
+/// 超出部分丢弃尾部并在时间轴上留白；用户可调大 video_step_s 覆盖更长时长。
+const MAX_CLIPS_PER_VIDEO: usize = 1000;
 
 /// 语义索引每份文档的最大片段数。超过后正文仍完整进入 FTS，但语义向量只覆盖前
 /// N 片——文件状态会带说明，绝不静默（审查 P1：原 24 片硬截断导致「关键词能搜到、

@@ -188,6 +188,13 @@ pub fn run() {
                         tracing::info!("启动对账：重排 {n} 个此前被跳过的任务");
                     }
                 }
+                // 方案 6.1：排除清理若曾中断（崩溃在保存设置之后、清理完成之前），
+                // 每次启动对账都按当前规则再对一遍——幂等且能自愈。
+                if let Ok(n) = commands::purge_excluded_files(&state) {
+                    if n > 0 {
+                        tracing::info!("启动对账：清理 {n} 个当前规则已排除的文件");
+                    }
+                }
                 match commands::spawn_index_thread(
                     &handle,
                     &state,

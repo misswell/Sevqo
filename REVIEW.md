@@ -261,3 +261,24 @@
 - **B 生命周期**：完成主体（keyword_only、mark_missing_vectors 按单元、重叠根目录拒绝、排除对账、watcher 状态修复、离线 Skipped 重排）。未做：内容指纹与 file_revision（八/四）。
 - **C 性能资源**：完成 moments 精确查询、put_many 连续写入。未做：视频有界流水线与批量推理、sidecar 取消协议、RAM Budget 接入调度、搜索 Top-K（百万级）。
 - **D 文档模型 UI**：完成模型 manifest/revision 绑定、关键词容错、keyword_only 标签。未做：截断状态透出 UI、Office/EPUB 解析器、根目录显式状态列、完整前端状态面板。
+
+## 2026-11-07 第六轮：v0.1.9 审查修复（生命周期闭环 + P2 清尾）
+
+审查确认上一轮核心修复全部落地后，指出 6 条 P1 与 5 条 P2。逐条核实处理：
+
+| 条目 | 核实结果 | 处理 |
+| --- | --- | --- |
+| P1-01 强杀后 indexing 永久卡死 | **不成立**：`Db::open` 启动时已有 `indexing→pending` 重置（:347）。补回归测试钉住 | `indexing_left_by_a_killed_process_recovers_on_reopen` |
+| P1-02 set_settings 自动对账必然失败 | **属实**：许可双取自锁 | 两阶段重构：block 内只做保存/清理，闭包释放许可后在外层启动对账 |
+| P1-03 排除清理不可恢复、无事务 | **属实** | `purge_by_ids` 整批一个事务；启动对账前按当前规则幂等重跑排除清理（自愈） |
+| P1-04 IntegrityChecker 只查 row_id 存在性 | **属实** | 升级为双向归属校验：`target_kind/ref_id/file_id` 三元组必须与单元一致；image 纳入 done 完整性；同单元多活映射全部失效重嵌；未知 target_kind 上报 |
+| P1-05 指纹/Revision | 未做（维持记录） | 独立批次，见批次状态 |
+| P1-06 视频资源上限/暂停 | 部分属实 | 子批边界暂停生效；`MAX_CLIPS_PER_VIDEO=1000` 截断超长视频；完整流水线/批量推理/sidecar 取消协议仍为下一批 |
+| P2-01 skipped 无差别重排 | **属实** | 引入 `[missing]` 稳定错误码；仅该类 Skipped 参与重排，格式不支持保持终态 |
+| P2-02 大小限制变更不对账 | **属实** | `max_file_bytes` 纳入索引范围变更检测，超限文件清理并对账 |
+| P2-03 根目录 `/` 边界误判 | **属实** | 改用 `Path::starts_with` 组件级比较 |
+| P2-04 追加路径缺 u32 上限 | **属实** | `put_many` 写入前拒绝超限行号 |
+| P2-05 旧代无限累积 | **属实** | 压缩后仅保留紧邻上一代作为恢复窗口，其余由启动清理；启动清理仍以深度校验通过为前提 |
+| 发布门禁 | **属实** | release.yml verify 补齐 clippy/fmt/pytest/ruff，与 CI 同一硬门槛 |
+
+测试：引擎 143（新增 3 条）/ 桌面 17 / 前端全过；`clippy --workspace --all-targets -D warnings` 与 `fmt --check` 全过。

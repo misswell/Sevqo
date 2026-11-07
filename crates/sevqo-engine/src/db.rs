@@ -643,13 +643,16 @@ impl Db {
         Ok(rows.filter_map(|x| x.ok()).collect())
     }
 
-    /// 批量清除文件的全部派生数据（排除规则变更时使用）。
+    /// 批量清除文件的全部派生数据（排除规则变更时使用）。整批一个事务：
+    /// 中途失败整体回滚，不会留下清了一半的状态（P1-03）。
     pub fn purge_by_ids(&self, ids: &[i64]) -> Result<()> {
         if ids.is_empty() {
             return Ok(());
         }
-        let g = self.write.lock().unwrap();
-        purge_files(&g, ids)?;
+        let mut g = self.write.lock().unwrap();
+        let tx = g.transaction()?;
+        purge_files(&tx, ids)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1353,7 +1356,11 @@ impl Db {
     /// 变成永久跳过）。路径仍不存在的保持 skipped。返回重排数量。
     pub fn requeue_skipped_existing(&self) -> Result<usize> {
         let g = self.write.lock().unwrap();
-        let mut st = g.prepare("SELECT id,path FROM file WHERE state='skipped' AND kind IN ('image','video','document','code')")?;
+        // 只有「暂时不存在」标记的 Skipped 才重排；格式不支持等永久原因保持终态（P2-01）。
+        let mut st = g.prepare(
+            "SELECT id,path FROM file WHERE state='skipped' AND error LIKE '[missing]%' \
+             AND kind IN ('image','video','document','code')",
+        )?;
         let rows = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
         let mut n = 0;
         for (id, path) in rows.flatten() {
@@ -1961,6 +1968,33 @@ mod tests {
         assert!(db.file(deep).is_none());
         assert_eq!(db.alive_vec_rows().unwrap(), 0, "子文件的向量映射一并回收");
         assert!(db.file(sibling).is_some(), "同前缀不同名的文件不受影响");
+    }
+
+    /// 进程异常退出后 indexing 不能永久卡死（P1-01）：重启打开数据库时
+    /// 必须把遗留 indexing 重置回 pending，重新进入队列。
+    #[test]
+    fn indexing_left_by_a_killed_process_recovers_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("i.sqlite");
+        let root;
+        let file_id;
+        {
+            let db = Db::open(&path).unwrap();
+            root = db.add_root("/tmp/d", "目录").unwrap();
+            file_id = upsert(&db, root, "/tmp/d/a.md", Kind::Document);
+            // 模拟任务开始：状态已置 indexing，进程此刻被杀死
+            db.set_file_state(file_id, FileState::Indexing, None)
+                .unwrap();
+            assert_eq!(db.file(file_id).unwrap().state, FileState::Indexing);
+        } // Drop 不执行任何恢复（模拟 kill -9）
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(
+            db.file(file_id).unwrap().state,
+            FileState::Pending,
+            "重启必须恢复"
+        );
+        assert_eq!(db.pending(10, &[]).unwrap().len(), 1, "重新进入待处理队列");
     }
 
     /// 按 clip 精确查询且分批绑定参数：超过一批（400）也能全部返回，
