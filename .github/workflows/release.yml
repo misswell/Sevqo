@@ -41,7 +41,7 @@ jobs:
   verify:
     # 探针跑不需要先花十几分钟装工具链、跑测试；build-macos 随它一起跳过。
     if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.probeCredentials) }}
-    runs-on: macos-14
+    runs-on: self-hosted
     outputs:
       signing_ready: ${{ steps.credentials.outputs.ready }}
     steps:
@@ -138,7 +138,7 @@ jobs:
   probe-credentials:
     # Secret 名字存在不等于值能用：这里在 Runner 上真装一次证书、真试签一次、真问一次公证。
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.probeCredentials }}
-    runs-on: macos-14
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
         with:
@@ -212,7 +212,7 @@ jobs:
           - arch: x86_64
             target: x86_64-apple-darwin
             platform: darwin-x86_64
-    runs-on: macos-14
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
         with:

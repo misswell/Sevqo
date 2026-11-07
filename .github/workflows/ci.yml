@@ -6,10 +6,12 @@ name: ci
 #     continue-on-error 记录，待一次性 normalize 提交后再转为阻塞项。
 #   - Python：只装测试所需的轻量依赖（numpy/pillow/pypdf），不装 torch；
 #     sidecar 协议级测试需要真实模型环境，目前由发布流程的真机 smoke 覆盖。
+# 注意：runner 是本机自托管。公共仓库的 fork PR 会在自托管机器上执行任意代码，
+# 因此 CI 只在 main push 与手动触发时运行，不跟随 pull_request。
 on:
   push:
     branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -17,7 +19,7 @@ concurrency:
 
 jobs:
   rust:
-    runs-on: macos-14
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -33,7 +35,7 @@ jobs:
         run: cargo fmt --check
 
   frontend:
-    runs-on: macos-14
+    runs-on: self-hosted
     defaults:
       run:
         working-directory: apps/desktop
@@ -49,7 +51,7 @@ jobs:
       - run: npm run build
 
   python:
-    runs-on: macos-14
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
