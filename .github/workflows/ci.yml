@@ -51,13 +51,12 @@ jobs:
     runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      # 自托管机使用本机 Homebrew Python 3.12 + venv（setup-python 在自托管
+      # macOS 上会尝试写 /Users/runner，无权限）。
       - name: 安装测试所需轻量依赖（不含 torch）
-        run: python -m pip install --quiet numpy pillow pypdf pytest ruff
+        run: python3 -m venv .venv-ci && .venv-ci/bin/pip install --quiet numpy pillow pypdf pytest ruff
       - name: ruff（语法与 pyflakes 级）
-        run: ruff check inference --select E9,F
+        run: .venv-ci/bin/ruff check inference --select E9,F
       - name: pytest
         working-directory: inference
-        run: python -m pytest tests -q
+        run: ../.venv-ci/bin/python -m pytest tests -q
